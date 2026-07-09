@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  com.es.mini-agent — macOS launchd LaunchAgent for es-mini-agent.
+
+  This is a LaunchAgent (runs as the logged-in user), NOT a LaunchDaemon,
+  matching the FLEET project's existing user-scoped launchd reliability pattern.
+
+  Install:
+    cp com.es.mini-agent.plist ~/Library/LaunchAgents/
+    launchctl load  ~/Library/LaunchAgents/com.es.mini-agent.plist
+
+  Reload after edits:
+    launchctl unload ~/Library/LaunchAgents/com.es.mini-agent.plist
+    launchctl load   ~/Library/LaunchAgents/com.es.mini-agent.plist
+
+  Tail logs:
+    tail -f ~/Documents/es-mini-agent/agent.log ~/Documents/es-mini-agent/agent.error.log
+
+  IMPORTANT: The EnvironmentVariables values below are PLACEHOLDERS.
+  Fill in real values locally on the Mini — do NOT commit real secrets.
+  Update the ProgramArguments node path if `which node` differs on your Mac
+  (e.g. /opt/homebrew/opt/node@24/bin/node on Apple Silicon w/ brew).
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.es.mini-agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- Intel Homebrew / system default. On Apple Silicon use:
+             /opt/homebrew/opt/node@24/bin/node  (or output of `which node`) -->
+        <string>/usr/local/bin/node</string>
+        <string>server.js</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/annabui/Documents/es-mini-agent</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PORT</key>
+        <string>8787</string>
+        <key>RECORD_CONTROL_KEY</key>
+        <string>REPLACE_ME_WITH_REAL_SECRET</string>
+        <key>BUILDING_ID</key>
+        <string>REPLACE_ME_e_g_bench-1</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/annabui/Documents/es-mini-agent/agent.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/annabui/Documents/es-mini-agent/agent.error.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

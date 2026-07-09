@@ -1,0 +1,14 @@
+{
+  "name": "es-mini-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "EVRYBDY Studios FLEET — Mini-side HTTP agent. Zero-dependency Node service that the Vercel proxy talks to. Proves the app-to-Mini connection is real; does not drive real cameras/OBS yet.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED"
+}
