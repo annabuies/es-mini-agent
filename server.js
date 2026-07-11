@@ -13,7 +13,7 @@ const BUILDING_ID = process.env.BUILDING_ID;
 // Robbie's existing install command (which only sets BUILDING_ID and
 // RECORD_CONTROL_KEY) keeps working unchanged after this update.
 const RECORD_POLL_URL = process.env.RECORD_POLL_URL || 'https://es-os-app.vercel.app';
-const POLL_INTERVAL_MS = 1500;
+const POLL_INTERVAL_MS = 1000;
 
 if (!RECORD_CONTROL_KEY) {
   console.error('[es-mini-agent] FATAL: RECORD_CONTROL_KEY env var is required. Refusing to start.');
