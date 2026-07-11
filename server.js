@@ -9,6 +9,11 @@ const http = require('http');
 const PORT = parseInt(process.env.PORT || '8787', 10);
 const RECORD_CONTROL_KEY = process.env.RECORD_CONTROL_KEY;
 const BUILDING_ID = process.env.BUILDING_ID;
+// Optional: outbound poll target. Defaults to the app's stable public URL so
+// Robbie's existing install command (which only sets BUILDING_ID and
+// RECORD_CONTROL_KEY) keeps working unchanged after this update.
+const RECORD_POLL_URL = process.env.RECORD_POLL_URL || 'https://es-os-app.vercel.app';
+const POLL_INTERVAL_MS = 1500;
 
 if (!RECORD_CONTROL_KEY) {
   console.error('[es-mini-agent] FATAL: RECORD_CONTROL_KEY env var is required. Refusing to start.');
@@ -178,12 +183,72 @@ server.on('clientError', (err, socket) => {
   try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch (_) {}
 });
 
+// ---------- outbound poll loop ----------
+// Reach OUT to the Vercel app every POLL_INTERVAL_MS to claim any pending
+// command, run it locally via handleOp(), and POST the result back. This
+// replaces the old inbound cloudflared quick-tunnel path — no inbound port
+// exposure needed from this Mac. The inbound handler above is left intact
+// (harmless without a tunnel) so nothing that used to work is broken.
+let polling = false;
+let pollTimer = null;
+
+async function pollOnce() {
+  if (polling) return; // network calls are async — belt-and-suspenders reentry guard
+  polling = true;
+  try {
+    const url = `${RECORD_POLL_URL}/api/record?building_id=${encodeURIComponent(BUILDING_ID)}`;
+    const getRes = await fetch(url, {
+      method: 'GET',
+      headers: { 'Authorization': 'Bearer ' + RECORD_CONTROL_KEY },
+    });
+    if (!getRes.ok) {
+      // 401/5xx from Vercel — log once per tick and move on. Do not crash.
+      console.warn(`[es-mini-agent] relay: poll GET ${getRes.status} from ${RECORD_POLL_URL}`);
+      return;
+    }
+    const data = await getRes.json().catch(() => ({}));
+    const cmd = data && data.command;
+    if (!cmd || !cmd.id || !cmd.op) return; // nothing to do — stay quiet to keep agent.log readable
+
+    const result = handleOp(cmd.op, {});
+    if (result == null) {
+      console.warn(`[es-mini-agent] relay: unknown op '${cmd.op}' (id=${cmd.id}) — skipping result post`);
+      return;
+    }
+
+    const postRes = await fetch(`${RECORD_POLL_URL}/api/record`, {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + RECORD_CONTROL_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ mini_result: true, id: cmd.id, ok: !!result.ok, result }),
+    });
+    if (!postRes.ok) {
+      console.warn(`[es-mini-agent] relay: result POST ${postRes.status} for ${cmd.op} (${cmd.id})`);
+      return;
+    }
+    console.log(`[es-mini-agent] relay: claimed ${cmd.op} (${cmd.id}) -> posted result`);
+  } catch (e) {
+    // Network hiccup, DNS blip, JSON parse — never crash the process.
+    console.error('[es-mini-agent] relay: poll error:', e && (e.stack || e.message || e));
+  } finally {
+    polling = false;
+  }
+}
+
 server.listen(PORT, () => {
   console.log(`[es-mini-agent] listening on :${PORT} building_id=${BUILDING_ID}`);
+  console.log(`[es-mini-agent] relay: polling ${RECORD_POLL_URL}/api/record every ${POLL_INTERVAL_MS}ms`);
+  pollTimer = setInterval(pollOnce, POLL_INTERVAL_MS);
 });
 
 function shutdown(signal) {
   console.log(`[es-mini-agent] ${signal} received, closing server...`);
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
   server.close(() => {
     console.log('[es-mini-agent] server closed. bye.');
     process.exit(0);
