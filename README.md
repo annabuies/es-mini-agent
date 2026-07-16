@@ -1,12 +1,12 @@
 # es-mini-agent
 
-**This agent proves the app-to-Mini connection is real. It does NOT control real cameras / audio / OBS yet — that is a separate future build once the physical rig exists.**
+**This agent proves the app-to-Mini connection is real. It now supports optional OBS Source Record control while keeping the existing in-memory demo mode as the default fallback.**
 
-Small zero-dependency Node HTTP service that runs on a FLEET Mac Mini (or a bench-test Mac standing in for one). The Vercel proxy at `es-os-app/api/record.js` forwards `/record/{start|stop|status|pause|resume}` calls here once `RECORD_CONTROL_URL` and `RECORD_CONTROL_KEY` are set on Vercel. Until then, the proxy returns honest mocks; this agent is what flips it from mock to real.
+Small zero-dependency Node HTTP service that runs on a FLEET Mac Mini (or a bench-test Mac standing in for one). The Vercel proxy at `es-os-app/api/record.js` forwards `/record/{start|stop|status|pause|resume}` calls here once `RECORD_CONTROL_URL` and `RECORD_CONTROL_KEY` are set on Vercel. If OBS env vars are omitted, the legacy demo/mock path remains unchanged.
 
 ## Requirements
 
-- Node.js `>=18` (uses only the built-in `http` module — zero runtime deps).
+- Node.js `>=22` (uses only built-ins, including the stable global `WebSocket` client for OBS control).
 
 ## Install
 
@@ -14,13 +14,17 @@ Nothing to install. `npm install` is a no-op (no dependencies).
 
 ## Configure
 
-Three env vars:
+Core + optional env vars:
 
 | var                  | required | example                       | notes |
 |----------------------|----------|-------------------------------|-------|
 | `PORT`               | no       | `8787`                        | default `8787` |
 | `RECORD_CONTROL_KEY` | **yes**  | long random string            | must match the value set on Vercel; agent refuses to start if unset |
 | `BUILDING_ID`        | **yes**  | `bench-1`                     | this Mini's identity; one Mini serves exactly one building |
+| `OBS_WS_URL`         | no       | `ws://127.0.0.1:4455`         | optional — enables real OBS control; omit for demo mode |
+| `OBS_WS_PASSWORD`    | no       | `(empty)`                     | optional — enables real OBS control; omit for demo mode |
+| `OBS_SOURCES`        | no       | `cam1,cam2`                   | optional — enables real OBS control; omit for demo mode |
+| `OBS_RECORD_DIR`     | no       | `~/es-mini-obs-recordings`    | optional in demo mode; required when `OBS_SOURCES` is set |
 
 Copy `.env.example` for local dev, or edit the `EnvironmentVariables` dict in `com.es.mini-agent.plist` for launchd.
 
@@ -81,13 +85,55 @@ curl -s -X POST http://localhost:8787/record/start \
 # -> {"ok":false,"reason":"building_mismatch"}
 ```
 
+## R2 dummy-upload test (optional, proves the upload pipeline without cameras)
+
+These endpoints trigger a synthetic multipart upload to Cloudflare R2 so you can validate the "upload + confirmation" half of the pipeline without OBS or camera hardware.
+
+- `POST /r2test/start` starts a background multipart upload test and returns immediately with `{ ok, testId, key }`.
+- `GET /r2test/status?testId=<id>` returns the current in-memory progress for that test.
+- `POST /r2test/abort` marks a test as aborted and asks the uploader loop to stop at the next safe part boundary.
+
+Example:
+
+```bash
+KEY=devsecret
+
+# start fresh test (300MB default)
+curl -s -X POST http://localhost:8787/r2test/start \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{}'
+
+# optional resume flow: reuse the same key after restart
+curl -s -X POST http://localhost:8787/r2test/start \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"resume":true,"key":"bench-r2-test/bench-1_1752580000000.bin"}'
+
+# poll status
+curl -s "http://localhost:8787/r2test/status?testId=<TEST_ID>" \
+  -H "Authorization: Bearer $KEY"
+
+# abort
+curl -s -X POST http://localhost:8787/r2test/abort \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"testId":"<TEST_ID>"}'
+```
+
+The uploader automatically pauses whenever a real recording is active (`state.recording === true`) and resumes after recording stops, and successful tests delete their own R2 test object afterward.
+
 ## Contract (what the Vercel proxy expects back)
 
-- `start`, `status`, `resume` → `{ ok, recording, feeds_writing }` (`feeds_writing` is always `null` until the real rig is wired — the frontend gracefully renders "3" when null; do not invent fake counts here.)
+- `start`, `status`, `resume` → `{ ok, recording, feeds_writing }` (demo mode keeps `feeds_writing: null`; OBS mode reports a verified count when recording and `0` when idle)
 - `stop` → `{ ok, saved }`
 - `pause` → `{ ok, paused }`
 
 Request body from the proxy: `{ building_id, client_code }`. Auth: `Authorization: Bearer <RECORD_CONTROL_KEY>`.
+
+## OBS control (optional)
+
+- Requires OBS Studio 28+ (obs-websocket v5 is built in). Enable/configure it in **Tools -> obs-websocket Settings** (port/password must match env vars here).
+- Requires exeldro's **Source Record** plugin installed, with a Source Record filter added to each source listed in `OBS_SOURCES`.
+- For `feeds_writing` detection to work, each source's Source Record filter **Path** must be set to `<OBS_RECORD_DIR>/<sourceName>/` (example: source `cam1` writes to `<OBS_RECORD_DIR>/cam1/`).
+- If `OBS_SOURCES` is unset/empty, the agent stays in demo mode (same in-memory behavior as before).
 
 ## Install as a launchd LaunchAgent (auto-start + auto-restart)
 
@@ -127,9 +173,8 @@ Request body from the proxy: `{ building_id, client_code }`. Auth: `Authorizatio
 
 ## What this agent explicitly does NOT do (yet)
 
-- No OBS / camera / audio device control.
+- No direct control of physical camera/audio hardware outside OBS itself.
 - No file writing of media.
-- No real `feeds_writing` count — always `null`.
 - No persistence — state (`recording`, `paused`) is in-memory only and resets on restart. That is intentional for the bench-test phase.
 
 Those come in a follow-up track once the physical studio rig exists.

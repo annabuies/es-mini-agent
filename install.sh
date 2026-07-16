@@ -30,6 +30,17 @@ err()  { printf '%s[error]%s %s\n' "$RED" "$RST" "$*" 1>&2; }
 : "${RECORD_CONTROL_KEY:=}"
 PORT="${PORT:-8787}"
 AUTO_TUNNEL="${AUTO_TUNNEL:-0}"
+# Optional OBS control (empty OBS_SOURCES => demo mode, unchanged behavior).
+OBS_SOURCES="${OBS_SOURCES:-}"
+OBS_WS_URL="${OBS_WS_URL:-ws://127.0.0.1:4455}"
+OBS_WS_PASSWORD="${OBS_WS_PASSWORD:-}"
+OBS_RECORD_DIR="${OBS_RECORD_DIR:-}"
+# Optional R2 dummy-upload test creds (used only by the /r2test/* endpoints).
+R2_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID:-}"
+R2_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY:-}"
+R2_BUCKET="${R2_BUCKET:-}"
+R2_ENDPOINT="${R2_ENDPOINT:-}"
+UPLOAD_CONFIRMED_WEBHOOK_URL="${UPLOAD_CONFIRMED_WEBHOOK_URL:-}"
 REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/annabuies/es-mini-agent/main}"
 
 if [[ -z "$BUILDING_ID" || -z "$RECORD_CONTROL_KEY" ]]; then
@@ -85,6 +96,8 @@ else
   }
   download "server.js"
   download "com.es.mini-agent.plist"
+  download "obs-control.js"
+  download "r2-upload.js"
 fi
 
 cd "$PROJECT_DIR"
@@ -140,6 +153,14 @@ if [[ ! -f "$PROJECT_DIR/com.es.mini-agent.plist" ]]; then
   err "com.es.mini-agent.plist not found in $PROJECT_DIR — cannot continue."
   exit 1
 fi
+if [[ ! -f "$PROJECT_DIR/obs-control.js" ]]; then
+  err "obs-control.js not found in $PROJECT_DIR — cannot continue."
+  exit 1
+fi
+if [[ ! -f "$PROJECT_DIR/r2-upload.js" ]]; then
+  err "r2-upload.js not found in $PROJECT_DIR — cannot continue."
+  exit 1
+fi
 
 # ---------- build the launchd plist FROM scratch (heredoc, not sed) ----------
 # We build it ourselves so a RECORD_CONTROL_KEY containing / & or other sed
@@ -169,6 +190,15 @@ LOG_ERR_X="$(xml_escape "$LOG_ERR")"
 PORT_X="$(xml_escape "$PORT")"
 KEY_X="$(xml_escape "$RECORD_CONTROL_KEY")"
 BID_X="$(xml_escape "$BUILDING_ID")"
+OBS_SOURCES_X="$(xml_escape "$OBS_SOURCES")"
+OBS_WS_URL_X="$(xml_escape "$OBS_WS_URL")"
+OBS_WS_PASSWORD_X="$(xml_escape "$OBS_WS_PASSWORD")"
+OBS_RECORD_DIR_X="$(xml_escape "$OBS_RECORD_DIR")"
+R2_ACCESS_KEY_ID_X="$(xml_escape "$R2_ACCESS_KEY_ID")"
+R2_SECRET_ACCESS_KEY_X="$(xml_escape "$R2_SECRET_ACCESS_KEY")"
+R2_BUCKET_X="$(xml_escape "$R2_BUCKET")"
+R2_ENDPOINT_X="$(xml_escape "$R2_ENDPOINT")"
+UPLOAD_CONFIRMED_WEBHOOK_URL_X="$(xml_escape "$UPLOAD_CONFIRMED_WEBHOOK_URL")"
 
 # Write to a temp file first, then move + chmod, so we never leave a
 # world-readable plist containing the secret on disk mid-write.
@@ -199,6 +229,24 @@ cat > "$TMP_PLIST" <<PLIST
         <string>${KEY_X}</string>
         <key>BUILDING_ID</key>
         <string>${BID_X}</string>
+        <key>OBS_SOURCES</key>
+        <string>${OBS_SOURCES_X}</string>
+        <key>OBS_WS_URL</key>
+        <string>${OBS_WS_URL_X}</string>
+        <key>OBS_WS_PASSWORD</key>
+        <string>${OBS_WS_PASSWORD_X}</string>
+        <key>OBS_RECORD_DIR</key>
+        <string>${OBS_RECORD_DIR_X}</string>
+        <key>R2_ACCESS_KEY_ID</key>
+        <string>${R2_ACCESS_KEY_ID_X}</string>
+        <key>R2_SECRET_ACCESS_KEY</key>
+        <string>${R2_SECRET_ACCESS_KEY_X}</string>
+        <key>R2_BUCKET</key>
+        <string>${R2_BUCKET_X}</string>
+        <key>R2_ENDPOINT</key>
+        <string>${R2_ENDPOINT_X}</string>
+        <key>UPLOAD_CONFIRMED_WEBHOOK_URL</key>
+        <string>${UPLOAD_CONFIRMED_WEBHOOK_URL_X}</string>
     </dict>
 
     <key>RunAtLoad</key>

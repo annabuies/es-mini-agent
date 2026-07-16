@@ -46,6 +46,24 @@
         <string>REPLACE_ME_WITH_REAL_SECRET</string>
         <key>BUILDING_ID</key>
         <string>REPLACE_ME_e_g_bench-1</string>
+        <key>OBS_WS_URL</key>
+        <string>ws://127.0.0.1:4455</string>
+        <key>OBS_WS_PASSWORD</key>
+        <string></string>
+        <key>OBS_SOURCES</key>
+        <string></string>
+        <key>OBS_RECORD_DIR</key>
+        <string></string>
+        <key>R2_ACCESS_KEY_ID</key>
+        <string>REPLACE_ME_R2_ACCESS_KEY_ID</string>
+        <key>R2_SECRET_ACCESS_KEY</key>
+        <string>REPLACE_ME_R2_SECRET_ACCESS_KEY</string>
+        <key>R2_BUCKET</key>
+        <string>REPLACE_ME_R2_BUCKET</string>
+        <key>R2_ENDPOINT</key>
+        <string>https://REPLACE_ME_ACCOUNT_ID.r2.cloudflarestorage.com</string>
+        <key>UPLOAD_CONFIRMED_WEBHOOK_URL</key>
+        <string></string>
     </dict>
 
     <key>RunAtLoad</key>
