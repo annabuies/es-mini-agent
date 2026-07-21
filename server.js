@@ -249,11 +249,18 @@ async function handleOp(op, body) {
 
     let filesStable = false;
     if (OBS_RECORD_DIR) {
-      const firstSample = sampleFeedsWriting(OBS_SOURCES, OBS_RECORD_DIR, new Map()).samples;
-      await sleep(1200);
-      const secondSample = sampleFeedsWriting(OBS_SOURCES, OBS_RECORD_DIR, firstSample).samples;
-      feedsPrevSamples = secondSample;
-      filesStable = OBS_SOURCES.every((source) => didSourceFileStabilize(firstSample, secondSample, source));
+      let prevSample = sampleFeedsWriting(OBS_SOURCES, OBS_RECORD_DIR, new Map()).samples;
+      for (let i = 0; i < 4; i += 1) {
+        await sleep(900);
+        const newSample = sampleFeedsWriting(OBS_SOURCES, OBS_RECORD_DIR, prevSample).samples;
+        if (OBS_SOURCES.every((source) => didSourceFileStabilize(prevSample, newSample, source))) {
+          filesStable = true;
+          prevSample = newSample;
+          break;
+        }
+        prevSample = newSample;
+      }
+      feedsPrevSamples = prevSample;
     } else {
       await sleep(1200);
     }
