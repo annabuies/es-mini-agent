@@ -363,9 +363,71 @@ function sampleFeedsWriting(sources, recordDir, prevSamples) {
   return { count, samples: nextSamples };
 }
 
+async function getSourceScreenshot(client, source, width, quality) {
+  if (!client || typeof client.request !== 'function') return null;
+
+  async function attempt(imageFormat) {
+    try {
+      const response = await client.request('GetSourceScreenshot', {
+        sourceName: source,
+        imageFormat,
+        imageWidth: width,
+        imageCompressionQuality: quality,
+      });
+
+      const status = response && response.requestStatus;
+      if (!status || typeof status !== 'object') {
+        return { ok: false, retryWithJpeg: false, frame: null };
+      }
+      if (status.result === false) {
+        const comment = typeof status.comment === 'string' ? status.comment.toLowerCase() : '';
+        const retryWithJpeg = imageFormat === 'jpg' && comment.includes('format');
+        return { ok: false, retryWithJpeg, frame: null };
+      }
+      if (status.result !== true) {
+        return { ok: false, retryWithJpeg: false, frame: null };
+      }
+
+      const imageData = response && response.responseData && response.responseData.imageData;
+      if (typeof imageData !== 'string') {
+        return { ok: false, retryWithJpeg: false, frame: null };
+      }
+      const comma = imageData.indexOf(',');
+      if (comma < 0 || comma >= (imageData.length - 1)) {
+        return { ok: false, retryWithJpeg: false, frame: null };
+      }
+
+      const payload = imageData.slice(comma + 1).trim();
+      if (!payload) {
+        return { ok: false, retryWithJpeg: false, frame: null };
+      }
+      if (!/^[A-Za-z0-9+/=\r\n]+$/.test(payload)) {
+        return { ok: false, retryWithJpeg: false, frame: null };
+      }
+
+      const frame = Buffer.from(payload, 'base64');
+      if (!frame || frame.length === 0) {
+        return { ok: false, retryWithJpeg: false, frame: null };
+      }
+      return { ok: true, retryWithJpeg: false, frame };
+    } catch (_) {
+      return { ok: false, retryWithJpeg: false, frame: null };
+    }
+  }
+
+  const first = await attempt('jpg');
+  if (first.ok) return first.frame;
+  if (first.retryWithJpeg) {
+    const second = await attempt('jpeg');
+    if (second.ok) return second.frame;
+  }
+  return null;
+}
+
 module.exports = {
   ObsClient,
   callVendor,
+  getSourceScreenshot,
   getNewestFileSample,
   sampleFeedsWriting,
 };

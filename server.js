@@ -5,11 +5,11 @@
 // Optional OBS Source Record control; in-memory demo mode remains the fallback.
 
 const http = require('http');
-const { ObsClient, callVendor, getNewestFileSample, sampleFeedsWriting } = require('./obs-control');
+const { ObsClient, callVendor, getNewestFileSample, getSourceScreenshot, sampleFeedsWriting } = require('./obs-control');
 const crypto = require('crypto');
 const path = require('path');
 const { createUploadQueue } = require('./upload-queue');
-const { runMultipartUploadTest } = require('./r2-upload');
+const { runMultipartUploadTest, signR2Request } = require('./r2-upload');
 
 const PORT = parseInt(process.env.PORT || '8787', 10);
 const RECORD_CONTROL_KEY = process.env.RECORD_CONTROL_KEY;
@@ -19,6 +19,10 @@ const BUILDING_ID = process.env.BUILDING_ID;
 // RECORD_CONTROL_KEY) keeps working unchanged after this update.
 const RECORD_POLL_URL = process.env.RECORD_POLL_URL || 'https://es-os-app.vercel.app';
 const POLL_INTERVAL_MS = 1000;
+const PREVIEW_INTERVAL_MS = 1500;
+const PREVIEW_TTL_MS = 60000;
+const PREVIEW_WIDTH = 640;
+const PREVIEW_JPEG_QUALITY = 60;
 const OBS_WS_URL = process.env.OBS_WS_URL || 'ws://127.0.0.1:4455';
 const OBS_WS_PASSWORD = process.env.OBS_WS_PASSWORD || '';
 const OBS_SOURCES_RAW = process.env.OBS_SOURCES || '';
@@ -50,6 +54,11 @@ const state = { recording: false, paused: false, recordingStartedAt: null };
 const r2Tests = new Map();
 let obsClient = null;
 let feedsPrevSamples = new Map();
+let previewUntil = 0;
+let previewTimer = null;
+let previewBusy = false;
+let previewLastOkAt = 0;
+let lastPreviewWarnAt = 0;
 
 function log(method, path, status, note) {
   const ts = new Date().toISOString();
@@ -183,6 +192,87 @@ async function getObsClient() {
   return obsClient;
 }
 
+function previewActive() {
+  return !!(previewTimer && Date.now() <= previewUntil);
+}
+
+function maybeWarnPreview(detail) {
+  const now = Date.now();
+  if (now - lastPreviewWarnAt < 30000) return;
+  lastPreviewWarnAt = now;
+  console.warn('[es-mini-agent] [preview] WARN:', truncateDetail(detail));
+}
+
+async function pushPreviewFrames() {
+  if (previewBusy) return;
+
+  if (Date.now() > previewUntil) {
+    if (previewTimer) {
+      clearInterval(previewTimer);
+      previewTimer = null;
+      console.log('[es-mini-agent] [preview] stopped (ttl)');
+    }
+    return;
+  }
+
+  previewBusy = true;
+  try {
+    let client;
+    try {
+      client = await getObsClient();
+    } catch (e) {
+      maybeWarnPreview('obs preview connect failed: ' + (e && (e.message || e)));
+      return;
+    }
+
+    for (const source of OBS_SOURCES) {
+      if (Date.now() > previewUntil) break;
+      const frame = await getSourceScreenshot(client, source, PREVIEW_WIDTH, PREVIEW_JPEG_QUALITY);
+      if (!frame) {
+        maybeWarnPreview('obs preview screenshot unavailable source=' + source);
+        continue;
+      }
+
+      try {
+        const key = `preview/${BUILDING_ID}/${source}.jpg`;
+        const signed = signR2Request({
+          method: 'PUT',
+          key,
+          query: {},
+          accessKeyId: R2_ACCESS_KEY_ID,
+          secretAccessKey: R2_SECRET_ACCESS_KEY,
+          bucket: R2_BUCKET,
+          endpoint: R2_ENDPOINT,
+        });
+        const putRes = await fetch(signed.url, {
+          method: 'PUT',
+          headers: Object.assign({}, signed.headers, {
+            'content-type': 'image/jpeg',
+          }),
+          body: frame,
+        });
+        if (!putRes.ok) {
+          maybeWarnPreview('preview put failed source=' + source + ' status=' + putRes.status);
+          continue;
+        }
+        previewLastOkAt = Date.now();
+      } catch (e) {
+        maybeWarnPreview('preview upload failed source=' + source + ': ' + (e && (e.message || e)));
+      }
+    }
+
+    if (Date.now() > previewUntil && previewTimer) {
+      clearInterval(previewTimer);
+      previewTimer = null;
+      console.log('[es-mini-agent] [preview] stopped (ttl)');
+    }
+  } catch (e) {
+    maybeWarnPreview('preview tick failed: ' + (e && (e.message || e)));
+  } finally {
+    previewBusy = false;
+  }
+}
+
 function didSourceFileStabilize(beforeSamples, afterSamples, source) {
   const before = beforeSamples.get(source);
   const after = afterSamples.get(source);
@@ -209,7 +299,7 @@ async function handleOp(op, body) {
       return { ok: true, cancelled: true, saved: false };
     }
     if (op === 'status') {
-      return { ok: true, recording: state.recording, feeds_writing: null };
+      return { ok: true, recording: state.recording, feeds_writing: null, preview: false };
     }
     if (op === 'pause') {
       if (!state.recording) {
@@ -222,6 +312,9 @@ async function handleOp(op, body) {
       state.paused = false;
       state.recording = true;
       return { ok: true, recording: true, feeds_writing: null };
+    }
+    if (op === 'preview_start' || op === 'preview_stop') {
+      return { ok: true, preview: false };
     }
     return null;
   }
@@ -366,13 +459,13 @@ async function handleOp(op, body) {
   }
   if (op === 'status') {
     if (!state.recording) {
-      const out = { ok: true, recording: false, feeds_writing: 0 };
+      const out = { ok: true, recording: false, feeds_writing: 0, preview: previewActive() };
       if (uploadQueue) out.uploads = uploadQueue.status();
       return out;
     }
     const sampled = sampleFeedsWriting(OBS_SOURCES, OBS_RECORD_DIR, feedsPrevSamples);
     feedsPrevSamples = sampled.samples;
-    const out = { ok: true, recording: true, feeds_writing: sampled.count };
+    const out = { ok: true, recording: true, feeds_writing: sampled.count, preview: previewActive() };
     if (uploadQueue) out.uploads = uploadQueue.status();
     return out;
   }
@@ -411,10 +504,30 @@ async function handleOp(op, body) {
     state.recording = true;
     return { ok: true, recording: true, feeds_writing: null };
   }
+  if (op === 'preview_start') {
+    if (!isR2Configured()) {
+      return { ok: false, reason: 'r2_unconfigured' };
+    }
+    previewUntil = Date.now() + PREVIEW_TTL_MS;
+    if (!previewTimer) {
+      previewTimer = setInterval(pushPreviewFrames, PREVIEW_INTERVAL_MS);
+      console.log('[es-mini-agent] [preview] started');
+    }
+    return { ok: true, preview: true };
+  }
+  if (op === 'preview_stop') {
+    previewUntil = 0;
+    if (previewTimer) {
+      clearInterval(previewTimer);
+      previewTimer = null;
+      console.log('[es-mini-agent] [preview] stopped');
+    }
+    return { ok: true, preview: false };
+  }
   return null;
 }
 
-const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume']);
+const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop']);
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -606,7 +719,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    const m = url.match(/^\/record\/([a-z]+)\/?$/);
+    const m = url.match(/^\/record\/([a-z_]+)\/?$/);
     if (m && method === 'POST') {
       const op = m[1];
 
@@ -727,6 +840,10 @@ function shutdown(signal) {
   if (pollTimer) {
     clearInterval(pollTimer);
     pollTimer = null;
+  }
+  if (previewTimer) {
+    clearInterval(previewTimer);
+    previewTimer = null;
   }
   server.close(() => {
     console.log('[es-mini-agent] server closed. bye.');
