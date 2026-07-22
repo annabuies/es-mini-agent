@@ -2,3 +2,4 @@
 node_modules
 *.log
 .r2-test-tmp/
+.r2-uploads/

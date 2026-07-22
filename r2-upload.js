@@ -253,23 +253,51 @@ function signR2Request({
   };
 }
 
-async function runMultipartUploadTest(opts) {
+async function writeMultipartStateMerged(stateFilePath, state) {
+  const existing = await readJsonFile(stateFilePath);
+  const base = existing && typeof existing === 'object' ? existing : {};
+  const next = Object.assign({}, base, {
+    uploadId: state.uploadId,
+    key: state.key,
+    partSize: state.partSize,
+    totalParts: state.totalParts,
+    completedParts: normalizeCompletedParts(state.completedParts),
+  });
+  await writeJsonFileAtomic(stateFilePath, next);
+  return next;
+}
+
+async function runMultipartUpload(opts) {
   const startedAt = Date.now();
-  const r2Config = opts && opts.r2Config ? opts.r2Config : {};
-  const key = String((opts && opts.key) || '').trim();
-  const testId = opts && opts.testId ? opts.testId : undefined;
-  const sizeBytesRaw = Number(opts && opts.sizeBytes);
+  const options = opts && typeof opts === 'object' ? opts : {};
+  const r2Config = options.r2Config && typeof options.r2Config === 'object' ? options.r2Config : {};
+  const key = String(options.key || '').trim();
+  const filePathRaw = String(options.filePath || '').trim();
+  const filePath = path.resolve(filePathRaw);
+  const sizeBytesRaw = Number(options.sizeBytes);
   const sizeBytes = Number.isFinite(sizeBytesRaw) && sizeBytesRaw > 0
     ? Math.floor(sizeBytesRaw)
-    : DEFAULT_SIZE_BYTES;
-
-  if (!key) throw new Error('runMultipartUploadTest requires key');
-
-  const stateFilePath = path.resolve(String((opts && opts.stateFilePath) || path.join(process.cwd(), '.r2-test-tmp', toSafeFileName(key) + '.state.json')));
-  const tmpDir = path.dirname(stateFilePath);
-  const dummyFilePath = path.join(tmpDir, toSafeFileName(key) + '.bin');
+    : 0;
+  const stateFilePathRaw = String(options.stateFilePath || '').trim();
+  const stateFilePath = path.resolve(stateFilePathRaw);
+  const webhookExtra = options.webhookExtra && typeof options.webhookExtra === 'object' && !Array.isArray(options.webhookExtra)
+    ? options.webhookExtra
+    : {};
+  const abortOnFailure = options.abortOnFailure !== false;
+  const deleteObjectAfterVerify = !!options.deleteObjectAfterVerify;
   const partSize = PART_SIZE_BYTES;
   const totalParts = Math.ceil(sizeBytes / partSize);
+
+  if (!key) throw new Error('runMultipartUpload requires key');
+  if (!filePathRaw) throw new Error('runMultipartUpload requires filePath');
+  if (!stateFilePathRaw) throw new Error('runMultipartUpload requires stateFilePath');
+  if (!sizeBytes) throw new Error('runMultipartUpload requires sizeBytes');
+
+  const st = await fsp.stat(filePath);
+  if (!st.isFile()) throw new Error('runMultipartUpload filePath is not a file');
+  if (st.size !== sizeBytes) {
+    throw new Error('runMultipartUpload sizeBytes mismatch expected=' + sizeBytes + ' actual=' + st.size);
+  }
 
   let uploadId = null;
   let multipartFinalized = false;
@@ -298,8 +326,7 @@ async function runMultipartUploadTest(opts) {
   }
 
   try {
-    await fsp.mkdir(tmpDir, { recursive: true });
-    await ensureDummyFile(dummyFilePath, sizeBytes);
+    await fsp.mkdir(path.dirname(stateFilePath), { recursive: true });
 
     const existingState = await readJsonFile(stateFilePath);
     if (existingState && existingState.key === key && existingState.uploadId) {
@@ -323,20 +350,21 @@ async function runMultipartUploadTest(opts) {
       }
       uploadId = uploadIdMatch[1];
       stateForCompletion = buildStateFromParts(uploadId, key, partSize, totalParts, []);
-      await writeJsonFileAtomic(stateFilePath, stateForCompletion);
+      const mergedState = await writeMultipartStateMerged(stateFilePath, stateForCompletion);
+      stateForCompletion = buildStateFromParts(uploadId, key, partSize, totalParts, mergedState.completedParts);
     }
 
-    const fileHandle = await fsp.open(dummyFilePath, 'r');
+    const fileHandle = await fsp.open(filePath, 'r');
     try {
       for (let partNumber = 1; partNumber <= totalParts; partNumber += 1) {
         const alreadyDone = stateForCompletion.completedParts.some((part) => part.partNumber === partNumber);
         if (alreadyDone) continue;
 
         while (true) {
-          if (opts && typeof opts.shouldAbort === 'function' && opts.shouldAbort()) {
+          if (typeof options.shouldAbort === 'function' && options.shouldAbort()) {
             throw makeAbortError();
           }
-          if (!(opts && typeof opts.isRecording === 'function' && opts.isRecording())) break;
+          if (!(typeof options.isRecording === 'function' && options.isRecording())) break;
           const waitStart = Date.now();
           await sleep(RECORDING_CHECK_INTERVAL_MS);
           pausedForRecordingMs += (Date.now() - waitStart);
@@ -372,11 +400,12 @@ async function runMultipartUploadTest(opts) {
 
         stateForCompletion.completedParts.push({ partNumber, etag });
         stateForCompletion = buildStateFromParts(uploadId, key, partSize, totalParts, stateForCompletion.completedParts);
-        await writeJsonFileAtomic(stateFilePath, stateForCompletion);
+        const mergedState = await writeMultipartStateMerged(stateFilePath, stateForCompletion);
+        stateForCompletion = buildStateFromParts(uploadId, key, partSize, totalParts, mergedState.completedParts);
 
-        if (opts && typeof opts.onProgress === 'function') {
+        if (typeof options.onProgress === 'function') {
           try {
-            opts.onProgress({
+            options.onProgress({
               partsCompleted: stateForCompletion.completedParts.length,
               totalParts,
               bytesUploaded: bytesUploadedForParts(stateForCompletion.completedParts, sizeBytes, partSize),
@@ -429,17 +458,16 @@ async function runMultipartUploadTest(opts) {
     }
     verified = true;
 
-    const payload = {
+    const payload = Object.assign({
       event: 'upload_confirmed',
       key,
       sizeBytes,
-      testId,
       confirmedAt: new Date().toISOString(),
-    };
+    }, webhookExtra);
     console.log('[r2-upload] upload_confirmed:', JSON.stringify(payload));
-    if (opts && opts.webhookUrl) {
+    if (options.webhookUrl) {
       try {
-        const webhookRes = await fetch(String(opts.webhookUrl), {
+        const webhookRes = await fetch(String(options.webhookUrl), {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify(payload),
@@ -466,19 +494,19 @@ async function runMultipartUploadTest(opts) {
   } catch (e) {
     fatalError = e;
   } finally {
-    if (verified) {
+    if (verified && deleteObjectAfterVerify) {
       try {
         const deleteRes = await signedFetch('DELETE', {}, null);
         if (!deleteRes.ok) {
           const detail = truncateDetail(await readResponseTextSafe(deleteRes));
           throw new Error('DeleteObject cleanup failed status=' + deleteRes.status + ' detail=' + detail);
         }
-        await removeFileIfExists(dummyFilePath);
+        await removeFileIfExists(filePath);
         await removeFileIfExists(stateFilePath);
       } catch (cleanupErr) {
         fatalError = fatalError || cleanupErr;
       }
-    } else if (uploadId && !multipartFinalized) {
+    } else if (uploadId && !multipartFinalized && abortOnFailure) {
       try {
         const abortRes = await signedFetch('DELETE', { uploadId }, null);
         if (!abortRes.ok) {
@@ -488,7 +516,7 @@ async function runMultipartUploadTest(opts) {
       } catch (abortErr) {
         console.warn('[r2-upload] AbortMultipartUpload error:', abortErr && (abortErr.stack || abortErr.message || abortErr));
       }
-    } else if (fatalError && multipartFinalized) {
+    } else if (fatalError && multipartFinalized && abortOnFailure) {
       // Verify failed after completion: object may already exist and incur cost; best-effort delete.
       try {
         await signedFetch('DELETE', {}, null);
@@ -505,7 +533,42 @@ async function runMultipartUploadTest(opts) {
   return summary;
 }
 
+async function runMultipartUploadTest(opts) {
+  const options = opts && typeof opts === 'object' ? opts : {};
+  const r2Config = options.r2Config ? options.r2Config : {};
+  const key = String(options.key || '').trim();
+  const testId = options.testId ? options.testId : undefined;
+  const sizeBytesRaw = Number(options.sizeBytes);
+  const sizeBytes = Number.isFinite(sizeBytesRaw) && sizeBytesRaw > 0
+    ? Math.floor(sizeBytesRaw)
+    : DEFAULT_SIZE_BYTES;
+
+  if (!key) throw new Error('runMultipartUploadTest requires key');
+
+  const stateFilePath = path.resolve(String(options.stateFilePath || path.join(process.cwd(), '.r2-test-tmp', toSafeFileName(key) + '.state.json')));
+  const tmpDir = path.dirname(stateFilePath);
+  const dummyFilePath = path.join(tmpDir, toSafeFileName(key) + '.bin');
+  await fsp.mkdir(tmpDir, { recursive: true });
+  await ensureDummyFile(dummyFilePath, sizeBytes);
+
+  return runMultipartUpload({
+    r2Config,
+    key,
+    filePath: dummyFilePath,
+    sizeBytes,
+    stateFilePath,
+    isRecording: options.isRecording,
+    shouldAbort: options.shouldAbort,
+    onProgress: options.onProgress,
+    webhookUrl: options.webhookUrl,
+    webhookExtra: { testId },
+    abortOnFailure: true,
+    deleteObjectAfterVerify: true,
+  });
+}
+
 module.exports = {
   signR2Request,
+  runMultipartUpload,
   runMultipartUploadTest,
 };

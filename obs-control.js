@@ -319,6 +319,8 @@ function getNewestFileSample(sourceDir) {
 
     if (!newest || stat.mtimeMs > newest.mtimeMs) {
       newest = {
+        name: entry.name,
+        absPath,
         size: stat.size,
         mtimeMs: stat.mtimeMs,
       };
@@ -364,5 +366,6 @@ function sampleFeedsWriting(sources, recordDir, prevSamples) {
 module.exports = {
   ObsClient,
   callVendor,
+  getNewestFileSample,
   sampleFeedsWriting,
 };

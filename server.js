@@ -5,9 +5,10 @@
 // Optional OBS Source Record control; in-memory demo mode remains the fallback.
 
 const http = require('http');
-const { ObsClient, callVendor, sampleFeedsWriting } = require('./obs-control');
+const { ObsClient, callVendor, getNewestFileSample, sampleFeedsWriting } = require('./obs-control');
 const crypto = require('crypto');
 const path = require('path');
+const { createUploadQueue } = require('./upload-queue');
 const { runMultipartUploadTest } = require('./r2-upload');
 
 const PORT = parseInt(process.env.PORT || '8787', 10);
@@ -45,7 +46,7 @@ if (!BUILDING_ID) {
 }
 
 const START_TIME = Date.now();
-const state = { recording: false, paused: false };
+const state = { recording: false, paused: false, recordingStartedAt: null };
 const r2Tests = new Map();
 let obsClient = null;
 let feedsPrevSamples = new Map();
@@ -119,6 +120,21 @@ function sleep(ms) {
 function isR2Configured() {
   return !!(R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY && R2_BUCKET && R2_ENDPOINT);
 }
+
+const uploadQueue = isR2Configured()
+  ? createUploadQueue({
+    r2Config: {
+      accessKeyId: R2_ACCESS_KEY_ID,
+      secretAccessKey: R2_SECRET_ACCESS_KEY,
+      bucket: R2_BUCKET,
+      endpoint: R2_ENDPOINT,
+    },
+    stateDir: path.join(__dirname, '.r2-uploads'),
+    isRecording: () => state.recording,
+    webhookUrl: UPLOAD_CONFIRMED_WEBHOOK_URL,
+    buildingId: BUILDING_ID,
+  })
+  : null;
 
 function parseSizeBytesOrDefault(value) {
   if (value == null || value === '') return R2_DEFAULT_TEST_SIZE_BYTES;
@@ -230,6 +246,7 @@ async function handleOp(op, body) {
     feedsPrevSamples = new Map();
     state.recording = true;
     state.paused = false;
+    state.recordingStartedAt = Date.now();
     return { ok: true, recording: true, feeds_writing: null };
   }
   if (op === 'stop') {
@@ -267,18 +284,46 @@ async function handleOp(op, body) {
 
     const allStopsSucceeded = stopResults.every((entry) => entry.vendor.success);
     const saved = allStopsSucceeded && filesStable;
+    const recordingStartedAt = state.recordingStartedAt;
+    let uploadQueued = 0;
+
+    if (uploadQueue && OBS_RECORD_DIR) {
+      if (!recordingStartedAt) {
+        console.warn('[es-mini-agent] upload skipped: unknown recording start');
+      } else {
+        for (const source of OBS_SOURCES) {
+          try {
+            const sourceDir = path.join(OBS_RECORD_DIR, source);
+            const newest = getNewestFileSample(sourceDir);
+            if (!newest || !newest.absPath) continue;
+            if (newest.mtimeMs < (recordingStartedAt - 60000)) continue;
+            const out = uploadQueue.enqueue({ filePath: newest.absPath, source });
+            if (out && out.queued) uploadQueued += 1;
+          } catch (e) {
+            console.warn('[es-mini-agent] upload enqueue failed source=' + source + ':', e && (e.stack || e.message || e));
+          }
+        }
+      }
+    }
 
     state.recording = false;
     state.paused = false;
-    return { ok: true, saved };
+    state.recordingStartedAt = null;
+    const response = { ok: true, saved };
+    if (uploadQueue) response.upload_queued = uploadQueued;
+    return response;
   }
   if (op === 'status') {
     if (!state.recording) {
-      return { ok: true, recording: false, feeds_writing: 0 };
+      const out = { ok: true, recording: false, feeds_writing: 0 };
+      if (uploadQueue) out.uploads = uploadQueue.status();
+      return out;
     }
     const sampled = sampleFeedsWriting(OBS_SOURCES, OBS_RECORD_DIR, feedsPrevSamples);
     feedsPrevSamples = sampled.samples;
-    return { ok: true, recording: true, feeds_writing: sampled.count };
+    const out = { ok: true, recording: true, feeds_writing: sampled.count };
+    if (uploadQueue) out.uploads = uploadQueue.status();
+    return out;
   }
   if (op === 'pause') {
     if (!state.recording) {
@@ -619,6 +664,11 @@ server.listen(PORT, () => {
   console.log(`[es-mini-agent] listening on :${PORT} building_id=${BUILDING_ID}`);
   console.log(`[es-mini-agent] relay: polling ${RECORD_POLL_URL}/api/record every ${POLL_INTERVAL_MS}ms`);
   pollTimer = setInterval(pollOnce, POLL_INTERVAL_MS);
+  if (uploadQueue) {
+    uploadQueue.sweep().catch((e) => {
+      console.warn('[es-mini-agent] upload queue sweep failed:', e && (e.stack || e.message || e));
+    });
+  }
 });
 
 function shutdown(signal) {

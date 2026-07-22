@@ -120,6 +120,16 @@ curl -s -X POST http://localhost:8787/r2test/abort \
 
 The uploader automatically pauses whenever a real recording is active (`state.recording === true`) and resumes after recording stops, and successful tests delete their own R2 test object afterward.
 
+## On-stop recording upload (R2)
+
+When R2 credentials are configured (`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_ENDPOINT`), real OBS recordings are automatically enqueued for upload on every `stop` call.
+
+- Object key layout: `recordings/<building_id>/<source>/<filename>`
+- Uploads are resumable across agent restarts via `.r2-uploads/*.state.json`
+- Upload part transfer pauses while a recording is active and resumes when recording stops
+- Recording files are never deleted from the Mac mini by this upload path
+- Failed uploads are logged in `agent.log` and surfaced again during boot sweep; failed states are left in place and are not auto-retried
+
 ## Contract (what the Vercel proxy expects back)
 
 - `start`, `status`, `resume` → `{ ok, recording, feeds_writing }` (demo mode keeps `feeds_writing: null`; OBS mode reports a verified count when recording and `0` when idle)

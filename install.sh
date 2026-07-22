@@ -98,6 +98,7 @@ else
   download "com.es.mini-agent.plist"
   download "obs-control.js"
   download "r2-upload.js"
+  download "upload-queue.js"
 fi
 
 cd "$PROJECT_DIR"
@@ -159,6 +160,10 @@ if [[ ! -f "$PROJECT_DIR/obs-control.js" ]]; then
 fi
 if [[ ! -f "$PROJECT_DIR/r2-upload.js" ]]; then
   err "r2-upload.js not found in $PROJECT_DIR — cannot continue."
+  exit 1
+fi
+if [[ ! -f "$PROJECT_DIR/upload-queue.js" ]]; then
+  err "upload-queue.js not found in $PROJECT_DIR — cannot continue."
   exit 1
 fi
 
