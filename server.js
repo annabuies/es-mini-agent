@@ -203,6 +203,11 @@ async function handleOp(op, body) {
       state.paused = false;
       return { ok: true, saved: true };
     }
+    if (op === 'cancel') {
+      state.recording = false;
+      state.paused = false;
+      return { ok: true, cancelled: true, saved: false };
+    }
     if (op === 'status') {
       return { ok: true, recording: state.recording, feeds_writing: null };
     }
@@ -222,6 +227,9 @@ async function handleOp(op, body) {
   }
 
   if (op === 'start') {
+    if (state.recording) {
+      return { ok: true, recording: true, feeds_writing: null, already: true };
+    }
     if (!OBS_RECORD_DIR) {
       return { ok: false, reason: 'obs_misconfigured' };
     }
@@ -313,6 +321,49 @@ async function handleOp(op, body) {
     if (uploadQueue) response.upload_queued = uploadQueued;
     return response;
   }
+  if (op === 'cancel') {
+    let stopResults;
+    try {
+      const client = await getObsClient();
+      stopResults = await Promise.all(OBS_SOURCES.map(async (source) => {
+        const vendor = await callVendor(client, 'record_stop', source);
+        return { source, vendor };
+      }));
+    } catch (e) {
+      stopResults = OBS_SOURCES.map((source) => ({
+        source,
+        vendor: { success: false, error: e && (e.message || String(e)) || 'obs_stop_error' },
+      }));
+    }
+
+    if (OBS_RECORD_DIR) {
+      let prevSample = sampleFeedsWriting(OBS_SOURCES, OBS_RECORD_DIR, new Map()).samples;
+      for (let i = 0; i < 4; i += 1) {
+        await sleep(900);
+        const newSample = sampleFeedsWriting(OBS_SOURCES, OBS_RECORD_DIR, prevSample).samples;
+        if (OBS_SOURCES.every((source) => didSourceFileStabilize(prevSample, newSample, source))) {
+          prevSample = newSample;
+          break;
+        }
+        prevSample = newSample;
+      }
+      feedsPrevSamples = prevSample;
+    } else {
+      await sleep(1200);
+    }
+
+    const allStopsSucceeded = stopResults.every((entry) => entry.vendor.success);
+    if (!allStopsSucceeded) {
+      const failed = stopResults.find((entry) => !entry.vendor.success);
+      const detail = failed ? (failed.source + ': ' + (failed.vendor.error || 'unknown_error')) : 'obs_stop_failed';
+      console.warn('[es-mini-agent] WARN: OBS cancel vendor call failed:', truncateDetail(detail));
+    }
+
+    state.recording = false;
+    state.paused = false;
+    state.recordingStartedAt = null;
+    return { ok: true, cancelled: true, saved: false };
+  }
   if (op === 'status') {
     if (!state.recording) {
       const out = { ok: true, recording: false, feeds_writing: 0 };
@@ -363,7 +414,7 @@ async function handleOp(op, body) {
   return null;
 }
 
-const VALID_OPS = new Set(['start', 'stop', 'status', 'pause', 'resume']);
+const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume']);
 
 const server = http.createServer(async (req, res) => {
   try {
