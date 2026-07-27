@@ -19,7 +19,7 @@ const BUILDING_ID = process.env.BUILDING_ID;
 // RECORD_CONTROL_KEY) keeps working unchanged after this update.
 const RECORD_POLL_URL = process.env.RECORD_POLL_URL || 'https://es-os-app.vercel.app';
 const POLL_INTERVAL_MS = 1000;
-const PREVIEW_INTERVAL_MS = 1500;
+const PREVIEW_INTERVAL_MS = 500;
 const PREVIEW_TTL_MS = 60000;
 const PREVIEW_WIDTH = 640;
 const PREVIEW_JPEG_QUALITY = 60;
