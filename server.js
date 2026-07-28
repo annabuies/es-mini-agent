@@ -459,13 +459,13 @@ async function handleOp(op, body) {
   }
   if (op === 'status') {
     if (!state.recording) {
-      const out = { ok: true, recording: false, feeds_writing: 0, preview: previewActive() };
+      const out = { ok: true, recording: false, feeds_writing: 0, preview: previewActive(), sources: OBS_SOURCES.slice() };
       if (uploadQueue) out.uploads = uploadQueue.status();
       return out;
     }
     const sampled = sampleFeedsWriting(OBS_SOURCES, OBS_RECORD_DIR, feedsPrevSamples);
     feedsPrevSamples = sampled.samples;
-    const out = { ok: true, recording: true, feeds_writing: sampled.count, preview: previewActive() };
+    const out = { ok: true, recording: true, feeds_writing: sampled.count, preview: previewActive(), sources: OBS_SOURCES.slice() };
     if (uploadQueue) out.uploads = uploadQueue.status();
     return out;
   }
@@ -513,7 +513,7 @@ async function handleOp(op, body) {
       previewTimer = setInterval(pushPreviewFrames, PREVIEW_INTERVAL_MS);
       console.log('[es-mini-agent] [preview] started');
     }
-    return { ok: true, preview: true };
+    return { ok: true, preview: true, sources: OBS_SOURCES.slice() };
   }
   if (op === 'preview_stop') {
     previewUntil = 0;
