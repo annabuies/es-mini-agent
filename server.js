@@ -358,6 +358,9 @@ async function handleOp(op, body) {
     if (op === 'preview_start' || op === 'preview_stop') {
       return { ok: true, preview: false };
     }
+    if (op === 'diag') {
+      return { ok: true, demo: true, recording: state.recording, stats: null, filters: null };
+    }
     return null;
   }
 
@@ -530,6 +533,72 @@ async function handleOp(op, body) {
     if (uploadQueue) out.uploads = uploadQueue.status();
     return out;
   }
+  if (op === 'diag') {
+    const out = { ok: true, demo: false, recording: state.recording, stats: null, filters: null };
+
+    let client;
+    try {
+      client = await getObsClient();
+    } catch (e) {
+      out.error = 'obs_unreachable';
+      return out;
+    }
+
+    try {
+      const statsRes = await client.request('GetStats', {});
+      const responseData = statsRes && statsRes.responseData;
+      if (responseData && typeof responseData === 'object') {
+        out.stats = {
+          activeFps: typeof responseData.activeFps === 'undefined' ? null : responseData.activeFps,
+          averageFrameRenderTime: typeof responseData.averageFrameRenderTime === 'undefined' ? null : responseData.averageFrameRenderTime,
+          renderSkippedFrames: typeof responseData.renderSkippedFrames === 'undefined' ? null : responseData.renderSkippedFrames,
+          renderTotalFrames: typeof responseData.renderTotalFrames === 'undefined' ? null : responseData.renderTotalFrames,
+          outputSkippedFrames: typeof responseData.outputSkippedFrames === 'undefined' ? null : responseData.outputSkippedFrames,
+          outputTotalFrames: typeof responseData.outputTotalFrames === 'undefined' ? null : responseData.outputTotalFrames,
+          cpuUsage: typeof responseData.cpuUsage === 'undefined' ? null : responseData.cpuUsage,
+          memoryUsage: typeof responseData.memoryUsage === 'undefined' ? null : responseData.memoryUsage,
+          availableDiskSpace: typeof responseData.availableDiskSpace === 'undefined' ? null : responseData.availableDiskSpace,
+        };
+      }
+    } catch (_) { /* stats are best-effort — a failed GetStats must still return the filter data */ }
+
+    const filters = [];
+    for (const source of sessionSources()) {
+      try {
+        const filterRes = await client.request('GetSourceFilterList', { sourceName: source });
+        const responseData = filterRes && filterRes.responseData;
+        const list = responseData && responseData.filters;
+        if (!Array.isArray(list)) {
+          filters.push({ source: source, error: 'no_filter_list' });
+          continue;
+        }
+        let sawRecordFilter = false;
+        for (const f of list) {
+          const entry = {
+            source: source,
+            filter: (f && typeof f.filterName !== 'undefined') ? f.filterName : null,
+            kind: (f && typeof f.filterKind !== 'undefined') ? f.filterKind : null,
+            enabled: !!(f && f.filterEnabled),
+          };
+          if (entry.kind === 'source_record_filter') {
+            entry.settings = (f && f.filterSettings) ? f.filterSettings : {};
+            sawRecordFilter = true;
+          }
+          filters.push(entry);
+        }
+        // A camera with no Source Record filter records NOTHING. Say so loudly:
+        // without this the source would just be absent from the list, and an
+        // absence is the one thing an operator reading a diagnostic won't notice.
+        if (!sawRecordFilter) {
+          filters.push({ source: source, error: 'no_source_record_filter' });
+        }
+      } catch (e) {
+        filters.push({ source: source, error: 'filter_query_failed' });
+      }
+    }
+    out.filters = filters;
+    return out;
+  }
   if (op === 'pause') {
     if (!state.recording) {
       console.warn(`[es-mini-agent] WARN: pause called while not recording (demo-safe: returning ok).`);
@@ -588,7 +657,7 @@ async function handleOp(op, body) {
   return null;
 }
 
-const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop']);
+const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'diag']);
 
 const server = http.createServer(async (req, res) => {
   try {
