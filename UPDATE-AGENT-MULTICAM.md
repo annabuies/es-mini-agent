@@ -48,6 +48,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/annabuies/es-mini-agent/main
 
 The installer unloads/reloads the agent itself and ends with a green **SUCCESS** banner. A red FAILURE banner → `tail -n 50 ~/Documents/es-mini-agent/agent.error.log` and send that to Anna.
 
+> **If Step 1 showed `MISSING UPLOAD_CONFIRMED_WEBHOOK_URL`:** Anna will have replaced the
+> `UPLOAD_CONFIRMED_WEBHOOK_URL="$(getv ...)"` line above with a real URL before sending you this.
+> If she hasn't, run the block as-is and tell her — it just means the "footage saved" Slack
+> notification stays off for now. Everything else in this update still works.
+
 ## Step 3 — Verify
 
 ```bash
