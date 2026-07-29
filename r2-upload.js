@@ -79,6 +79,13 @@ function toSafeFileName(value) {
     .slice(0, 180) || 'r2_dummy_upload';
 }
 
+function contentTypeForKey(key) {
+  const lower = String(key || '').toLowerCase();
+  if (lower.endsWith('.mkv')) return 'video/x-matroska';
+  if (lower.endsWith('.mp4')) return 'video/mp4';
+  return null;
+}
+
 async function readJsonFile(filePath) {
   try {
     const raw = await fsp.readFile(filePath, 'utf8');
@@ -338,7 +345,8 @@ async function runMultipartUpload(opts) {
     } else if (existingState && existingState.key && existingState.key !== key) {
       throw new Error('existing state key mismatch for requested key');
     } else {
-      const createRes = await signedFetch('POST', { uploads: '' }, null);
+      const initiateContentType = contentTypeForKey(key);
+      const createRes = await signedFetch('POST', { uploads: '' }, null, initiateContentType ? { 'content-type': initiateContentType } : undefined);
       if (!createRes.ok) {
         const detail = truncateDetail(await readResponseTextSafe(createRes));
         throw new Error('CreateMultipartUpload failed status=' + createRes.status + ' detail=' + detail);
@@ -568,6 +576,7 @@ async function runMultipartUploadTest(opts) {
 }
 
 module.exports = {
+  contentTypeForKey,
   signR2Request,
   runMultipartUpload,
   runMultipartUploadTest,
