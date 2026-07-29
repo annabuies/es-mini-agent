@@ -145,6 +145,29 @@ if [[ -z "$NODE_MAJOR" || ! "$NODE_MAJOR" =~ ^[0-9]+$ || "$NODE_MAJOR" -lt 18 ]]
 fi
 ok "Node $NODE_VERSION_RAW at $NODE_BIN"
 
+# ---------- find ffmpeg (used for the 1080p playback proxy; recording itself doesn't need it) ----------
+FFMPEG_BIN=""
+if command -v ffmpeg >/dev/null 2>&1; then
+  FFMPEG_BIN="$(command -v ffmpeg)"
+  ok "ffmpeg found at $FFMPEG_BIN"
+else
+  if command -v brew >/dev/null 2>&1; then
+    info "ffmpeg not found — installing with Homebrew (this can take a couple of minutes)..."
+    if brew install ffmpeg && command -v ffmpeg >/dev/null 2>&1; then
+      FFMPEG_BIN="$(command -v ffmpeg)"
+      ok "ffmpeg found at $FFMPEG_BIN"
+    else
+      warn "ffmpeg install via Homebrew did not complete. Recording will still work;"
+      warn "playback proxies (1080p MP4 alongside the 4K master) will be skipped until ffmpeg is installed."
+      warn "To add it later: brew install ffmpeg"
+    fi
+  else
+    warn "ffmpeg is not installed and Homebrew is not available."
+    warn "Recording will still work; playback proxies (1080p MP4 alongside the 4K master) will be skipped until ffmpeg is installed."
+    warn "To add it later: install Homebrew (https://brew.sh) then run: brew install ffmpeg"
+  fi
+fi
+
 # ---------- sanity: server.js and template exist ----------
 if [[ ! -f "$PROJECT_DIR/server.js" ]]; then
   err "server.js not found in $PROJECT_DIR — cannot continue."
