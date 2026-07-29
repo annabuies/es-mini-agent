@@ -206,7 +206,7 @@ function createUploadQueue(opts) {
         stateFilePath: job.stateFilePath,
         isRecording,
         shouldAbort: () => false,
-        webhookUrl,
+        webhookUrl: typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl,
         webhookExtra: { kind: 'recording', building_id: buildingId, source: job.source },
         abortOnFailure: false,
         deleteObjectAfterVerify: false,

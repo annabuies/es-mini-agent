@@ -35,7 +35,10 @@ const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || '';
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || '';
 const R2_BUCKET = process.env.R2_BUCKET || '';
 const R2_ENDPOINT = process.env.R2_ENDPOINT || '';
-const UPLOAD_CONFIRMED_WEBHOOK_URL = process.env.UPLOAD_CONFIRMED_WEBHOOK_URL || '';
+// Boot-time default. A remote value from the relay can override this at runtime
+// (see applyWebhookUrl / refreshSources) so rotating the secret never needs a
+// visit to the studio Mac. Remote can only ever REPLACE it, never blank it.
+let activeWebhookUrl = process.env.UPLOAD_CONFIRMED_WEBHOOK_URL || '';
 const R2_PART_SIZE_BYTES = 25 * 1024 * 1024;
 const R2_DEFAULT_TEST_SIZE_BYTES = 300 * 1024 * 1024;
 const R2_TEST_TMP_DIR = path.join(__dirname, '.r2-test-tmp');
@@ -142,7 +145,7 @@ const uploadQueue = isR2Configured()
     },
     stateDir: path.join(__dirname, '.r2-uploads'),
     isRecording: () => state.recording,
-    webhookUrl: UPLOAD_CONFIRMED_WEBHOOK_URL,
+    webhookUrl: () => activeWebhookUrl,
     buildingId: BUILDING_ID,
   })
   : null;
@@ -308,6 +311,12 @@ function applySources(next) {
   activeSources = next;
   pendingSources = null;
   console.log('[es-mini-agent] sources updated: ' + previous.join(',') + ' -> ' + activeSources.join(','));
+}
+
+function applyWebhookUrl(next) {
+  if (next === activeWebhookUrl) return;
+  activeWebhookUrl = next;
+  console.log('[es-mini-agent] upload webhook updated (remote)');
 }
 
 function sessionSources() {
@@ -667,7 +676,7 @@ const server = http.createServer(async (req, res) => {
           return !!(current && current.shouldAbort);
         },
         stateFilePath: stateFilePathForKey(key),
-        webhookUrl: UPLOAD_CONFIRMED_WEBHOOK_URL,
+        webhookUrl: activeWebhookUrl,
         onProgress: (partial) => {
           const current = r2Tests.get(testId);
           if (!current) return;
@@ -846,21 +855,36 @@ async function refreshSources() {
 
     const data = await getRes.json().catch(() => ({}));
     const remoteSources = data && data.sources;
-    if (!Array.isArray(remoteSources)) return;
-    if (!remoteSources.length) return;
-
-    const next = [];
-    for (const value of remoteSources) {
-      if (typeof value !== 'string') return;
-      const trimmed = value.trim();
-      if (!trimmed) return;
-      next.push(trimmed);
+    if (Array.isArray(remoteSources) && remoteSources.length) {
+      const next = [];
+      let invalid = false;
+      for (const value of remoteSources) {
+        if (typeof value !== 'string') {
+          invalid = true;
+          break;
+        }
+        const trimmed = value.trim();
+        if (!trimmed) {
+          invalid = true;
+          break;
+        }
+        next.push(trimmed);
+      }
+      if (!invalid && next.length) {
+        const current = pendingSources || activeSources;
+        if (!sameSources(next, current)) applySources(next);
+      }
     }
-    if (!next.length) return;
-    const current = pendingSources || activeSources;
-    if (sameSources(next, current)) return;
 
-    applySources(next);
+    const remoteWebhookUrl = data && data.upload_webhook_url;
+    if (typeof remoteWebhookUrl !== 'string') return;
+    const trimmedWebhookUrl = remoteWebhookUrl.trim();
+    if (!trimmedWebhookUrl) return;
+    if (!trimmedWebhookUrl.startsWith('https://')) {
+      console.warn('[es-mini-agent] relay: ignoring non-https upload webhook');
+      return;
+    }
+    applyWebhookUrl(trimmedWebhookUrl);
   } catch (e) {
     console.error('[es-mini-agent] relay: sources refresh error:', e && (e.stack || e.message || e));
   }
