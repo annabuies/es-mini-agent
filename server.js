@@ -19,6 +19,7 @@ const BUILDING_ID = process.env.BUILDING_ID;
 // RECORD_CONTROL_KEY) keeps working unchanged after this update.
 const RECORD_POLL_URL = process.env.RECORD_POLL_URL || 'https://es-os-app.vercel.app';
 const POLL_INTERVAL_MS = 1000;
+const SOURCES_REFRESH_MS = 60000;
 const PREVIEW_INTERVAL_MS = 500;
 const PREVIEW_TTL_MS = 60000;
 const PREVIEW_WIDTH = 640;
@@ -26,10 +27,10 @@ const PREVIEW_JPEG_QUALITY = 60;
 const OBS_WS_URL = process.env.OBS_WS_URL || 'ws://127.0.0.1:4455';
 const OBS_WS_PASSWORD = process.env.OBS_WS_PASSWORD || '';
 const OBS_SOURCES_RAW = process.env.OBS_SOURCES || '';
-const OBS_SOURCES = OBS_SOURCES_RAW.split(',').map((v) => v.trim()).filter(Boolean);
+let activeSources = OBS_SOURCES_RAW.split(',').map((v) => v.trim()).filter(Boolean);
 const OBS_RECORD_DIR = process.env.OBS_RECORD_DIR || '';
 const OBS_ENABLED = !!(OBS_SOURCES_RAW && OBS_SOURCES_RAW.trim());
-const OBS_MODE_ACTIVE = OBS_ENABLED && OBS_SOURCES.length > 0;
+const OBS_MODE_ACTIVE = OBS_ENABLED && activeSources.length > 0;
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || '';
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || '';
 const R2_BUCKET = process.env.R2_BUCKET || '';
@@ -50,7 +51,7 @@ if (!BUILDING_ID) {
 }
 
 const START_TIME = Date.now();
-const state = { recording: false, paused: false, recordingStartedAt: null };
+const state = { recording: false, paused: false, recordingStartedAt: null, sources: null };
 const r2Tests = new Map();
 let obsClient = null;
 let feedsPrevSamples = new Map();
@@ -59,6 +60,7 @@ let previewTimer = null;
 let previewBusy = false;
 let previewLastOkAt = 0;
 let lastPreviewWarnAt = 0;
+let pendingSources = null;
 
 function log(method, path, status, note) {
   const ts = new Date().toISOString();
@@ -225,7 +227,7 @@ async function pushPreviewFrames() {
       return;
     }
 
-    for (const source of OBS_SOURCES) {
+    for (const source of activeSources) {
       if (Date.now() > previewUntil) break;
       const frame = await getSourceScreenshot(client, source, PREVIEW_WIDTH, PREVIEW_JPEG_QUALITY);
       if (!frame) {
@@ -281,6 +283,37 @@ function didSourceFileStabilize(beforeSamples, afterSamples, source) {
   return before.size === after.size;
 }
 
+function sameSources(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b)) return false;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+function applySources(next) {
+  if (state.recording) {
+    if (sameSources(next, activeSources)) {
+      if (pendingSources) console.log('[es-mini-agent] deferred sources update cancelled (reverted to current list)');
+      pendingSources = null;
+      return;
+    }
+    if (pendingSources && sameSources(pendingSources, next)) return;
+    pendingSources = next;
+    console.log('[es-mini-agent] sources update deferred until current recording ends');
+    return;
+  }
+  const previous = activeSources.slice();
+  activeSources = next;
+  pendingSources = null;
+  console.log('[es-mini-agent] sources updated: ' + previous.join(',') + ' -> ' + activeSources.join(','));
+}
+
+function sessionSources() {
+  return (state.recording && Array.isArray(state.sources) && state.sources.length) ? state.sources : activeSources;
+}
+
 async function handleOp(op, body) {
   if (!OBS_MODE_ACTIVE) {
     if (op === 'start') {
@@ -326,6 +359,7 @@ async function handleOp(op, body) {
     if (!OBS_RECORD_DIR) {
       return { ok: false, reason: 'obs_misconfigured' };
     }
+    const startingSources = activeSources.slice();
 
     let client;
     try {
@@ -334,7 +368,7 @@ async function handleOp(op, body) {
       return { ok: false, reason: 'obs_start_failed', detail: truncateDetail(e && (e.message || e)) };
     }
 
-    const startResults = await Promise.all(OBS_SOURCES.map(async (source) => {
+    const startResults = await Promise.all(startingSources.map(async (source) => {
       const vendor = await callVendor(client, 'record_start', source);
       return { source, vendor };
     }));
@@ -348,124 +382,142 @@ async function handleOp(op, body) {
     state.recording = true;
     state.paused = false;
     state.recordingStartedAt = Date.now();
+    state.sources = startingSources;
     return { ok: true, recording: true, feeds_writing: null };
   }
   if (op === 'stop') {
-    let stopResults;
+    const sources = sessionSources();
+    let response = { ok: true, saved: false };
     try {
-      const client = await getObsClient();
-      stopResults = await Promise.all(OBS_SOURCES.map(async (source) => {
-        const vendor = await callVendor(client, 'record_stop', source);
-        return { source, vendor };
-      }));
-    } catch (e) {
-      stopResults = OBS_SOURCES.map((source) => ({
-        source,
-        vendor: { success: false, error: e && (e.message || String(e)) || 'obs_stop_error' },
-      }));
-    }
-
-    let filesStable = false;
-    if (OBS_RECORD_DIR) {
-      let prevSample = sampleFeedsWriting(OBS_SOURCES, OBS_RECORD_DIR, new Map()).samples;
-      for (let i = 0; i < 4; i += 1) {
-        await sleep(900);
-        const newSample = sampleFeedsWriting(OBS_SOURCES, OBS_RECORD_DIR, prevSample).samples;
-        if (OBS_SOURCES.every((source) => didSourceFileStabilize(prevSample, newSample, source))) {
-          filesStable = true;
-          prevSample = newSample;
-          break;
-        }
-        prevSample = newSample;
+      let stopResults;
+      try {
+        const client = await getObsClient();
+        stopResults = await Promise.all(sources.map(async (source) => {
+          const vendor = await callVendor(client, 'record_stop', source);
+          return { source, vendor };
+        }));
+      } catch (e) {
+        stopResults = sources.map((source) => ({
+          source,
+          vendor: { success: false, error: e && (e.message || String(e)) || 'obs_stop_error' },
+        }));
       }
-      feedsPrevSamples = prevSample;
-    } else {
-      await sleep(1200);
-    }
 
-    const allStopsSucceeded = stopResults.every((entry) => entry.vendor.success);
-    const saved = allStopsSucceeded && filesStable;
-    const recordingStartedAt = state.recordingStartedAt;
-    let uploadQueued = 0;
-
-    if (uploadQueue && OBS_RECORD_DIR) {
-      if (!recordingStartedAt) {
-        console.warn('[es-mini-agent] upload skipped: unknown recording start');
+      let filesStable = false;
+      if (OBS_RECORD_DIR) {
+        let prevSample = sampleFeedsWriting(sources, OBS_RECORD_DIR, new Map()).samples;
+        for (let i = 0; i < 4; i += 1) {
+          await sleep(900);
+          const newSample = sampleFeedsWriting(sources, OBS_RECORD_DIR, prevSample).samples;
+          if (sources.every((source) => didSourceFileStabilize(prevSample, newSample, source))) {
+            filesStable = true;
+            prevSample = newSample;
+            break;
+          }
+          prevSample = newSample;
+        }
+        feedsPrevSamples = prevSample;
       } else {
-        for (const source of OBS_SOURCES) {
-          try {
-            const sourceDir = path.join(OBS_RECORD_DIR, source);
-            const newest = getNewestFileSample(sourceDir);
-            if (!newest || !newest.absPath) continue;
-            if (newest.mtimeMs < (recordingStartedAt - 60000)) continue;
-            const out = uploadQueue.enqueue({ filePath: newest.absPath, source });
-            if (out && out.queued) uploadQueued += 1;
-          } catch (e) {
-            console.warn('[es-mini-agent] upload enqueue failed source=' + source + ':', e && (e.stack || e.message || e));
+        await sleep(1200);
+      }
+
+      const allStopsSucceeded = stopResults.every((entry) => entry.vendor.success);
+      const saved = allStopsSucceeded && filesStable;
+      const recordingStartedAt = state.recordingStartedAt;
+      let uploadQueued = 0;
+
+      if (uploadQueue && OBS_RECORD_DIR) {
+        if (!recordingStartedAt) {
+          console.warn('[es-mini-agent] upload skipped: unknown recording start');
+        } else {
+          for (const source of sources) {
+            try {
+              const sourceDir = path.join(OBS_RECORD_DIR, source);
+              const newest = getNewestFileSample(sourceDir);
+              if (!newest || !newest.absPath) continue;
+              if (newest.mtimeMs < (recordingStartedAt - 60000)) continue;
+              const out = uploadQueue.enqueue({ filePath: newest.absPath, source });
+              if (out && out.queued) uploadQueued += 1;
+            } catch (e) {
+              console.warn('[es-mini-agent] upload enqueue failed source=' + source + ':', e && (e.stack || e.message || e));
+            }
           }
         }
       }
-    }
 
-    state.recording = false;
-    state.paused = false;
-    state.recordingStartedAt = null;
-    const response = { ok: true, saved };
-    if (uploadQueue) response.upload_queued = uploadQueued;
+      response = { ok: true, saved };
+      if (uploadQueue) response.upload_queued = uploadQueued;
+    } finally {
+      state.recording = false;
+      state.paused = false;
+      state.recordingStartedAt = null;
+      state.sources = null;
+      if (pendingSources) {
+        applySources(pendingSources);
+      }
+    }
     return response;
   }
   if (op === 'cancel') {
-    let stopResults;
+    const sources = sessionSources();
     try {
-      const client = await getObsClient();
-      stopResults = await Promise.all(OBS_SOURCES.map(async (source) => {
-        const vendor = await callVendor(client, 'record_stop', source);
-        return { source, vendor };
-      }));
-    } catch (e) {
-      stopResults = OBS_SOURCES.map((source) => ({
-        source,
-        vendor: { success: false, error: e && (e.message || String(e)) || 'obs_stop_error' },
-      }));
-    }
-
-    if (OBS_RECORD_DIR) {
-      let prevSample = sampleFeedsWriting(OBS_SOURCES, OBS_RECORD_DIR, new Map()).samples;
-      for (let i = 0; i < 4; i += 1) {
-        await sleep(900);
-        const newSample = sampleFeedsWriting(OBS_SOURCES, OBS_RECORD_DIR, prevSample).samples;
-        if (OBS_SOURCES.every((source) => didSourceFileStabilize(prevSample, newSample, source))) {
-          prevSample = newSample;
-          break;
-        }
-        prevSample = newSample;
+      let stopResults;
+      try {
+        const client = await getObsClient();
+        stopResults = await Promise.all(sources.map(async (source) => {
+          const vendor = await callVendor(client, 'record_stop', source);
+          return { source, vendor };
+        }));
+      } catch (e) {
+        stopResults = sources.map((source) => ({
+          source,
+          vendor: { success: false, error: e && (e.message || String(e)) || 'obs_stop_error' },
+        }));
       }
-      feedsPrevSamples = prevSample;
-    } else {
-      await sleep(1200);
-    }
 
-    const allStopsSucceeded = stopResults.every((entry) => entry.vendor.success);
-    if (!allStopsSucceeded) {
-      const failed = stopResults.find((entry) => !entry.vendor.success);
-      const detail = failed ? (failed.source + ': ' + (failed.vendor.error || 'unknown_error')) : 'obs_stop_failed';
-      console.warn('[es-mini-agent] WARN: OBS cancel vendor call failed:', truncateDetail(detail));
-    }
+      if (OBS_RECORD_DIR) {
+        let prevSample = sampleFeedsWriting(sources, OBS_RECORD_DIR, new Map()).samples;
+        for (let i = 0; i < 4; i += 1) {
+          await sleep(900);
+          const newSample = sampleFeedsWriting(sources, OBS_RECORD_DIR, prevSample).samples;
+          if (sources.every((source) => didSourceFileStabilize(prevSample, newSample, source))) {
+            prevSample = newSample;
+            break;
+          }
+          prevSample = newSample;
+        }
+        feedsPrevSamples = prevSample;
+      } else {
+        await sleep(1200);
+      }
 
-    state.recording = false;
-    state.paused = false;
-    state.recordingStartedAt = null;
-    return { ok: true, cancelled: true, saved: false };
+      const allStopsSucceeded = stopResults.every((entry) => entry.vendor.success);
+      if (!allStopsSucceeded) {
+        const failed = stopResults.find((entry) => !entry.vendor.success);
+        const detail = failed ? (failed.source + ': ' + (failed.vendor.error || 'unknown_error')) : 'obs_stop_failed';
+        console.warn('[es-mini-agent] WARN: OBS cancel vendor call failed:', truncateDetail(detail));
+      }
+      return { ok: true, cancelled: true, saved: false };
+    } finally {
+      state.recording = false;
+      state.paused = false;
+      state.recordingStartedAt = null;
+      state.sources = null;
+      if (pendingSources) {
+        applySources(pendingSources);
+      }
+    }
   }
   if (op === 'status') {
+    const sources = sessionSources();
     if (!state.recording) {
-      const out = { ok: true, recording: false, feeds_writing: 0, preview: previewActive(), sources: OBS_SOURCES.slice() };
+      const out = { ok: true, recording: false, feeds_writing: 0, preview: previewActive(), sources: sources.slice() };
       if (uploadQueue) out.uploads = uploadQueue.status();
       return out;
     }
-    const sampled = sampleFeedsWriting(OBS_SOURCES, OBS_RECORD_DIR, feedsPrevSamples);
+    const sampled = sampleFeedsWriting(sources, OBS_RECORD_DIR, feedsPrevSamples);
     feedsPrevSamples = sampled.samples;
-    const out = { ok: true, recording: true, feeds_writing: sampled.count, preview: previewActive(), sources: OBS_SOURCES.slice() };
+    const out = { ok: true, recording: true, feeds_writing: sampled.count, preview: previewActive(), sources: sources.slice() };
     if (uploadQueue) out.uploads = uploadQueue.status();
     return out;
   }
@@ -476,7 +528,7 @@ async function handleOp(op, body) {
 
     try {
       const client = await getObsClient();
-      const pauseResults = await Promise.all(OBS_SOURCES.map((source) => callVendor(client, 'record_pause', source)));
+      const pauseResults = await Promise.all(sessionSources().map((source) => callVendor(client, 'record_pause', source)));
       const failed = pauseResults.find((result) => !result.success);
       if (failed) {
         console.warn('[es-mini-agent] WARN: OBS pause vendor call failed:', failed.error || 'vendor_error');
@@ -491,7 +543,7 @@ async function handleOp(op, body) {
   if (op === 'resume') {
     try {
       const client = await getObsClient();
-      const resumeResults = await Promise.all(OBS_SOURCES.map((source) => callVendor(client, 'record_unpause', source)));
+      const resumeResults = await Promise.all(sessionSources().map((source) => callVendor(client, 'record_unpause', source)));
       const failed = resumeResults.find((result) => !result.success);
       if (failed) {
         console.warn('[es-mini-agent] WARN: OBS resume vendor call failed:', failed.error || 'vendor_error');
@@ -513,7 +565,7 @@ async function handleOp(op, body) {
       previewTimer = setInterval(pushPreviewFrames, PREVIEW_INTERVAL_MS);
       console.log('[es-mini-agent] [preview] started');
     }
-    return { ok: true, preview: true, sources: OBS_SOURCES.slice() };
+    return { ok: true, preview: true, sources: activeSources.slice() };
   }
   if (op === 'preview_stop') {
     previewUntil = 0;
@@ -778,6 +830,41 @@ server.on('clientError', (err, socket) => {
 // (harmless without a tunnel) so nothing that used to work is broken.
 let polling = false;
 let pollTimer = null;
+let sourcesTimer = null;
+
+async function refreshSources() {
+  try {
+    const url = `${RECORD_POLL_URL}/api/record?building_id=${encodeURIComponent(BUILDING_ID)}&want_sources=1`;
+    const getRes = await fetch(url, {
+      method: 'GET',
+      headers: { 'Authorization': 'Bearer ' + RECORD_CONTROL_KEY },
+    });
+    if (!getRes.ok) {
+      console.warn(`[es-mini-agent] relay: sources GET ${getRes.status} from ${RECORD_POLL_URL}`);
+      return;
+    }
+
+    const data = await getRes.json().catch(() => ({}));
+    const remoteSources = data && data.sources;
+    if (!Array.isArray(remoteSources)) return;
+    if (!remoteSources.length) return;
+
+    const next = [];
+    for (const value of remoteSources) {
+      if (typeof value !== 'string') return;
+      const trimmed = value.trim();
+      if (!trimmed) return;
+      next.push(trimmed);
+    }
+    if (!next.length) return;
+    const current = pendingSources || activeSources;
+    if (sameSources(next, current)) return;
+
+    applySources(next);
+  } catch (e) {
+    console.error('[es-mini-agent] relay: sources refresh error:', e && (e.stack || e.message || e));
+  }
+}
 
 async function pollOnce() {
   if (polling) return; // network calls are async — belt-and-suspenders reentry guard
@@ -827,7 +914,12 @@ async function pollOnce() {
 server.listen(PORT, () => {
   console.log(`[es-mini-agent] listening on :${PORT} building_id=${BUILDING_ID}`);
   console.log(`[es-mini-agent] relay: polling ${RECORD_POLL_URL}/api/record every ${POLL_INTERVAL_MS}ms`);
+  console.log('[es-mini-agent] sources (env): ' + activeSources.join(','));
   pollTimer = setInterval(pollOnce, POLL_INTERVAL_MS);
+  if (OBS_MODE_ACTIVE) {
+    sourcesTimer = setInterval(refreshSources, SOURCES_REFRESH_MS);
+    refreshSources().catch(() => {});
+  }
   if (uploadQueue) {
     uploadQueue.sweep().catch((e) => {
       console.warn('[es-mini-agent] upload queue sweep failed:', e && (e.stack || e.message || e));
@@ -840,6 +932,10 @@ function shutdown(signal) {
   if (pollTimer) {
     clearInterval(pollTimer);
     pollTimer = null;
+  }
+  if (sourcesTimer) {
+    clearInterval(sourcesTimer);
+    sourcesTimer = null;
   }
   if (previewTimer) {
     clearInterval(previewTimer);
