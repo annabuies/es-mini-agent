@@ -2,6 +2,7 @@
 
 const fsp = require('fs/promises');
 const path = require('path');
+const { spawn } = require('child_process');
 
 const { runMultipartUpload, signR2Request } = require('./r2-upload');
 
@@ -69,6 +70,7 @@ function createUploadQueue(opts) {
   const uploader = typeof options.uploader === 'function' ? options.uploader : runMultipartUpload;
 
   const queue = [];
+  const pendingProxyJobs = [];
   const queuedFilePaths = new Set();
   const completedFilePaths = new Set();
   let activeJob = null;
@@ -171,6 +173,27 @@ function createUploadQueue(opts) {
     }
   }
 
+  function runFfmpeg(args) {
+    return new Promise((resolve, reject) => {
+      let proc;
+      try {
+        proc = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+      } catch (e) {
+        reject(e);
+        return;
+      }
+      let stderrTail = '';
+      proc.stderr.on('data', (chunk) => {
+        stderrTail = (stderrTail + chunk.toString('utf8')).slice(-MAX_ERROR_LEN);
+      });
+      proc.on('error', (e) => reject(e));
+      proc.on('close', (code) => {
+        if (code === 0) resolve();
+        else reject(new Error('ffmpeg exited with code ' + code + (stderrTail ? ': ' + stderrTail : '')));
+      });
+    });
+  }
+
   async function runJob(job) {
     const stable = await waitForStableSize(job.filePath, job.key);
     if (!stable.ok) {
@@ -229,6 +252,13 @@ function createUploadQueue(opts) {
       };
       const partsUploaded = summary && Number(summary.partsUploaded) || activeSnapshot.partsCompleted || 0;
       console.log('[upload-queue] confirmed ' + job.key + ' (' + partsUploaded + ' parts)');
+      try {
+        maybeMakeProxy(job).catch((e) => {
+          console.warn('[upload-queue] proxy step failed key=' + job.key + ':', e && (e.stack || e.message || e));
+        });
+      } catch (e) {
+        console.warn('[upload-queue] proxy step threw synchronously key=' + job.key + ':', e && (e.stack || e.message || e));
+      }
     } catch (e) {
       const detail = truncateError(e && (e.message || e.stack || e));
       await updateStateFields(job.stateFilePath, {
@@ -239,6 +269,63 @@ function createUploadQueue(opts) {
       console.warn('[upload-queue] upload failed key=' + job.key + ' error=' + (detail || 'upload_failed'));
     } finally {
       activeSnapshot = null;
+    }
+  }
+
+  async function maybeMakeProxy(job) {
+    if (isRecording()) {
+      pendingProxyJobs.push(job);
+      console.warn('[upload-queue] proxy deferred (recording active) key=' + job.key);
+      return;
+    }
+
+    const proxyBase = path.basename(job.filePath, path.extname(job.filePath));
+    const proxyKey = 'proxies/' + buildingId + '/' + job.source + '/' + proxyBase + '.mp4';
+    const tmpProxyPath = job.filePath + '.proxy.mp4';
+
+    try {
+      let st;
+      try {
+        st = await fsp.stat(job.filePath);
+      } catch (e) {
+        console.warn('[upload-queue] proxy skipped, master file gone key=' + job.key);
+        return;
+      }
+      if (!st.isFile()) return;
+
+      await runFfmpeg([
+        '-y',
+        '-i', job.filePath,
+        '-vf', 'scale=1920:1080',
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-crf', '21',
+        '-c:a', 'aac',
+        '-movflags', '+faststart',
+        tmpProxyPath,
+      ]);
+
+      const proxyStat = await fsp.stat(tmpProxyPath);
+      const proxyStateFilePath = stateFilePathForKey(proxyKey);
+      await uploader({
+        r2Config,
+        key: proxyKey,
+        filePath: tmpProxyPath,
+        sizeBytes: proxyStat.size,
+        stateFilePath: proxyStateFilePath,
+        isRecording,
+        shouldAbort: () => false,
+        webhookUrl: undefined,
+        webhookExtra: { kind: 'proxy', building_id: buildingId, source: job.source },
+        abortOnFailure: false,
+        deleteObjectAfterVerify: false,
+      });
+      await removeFileIfExists(proxyStateFilePath);
+      console.log('[upload-queue] proxy confirmed ' + proxyKey);
+    } catch (e) {
+      console.warn('[upload-queue] proxy failed key=' + job.key + ' error=' + truncateError(e && (e.message || e.stack || e)));
+    } finally {
+      await removeFileIfExists(tmpProxyPath);
     }
   }
 
@@ -374,6 +461,15 @@ function createUploadQueue(opts) {
             console.warn('[upload-queue] failed deleting stale state ' + stateFilePath + ':', e && (e.stack || e.message || e));
           }
           console.warn('[upload-queue] removed stale state for missing source file key=' + String(stateData.key || '?'));
+        }
+      }
+
+      if (pendingProxyJobs.length > 0 && !isRecording()) {
+        const jobsToRetry = pendingProxyJobs.splice(0, pendingProxyJobs.length);
+        for (const job of jobsToRetry) {
+          maybeMakeProxy(job).catch((e) => {
+            console.warn('[upload-queue] deferred proxy retry error:', e && (e.stack || e.message || e));
+          });
         }
       }
     } catch (e) {
