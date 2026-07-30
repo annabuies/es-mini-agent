@@ -16,7 +16,7 @@ const { runSelfUpdate, getVersionBlock } = require('./self-update');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.07.30-3';
+const AGENT_VERSION = '2026.07.30-4';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -723,6 +723,21 @@ async function handleOp(op, body) {
         name: i && typeof i.inputName !== 'undefined' ? i.inputName : null,
         kind: i && typeof i.inputKind !== 'undefined' ? i.inputKind : null,
       }));
+      const inputNames = new Set(allInputs
+        .map((i) => i.name)
+        .filter((name) => typeof name === 'string'));
+
+      let defaults = null;
+      try {
+        const defaultsRes = await client.request('GetSourceFilterDefaultSettings', { filterKind: 'source_record_filter' });
+        const defaultsData = defaultsRes && defaultsRes.responseData;
+        const maybeDefaults = defaultsData && defaultsData.defaultFilterSettings;
+        if (maybeDefaults && typeof maybeDefaults === 'object') {
+          defaults = maybeDefaults;
+        }
+      } catch (_) {
+        defaults = null;
+      }
 
       const candidates = allInputs.filter((i) => (
         !activeSources.includes(i.name)
@@ -736,35 +751,11 @@ async function handleOp(op, body) {
           reason: candidates.length === 0 ? 'no_audio_input_found' : 'ambiguous_audio_input',
           candidates,
           inputs: allInputs,
-        };
-      }
-
-      const defaultsRes = await client.request('GetSourceFilterDefaultSettings', { filterKind: 'source_record_filter' });
-      const defaultsData = defaultsRes && defaultsRes.responseData;
-      const defaults = defaultsData && defaultsData.defaultFilterSettings;
-      if (!defaults || typeof defaults !== 'object') {
-        return { ok: true, bound: false, error: 'defaults_query_failed', inputs: allInputs, candidates };
-      }
-
-      const audioKeys = Object.keys(defaults).filter((k) => k.toLowerCase().includes('audio'));
-      const stringAudioKeys = audioKeys.filter((k) => typeof defaults[k] === 'string');
-      const boolAudioKeys = audioKeys.filter((k) => typeof defaults[k] === 'boolean');
-      if (stringAudioKeys.length !== 1 || boolAudioKeys.length > 1) {
-        return {
-          ok: true,
-          bound: false,
-          reason: 'ambiguous_filter_keys',
           defaults,
-          audioKeys,
-          inputs: allInputs,
-          candidates,
         };
       }
 
-      const newSettings = { [stringAudioKeys[0]]: candidates[0].name };
-      if (boolAudioKeys.length === 1) {
-        newSettings[boolAudioKeys[0]] = true;
-      }
+      const keysWritten = { different_audio: true, audio_source: candidates[0].name };
 
       const cameras = [];
       for (const source of activeSources) {
@@ -783,6 +774,17 @@ async function handleOp(op, body) {
             continue;
           }
 
+          const currentRes = await client.request('GetSourceFilter', { sourceName: source, filterName });
+          const currentData = currentRes && currentRes.responseData;
+          const currentSettings = currentData && currentData.filterSettings;
+          const currentEncoder = currentSettings && currentSettings.audio_encoder;
+          const repaired = (typeof currentEncoder === 'string') && inputNames.has(currentEncoder);
+
+          const newSettings = Object.assign({}, keysWritten);
+          if (repaired) {
+            newSettings.audio_encoder = (defaults && typeof defaults.audio_encoder === 'string') ? defaults.audio_encoder : '';
+          }
+
           await client.request('SetSourceFilterSettings', {
             sourceName: source,
             filterName,
@@ -792,7 +794,7 @@ async function handleOp(op, body) {
           const readBackRes = await client.request('GetSourceFilter', { sourceName: source, filterName });
           const readBackData = readBackRes && readBackRes.responseData;
           const readBackSettings = readBackData && readBackData.filterSettings;
-          cameras.push({ source, filter: filterName, wrote: newSettings, readBack: readBackSettings });
+          cameras.push({ source, filter: filterName, wrote: newSettings, readBack: readBackSettings, repaired });
         } catch (e) {
           cameras.push({ source, error: 'set_failed', detail: truncateDetail(e && (e.message || e)) });
         }
@@ -802,9 +804,10 @@ async function handleOp(op, body) {
         ok: true,
         bound: true,
         audioSource: candidates[0].name,
-        keysWritten: newSettings,
+        keysWritten,
         inputs: allInputs,
         candidates,
+        defaults,
         cameras,
       };
     } catch (e) {
