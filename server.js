@@ -16,7 +16,7 @@ const { runSelfUpdate, getVersionBlock } = require('./self-update');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.07.30-4';
+const AGENT_VERSION = '2026.07.30-5';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -701,6 +701,7 @@ async function handleOp(op, body) {
     return out;
   }
   if (op === 'audio_bind') {
+    let audioInput = null;
     try {
       if (state.recording) {
         return { ok: false, reason: 'busy_recording' };
@@ -755,7 +756,19 @@ async function handleOp(op, body) {
         };
       }
 
-      const keysWritten = { different_audio: true, audio_source: candidates[0].name };
+      audioInput = { name: candidates[0].name, muted: null, volumeDb: null };
+      try {
+        const muteRes = await client.request('GetInputMute', { inputName: candidates[0].name });
+        const m = muteRes && muteRes.responseData;
+        if (m && typeof m.inputMuted === 'boolean') audioInput.muted = m.inputMuted;
+      } catch (_) {}
+      try {
+        const volRes = await client.request('GetInputVolume', { inputName: candidates[0].name });
+        const v = volRes && volRes.responseData;
+        if (v && typeof v.inputVolumeDb === 'number') audioInput.volumeDb = v.inputVolumeDb;
+      } catch (_) {}
+
+      const keysWritten = { different_audio: true, audio_source: candidates[0].name, audio_track: 1 };
 
       const cameras = [];
       for (const source of activeSources) {
@@ -804,6 +817,7 @@ async function handleOp(op, body) {
         ok: true,
         bound: true,
         audioSource: candidates[0].name,
+        audioInput,
         keysWritten,
         inputs: allInputs,
         candidates,
@@ -811,7 +825,7 @@ async function handleOp(op, body) {
         cameras,
       };
     } catch (e) {
-      return { ok: false, reason: 'audio_bind_exception', detail: truncateDetail(e && (e.message || e)) };
+      return { ok: false, reason: 'audio_bind_exception', detail: truncateDetail(e && (e.message || e)), audioInput };
     }
   }
   if (op === 'pause') {
