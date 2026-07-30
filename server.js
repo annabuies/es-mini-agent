@@ -16,7 +16,7 @@ const { runSelfUpdate, getVersionBlock } = require('./self-update');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.07.30-2';
+const AGENT_VERSION = '2026.07.30-3';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -446,6 +446,9 @@ async function handleOp(op, body) {
         version: getVersionBlock({ projectDir: __dirname, agentVersion: AGENT_VERSION }),
       };
     }
+    if (op === 'audio_bind') {
+      return { ok: true, demo: true, bound: false, reason: 'demo_mode' };
+    }
     if (op === 'update') {
       return await performUpdate();
     }
@@ -697,6 +700,117 @@ async function handleOp(op, body) {
     out.filters = filters;
     return out;
   }
+  if (op === 'audio_bind') {
+    try {
+      if (state.recording) {
+        return { ok: false, reason: 'busy_recording' };
+      }
+
+      let client;
+      try {
+        client = await getObsClient();
+      } catch (e) {
+        return { ok: true, bound: false, error: 'obs_unreachable' };
+      }
+
+      const inputRes = await client.request('GetInputList');
+      const inputData = inputRes && inputRes.responseData;
+      const inputs = inputData && inputData.inputs;
+      if (!Array.isArray(inputs)) {
+        return { ok: true, bound: false, error: 'input_list_failed' };
+      }
+      const allInputs = inputs.map((i) => ({
+        name: i && typeof i.inputName !== 'undefined' ? i.inputName : null,
+        kind: i && typeof i.inputKind !== 'undefined' ? i.inputKind : null,
+      }));
+
+      const candidates = allInputs.filter((i) => (
+        !activeSources.includes(i.name)
+        && typeof i.kind === 'string'
+        && i.kind.includes('input_capture')
+      ));
+      if (candidates.length !== 1) {
+        return {
+          ok: true,
+          bound: false,
+          reason: candidates.length === 0 ? 'no_audio_input_found' : 'ambiguous_audio_input',
+          candidates,
+          inputs: allInputs,
+        };
+      }
+
+      const defaultsRes = await client.request('GetSourceFilterDefaultSettings', { filterKind: 'source_record_filter' });
+      const defaultsData = defaultsRes && defaultsRes.responseData;
+      const defaults = defaultsData && defaultsData.defaultFilterSettings;
+      if (!defaults || typeof defaults !== 'object') {
+        return { ok: true, bound: false, error: 'defaults_query_failed', inputs: allInputs, candidates };
+      }
+
+      const audioKeys = Object.keys(defaults).filter((k) => k.toLowerCase().includes('audio'));
+      const stringAudioKeys = audioKeys.filter((k) => typeof defaults[k] === 'string');
+      const boolAudioKeys = audioKeys.filter((k) => typeof defaults[k] === 'boolean');
+      if (stringAudioKeys.length !== 1 || boolAudioKeys.length > 1) {
+        return {
+          ok: true,
+          bound: false,
+          reason: 'ambiguous_filter_keys',
+          defaults,
+          audioKeys,
+          inputs: allInputs,
+          candidates,
+        };
+      }
+
+      const newSettings = { [stringAudioKeys[0]]: candidates[0].name };
+      if (boolAudioKeys.length === 1) {
+        newSettings[boolAudioKeys[0]] = true;
+      }
+
+      const cameras = [];
+      for (const source of activeSources) {
+        try {
+          const filterListRes = await client.request('GetSourceFilterList', { sourceName: source });
+          const filterListData = filterListRes && filterListRes.responseData;
+          const filters = filterListData && filterListData.filters;
+          if (!Array.isArray(filters)) {
+            cameras.push({ source, error: 'no_source_record_filter' });
+            continue;
+          }
+          const sourceRecordFilter = filters.find((f) => f && f.filterKind === 'source_record_filter');
+          const filterName = sourceRecordFilter && sourceRecordFilter.filterName;
+          if (!filterName) {
+            cameras.push({ source, error: 'no_source_record_filter' });
+            continue;
+          }
+
+          await client.request('SetSourceFilterSettings', {
+            sourceName: source,
+            filterName,
+            filterSettings: newSettings,
+            overlay: true,
+          });
+          const readBackRes = await client.request('GetSourceFilter', { sourceName: source, filterName });
+          const readBackData = readBackRes && readBackRes.responseData;
+          const readBackSettings = readBackData && readBackData.filterSettings;
+          cameras.push({ source, filter: filterName, wrote: newSettings, readBack: readBackSettings });
+        } catch (e) {
+          cameras.push({ source, error: 'set_failed', detail: truncateDetail(e && (e.message || e)) });
+        }
+      }
+
+      return {
+        ok: true,
+        bound: true,
+        audioSource: candidates[0].name,
+        keysWritten: newSettings,
+        inputs: allInputs,
+        candidates,
+        cameras,
+      };
+    } catch (e) {
+      return { ok: false, reason: 'audio_bind_exception', detail: truncateDetail(e && (e.message || e)) };
+    }
+  }
   if (op === 'pause') {
     if (!state.recording) {
       console.warn(`[es-mini-agent] WARN: pause called while not recording (demo-safe: returning ok).`);
@@ -758,7 +872,7 @@ async function handleOp(op, body) {
   return null;
 }
 
-const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'diag', 'update']);
+const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'diag', 'audio_bind', 'update']);
 
 const server = http.createServer(async (req, res) => {
   try {
