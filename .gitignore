@@ -9,3 +9,8 @@ node_modules
 .update-staging/
 .update-backup/
 update-state.json
+# Credential-filled copies of the runbooks. This repo is PUBLIC, so a filled
+# runbook must never land in git history. They are generated to the Desktop by
+# Clients/ES/scripts/robbie-filled-runbook.sh; this is belt-and-braces in case
+# one ever gets written in here instead.
+*-FILLED.md
