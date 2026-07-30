@@ -35,11 +35,13 @@ OBS_SOURCES="${OBS_SOURCES:-}"
 OBS_WS_URL="${OBS_WS_URL:-ws://127.0.0.1:4455}"
 OBS_WS_PASSWORD="${OBS_WS_PASSWORD:-}"
 OBS_RECORD_DIR="${OBS_RECORD_DIR:-}"
-# Optional R2 dummy-upload test creds (used only by the /r2test/* endpoints).
-R2_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID:-}"
-R2_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY:-}"
-R2_BUCKET="${R2_BUCKET:-}"
-R2_ENDPOINT="${R2_ENDPOINT:-}"
+# Optional object-storage creds for recording uploads and preview frames.
+S3_ACCESS_KEY_ID="${S3_ACCESS_KEY_ID:-${R2_ACCESS_KEY_ID:-}}"
+S3_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY:-${R2_SECRET_ACCESS_KEY:-}}"
+S3_BUCKET="${S3_BUCKET:-${R2_BUCKET:-}}"
+S3_ENDPOINT="${S3_ENDPOINT:-${R2_ENDPOINT:-}}"
+S3_REGION="${S3_REGION:-}"
+AWS_ROLE_ARN="${AWS_ROLE_ARN:-}"
 UPLOAD_CONFIRMED_WEBHOOK_URL="${UPLOAD_CONFIRMED_WEBHOOK_URL:-}"
 REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/annabuies/es-mini-agent/main}"
 
@@ -222,10 +224,13 @@ OBS_SOURCES_X="$(xml_escape "$OBS_SOURCES")"
 OBS_WS_URL_X="$(xml_escape "$OBS_WS_URL")"
 OBS_WS_PASSWORD_X="$(xml_escape "$OBS_WS_PASSWORD")"
 OBS_RECORD_DIR_X="$(xml_escape "$OBS_RECORD_DIR")"
-R2_ACCESS_KEY_ID_X="$(xml_escape "$R2_ACCESS_KEY_ID")"
-R2_SECRET_ACCESS_KEY_X="$(xml_escape "$R2_SECRET_ACCESS_KEY")"
-R2_BUCKET_X="$(xml_escape "$R2_BUCKET")"
-R2_ENDPOINT_X="$(xml_escape "$R2_ENDPOINT")"
+S3_ACCESS_KEY_ID_X="$(xml_escape "$S3_ACCESS_KEY_ID")"
+S3_SECRET_ACCESS_KEY_X="$(xml_escape "$S3_SECRET_ACCESS_KEY")"
+S3_BUCKET_X="$(xml_escape "$S3_BUCKET")"
+S3_ENDPOINT_X="$(xml_escape "$S3_ENDPOINT")"
+S3_REGION_X="$(xml_escape "$S3_REGION")"
+AWS_ROLE_ARN_X="$(xml_escape "$AWS_ROLE_ARN")"
+FFMPEG_BIN_X="$(xml_escape "$FFMPEG_BIN")"
 UPLOAD_CONFIRMED_WEBHOOK_URL_X="$(xml_escape "$UPLOAD_CONFIRMED_WEBHOOK_URL")"
 
 # Write to a temp file first, then move + chmod, so we never leave a
@@ -265,14 +270,20 @@ cat > "$TMP_PLIST" <<PLIST
         <string>${OBS_WS_PASSWORD_X}</string>
         <key>OBS_RECORD_DIR</key>
         <string>${OBS_RECORD_DIR_X}</string>
-        <key>R2_ACCESS_KEY_ID</key>
-        <string>${R2_ACCESS_KEY_ID_X}</string>
-        <key>R2_SECRET_ACCESS_KEY</key>
-        <string>${R2_SECRET_ACCESS_KEY_X}</string>
-        <key>R2_BUCKET</key>
-        <string>${R2_BUCKET_X}</string>
-        <key>R2_ENDPOINT</key>
-        <string>${R2_ENDPOINT_X}</string>
+        <key>S3_ACCESS_KEY_ID</key>
+        <string>${S3_ACCESS_KEY_ID_X}</string>
+        <key>S3_SECRET_ACCESS_KEY</key>
+        <string>${S3_SECRET_ACCESS_KEY_X}</string>
+        <key>S3_BUCKET</key>
+        <string>${S3_BUCKET_X}</string>
+        <key>S3_ENDPOINT</key>
+        <string>${S3_ENDPOINT_X}</string>
+        <key>S3_REGION</key>
+        <string>${S3_REGION_X}</string>
+        <key>AWS_ROLE_ARN</key>
+        <string>${AWS_ROLE_ARN_X}</string>
+        <key>FFMPEG_BIN</key>
+        <string>${FFMPEG_BIN_X}</string>
         <key>UPLOAD_CONFIRMED_WEBHOOK_URL</key>
         <string>${UPLOAD_CONFIRMED_WEBHOOK_URL_X}</string>
     </dict>

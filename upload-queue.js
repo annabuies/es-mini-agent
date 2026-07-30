@@ -1,5 +1,6 @@
 'use strict';
 
+const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
 const { spawn } = require('child_process');
@@ -9,6 +10,7 @@ const { runMultipartUpload, signR2Request } = require('./r2-upload');
 const STABILITY_POLL_MS = 2000;
 const STABILITY_WARN_MS = 60000;
 const MAX_ERROR_LEN = 300;
+let ffmpegBinMemo = null;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -58,6 +60,27 @@ async function readResponseTextSafe(res) {
   } catch (_) {
     return '';
   }
+}
+
+function resolveFfmpegBin() {
+  if (ffmpegBinMemo) return ffmpegBinMemo;
+
+  const envBin = String(process.env.FFMPEG_BIN || '').trim();
+  if (envBin && fs.existsSync(envBin)) {
+    ffmpegBinMemo = { bin: envBin, source: 'env' };
+    return ffmpegBinMemo;
+  }
+
+  const candidates = ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg'];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      ffmpegBinMemo = { bin: candidate, source: 'probe' };
+      return ffmpegBinMemo;
+    }
+  }
+
+  ffmpegBinMemo = { bin: 'ffmpeg', source: 'path' };
+  return ffmpegBinMemo;
 }
 
 function createUploadQueue(opts) {
@@ -122,14 +145,27 @@ function createUploadQueue(opts) {
   async function abortRemoteMultipartIfPresent(stateData) {
     if (!stateData || !stateData.uploadId || !stateData.key) return;
     try {
+      let sessionToken = null;
+      let accessKeyId = r2Config.accessKeyId;
+      let secretAccessKey = r2Config.secretAccessKey;
+      if (typeof r2Config.getCredentials === 'function') {
+        const creds = await r2Config.getCredentials();
+        if (creds && typeof creds === 'object') {
+          accessKeyId = creds.accessKeyId;
+          secretAccessKey = creds.secretAccessKey;
+          sessionToken = creds.sessionToken || null;
+        }
+      }
       const signed = signR2Request({
         method: 'DELETE',
         key: String(stateData.key),
         query: { uploadId: String(stateData.uploadId) },
-        accessKeyId: r2Config.accessKeyId,
-        secretAccessKey: r2Config.secretAccessKey,
+        accessKeyId,
+        secretAccessKey,
+        sessionToken,
         bucket: r2Config.bucket,
         endpoint: r2Config.endpoint,
+        region: r2Config.region,
       });
       const res = await fetch(signed.url, {
         method: 'DELETE',
@@ -177,7 +213,8 @@ function createUploadQueue(opts) {
     return new Promise((resolve, reject) => {
       let proc;
       try {
-        proc = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+        const ffmpegBin = resolveFfmpegBin().bin;
+        proc = spawn(ffmpegBin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
       } catch (e) {
         reject(e);
         return;
@@ -493,4 +530,4 @@ function createUploadQueue(opts) {
   return { enqueue, sweep, status };
 }
 
-module.exports = { createUploadQueue };
+module.exports = { createUploadQueue, resolveFfmpegBin };

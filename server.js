@@ -8,8 +8,9 @@ const http = require('http');
 const { ObsClient, callVendor, getNewestFileSample, getSourceScreenshot, sampleFeedsWriting } = require('./obs-control');
 const crypto = require('crypto');
 const path = require('path');
-const { createUploadQueue } = require('./upload-queue');
+const { createUploadQueue, resolveFfmpegBin } = require('./upload-queue');
 const { runMultipartUploadTest, signR2Request } = require('./r2-upload');
+const { createCredentialsProvider } = require('./aws-creds');
 
 const PORT = parseInt(process.env.PORT || '8787', 10);
 const RECORD_CONTROL_KEY = process.env.RECORD_CONTROL_KEY;
@@ -31,10 +32,13 @@ let activeSources = OBS_SOURCES_RAW.split(',').map((v) => v.trim()).filter(Boole
 const OBS_RECORD_DIR = process.env.OBS_RECORD_DIR || '';
 const OBS_ENABLED = !!(OBS_SOURCES_RAW && OBS_SOURCES_RAW.trim());
 const OBS_MODE_ACTIVE = OBS_ENABLED && activeSources.length > 0;
-const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || '';
-const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || '';
-const R2_BUCKET = process.env.R2_BUCKET || '';
-const R2_ENDPOINT = process.env.R2_ENDPOINT || '';
+const STORAGE_ACCESS_KEY_ID = process.env.S3_ACCESS_KEY_ID || process.env.R2_ACCESS_KEY_ID || '';
+const STORAGE_SECRET_ACCESS_KEY = process.env.S3_SECRET_ACCESS_KEY || process.env.R2_SECRET_ACCESS_KEY || '';
+const STORAGE_BUCKET = process.env.S3_BUCKET || process.env.R2_BUCKET || '';
+const STORAGE_ENDPOINT = process.env.S3_ENDPOINT || process.env.R2_ENDPOINT || '';
+const EXPLICIT_STORAGE_REGION = process.env.S3_REGION || '';
+const AWS_ROLE_ARN = process.env.AWS_ROLE_ARN || '';
+const STORAGE_REGION = resolveRegion(EXPLICIT_STORAGE_REGION, STORAGE_ENDPOINT);
 // Boot-time default. A remote value from the relay can override this at runtime
 // (see applyWebhookUrl / refreshSources) so rotating the secret never needs a
 // visit to the studio Mac. Remote can only ever REPLACE it, never blank it.
@@ -131,18 +135,49 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function isR2Configured() {
-  return !!(R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY && R2_BUCKET && R2_ENDPOINT);
+function endpointHostnameOnly(endpoint) {
+  const raw = String(endpoint || '').trim();
+  if (!raw) return '';
+  const normalized = /^https?:\/\//i.test(raw) ? raw : ('https://' + raw);
+  try {
+    return new URL(normalized).hostname || '';
+  } catch (_) {
+    return '';
+  }
 }
 
-const uploadQueue = isR2Configured()
+function resolveRegion(explicitRegion, endpoint) {
+  const explicit = String(explicitRegion || '').trim();
+  if (explicit) return explicit;
+  const host = endpointHostnameOnly(endpoint).toLowerCase();
+  if (host.endsWith('amazonaws.com')) return 'us-east-1';
+  return 'auto';
+}
+
+function isStorageConfigured() {
+  return !!(STORAGE_ACCESS_KEY_ID && STORAGE_SECRET_ACCESS_KEY && STORAGE_BUCKET && STORAGE_ENDPOINT);
+}
+
+const storageCredentialsProvider = createCredentialsProvider({
+  accessKeyId: STORAGE_ACCESS_KEY_ID,
+  secretAccessKey: STORAGE_SECRET_ACCESS_KEY,
+  roleArn: AWS_ROLE_ARN,
+  region: STORAGE_REGION,
+  sessionName: 'es-mini-agent-' + BUILDING_ID,
+});
+
+const storageR2Config = {
+  accessKeyId: STORAGE_ACCESS_KEY_ID,
+  secretAccessKey: STORAGE_SECRET_ACCESS_KEY,
+  bucket: STORAGE_BUCKET,
+  endpoint: STORAGE_ENDPOINT,
+  region: STORAGE_REGION,
+  getCredentials: () => storageCredentialsProvider.getCredentials(),
+};
+
+const uploadQueue = isStorageConfigured()
   ? createUploadQueue({
-    r2Config: {
-      accessKeyId: R2_ACCESS_KEY_ID,
-      secretAccessKey: R2_SECRET_ACCESS_KEY,
-      bucket: R2_BUCKET,
-      endpoint: R2_ENDPOINT,
-    },
+    r2Config: storageR2Config,
     stateDir: path.join(__dirname, '.r2-uploads'),
     isRecording: () => state.recording,
     webhookUrl: () => activeWebhookUrl,
@@ -240,14 +275,17 @@ async function pushPreviewFrames() {
 
       try {
         const key = `preview/${BUILDING_ID}/${source}.jpg`;
+        const creds = await storageCredentialsProvider.getCredentials();
         const signed = signR2Request({
           method: 'PUT',
           key,
           query: {},
-          accessKeyId: R2_ACCESS_KEY_ID,
-          secretAccessKey: R2_SECRET_ACCESS_KEY,
-          bucket: R2_BUCKET,
-          endpoint: R2_ENDPOINT,
+          accessKeyId: creds.accessKeyId,
+          secretAccessKey: creds.secretAccessKey,
+          sessionToken: creds.sessionToken,
+          bucket: STORAGE_BUCKET,
+          endpoint: STORAGE_ENDPOINT,
+          region: STORAGE_REGION,
         });
         const putRes = await fetch(signed.url, {
           method: 'PUT',
@@ -535,6 +573,13 @@ async function handleOp(op, body) {
   }
   if (op === 'diag') {
     const out = { ok: true, demo: false, recording: state.recording, stats: null, filters: null };
+    out.storage = {
+      bucket: STORAGE_BUCKET,
+      region: STORAGE_REGION,
+      endpointHost: endpointHostnameOnly(STORAGE_ENDPOINT),
+      credentials: storageCredentialsProvider.describeCredentials(),
+    };
+    out.ffmpeg = resolveFfmpegBin();
 
     let client;
     try {
@@ -635,7 +680,7 @@ async function handleOp(op, body) {
     return { ok: true, recording: true, feeds_writing: null };
   }
   if (op === 'preview_start') {
-    if (!isR2Configured()) {
+    if (!isStorageConfigured()) {
       return { ok: false, reason: 'r2_unconfigured' };
     }
     previewUntil = Date.now() + PREVIEW_TTL_MS;
@@ -683,7 +728,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      if (!isR2Configured()) {
+      if (!isStorageConfigured()) {
         sendJson(res, 200, { ok: false, reason: 'r2_unconfigured' });
         log(method, url, 200, 'r2_unconfigured');
         return;
@@ -730,12 +775,7 @@ const server = http.createServer(async (req, res) => {
       });
 
       runMultipartUploadTest({
-        r2Config: {
-          accessKeyId: R2_ACCESS_KEY_ID,
-          secretAccessKey: R2_SECRET_ACCESS_KEY,
-          bucket: R2_BUCKET,
-          endpoint: R2_ENDPOINT,
-        },
+        r2Config: storageR2Config,
         testId,
         sizeBytes,
         key,

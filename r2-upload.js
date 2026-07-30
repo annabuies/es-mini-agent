@@ -198,8 +198,10 @@ function signR2Request({
   query,
   accessKeyId,
   secretAccessKey,
+  sessionToken = null,
   bucket,
   endpoint,
+  region = 'auto',
 }) {
   const verb = String(method || '').toUpperCase();
   if (!verb) throw new Error('method is required');
@@ -215,10 +217,14 @@ function signR2Request({
   const canonicalQueryString = buildCanonicalQueryString(query);
 
   const { amzDate, dateStamp } = amzNow();
-  const canonicalHeaders = 'host:' + host + '\n'
+  let canonicalHeaders = 'host:' + host + '\n'
     + 'x-amz-content-sha256:UNSIGNED-PAYLOAD\n'
     + 'x-amz-date:' + amzDate + '\n';
-  const signedHeaders = 'host;x-amz-content-sha256;x-amz-date';
+  let signedHeaders = 'host;x-amz-content-sha256;x-amz-date';
+  if (sessionToken) {
+    canonicalHeaders += 'x-amz-security-token:' + String(sessionToken) + '\n';
+    signedHeaders += ';x-amz-security-token';
+  }
   const canonicalRequest = [
     verb,
     canonicalUri,
@@ -228,7 +234,7 @@ function signR2Request({
     'UNSIGNED-PAYLOAD',
   ].join('\n');
 
-  const credentialScope = dateStamp + '/auto/s3/aws4_request';
+  const credentialScope = dateStamp + '/' + String(region || 'auto') + '/s3/aws4_request';
   const stringToSign = [
     'AWS4-HMAC-SHA256',
     amzDate,
@@ -237,7 +243,7 @@ function signR2Request({
   ].join('\n');
 
   const kDate = hmac(Buffer.from('AWS4' + secretAccessKey, 'utf8'), dateStamp);
-  const kRegion = hmac(kDate, 'auto');
+  const kRegion = hmac(kDate, String(region || 'auto'));
   const kService = hmac(kRegion, 's3');
   const kSigning = hmac(kService, 'aws4_request');
   const signature = crypto.createHmac('sha256', kSigning).update(stringToSign, 'utf8').digest('hex');
@@ -249,14 +255,19 @@ function signR2Request({
 
   const url = endpointNoSlash + canonicalUri + (canonicalQueryString ? ('?' + canonicalQueryString) : '');
 
+  const headers = {
+    host,
+    'x-amz-content-sha256': 'UNSIGNED-PAYLOAD',
+    'x-amz-date': amzDate,
+    Authorization: authorization,
+  };
+  if (sessionToken) {
+    headers['x-amz-security-token'] = String(sessionToken);
+  }
+
   return {
     url,
-    headers: {
-      host,
-      'x-amz-content-sha256': 'UNSIGNED-PAYLOAD',
-      'x-amz-date': amzDate,
-      Authorization: authorization,
-    },
+    headers,
   };
 }
 
@@ -314,15 +325,36 @@ async function runMultipartUpload(opts) {
   let fatalError = null;
   let stateForCompletion = null;
 
+  async function resolveRequestCredentials() {
+    if (typeof r2Config.getCredentials === 'function') {
+      const resolved = await r2Config.getCredentials();
+      if (resolved && typeof resolved === 'object') {
+        return {
+          accessKeyId: resolved.accessKeyId,
+          secretAccessKey: resolved.secretAccessKey,
+          sessionToken: resolved.sessionToken || null,
+        };
+      }
+    }
+    return {
+      accessKeyId: r2Config.accessKeyId,
+      secretAccessKey: r2Config.secretAccessKey,
+      sessionToken: null,
+    };
+  }
+
   async function signedFetch(method, query, body, extraHeaders) {
+    const creds = await resolveRequestCredentials();
     const signed = signR2Request({
       method,
       key,
       query,
-      accessKeyId: r2Config.accessKeyId,
-      secretAccessKey: r2Config.secretAccessKey,
+      accessKeyId: creds.accessKeyId,
+      secretAccessKey: creds.secretAccessKey,
+      sessionToken: creds.sessionToken,
       bucket: r2Config.bucket,
       endpoint: r2Config.endpoint,
+      region: r2Config.region,
     });
     const headers = Object.assign({}, signed.headers, extraHeaders || {});
     return fetch(signed.url, {
