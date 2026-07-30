@@ -75,11 +75,43 @@ else
   SCRIPT_DIR=""
 fi
 
+# ---------- the module list ----------
+# The list of runtime modules lives in modules.txt, NOT here, precisely so this
+# installer and self-update.js cannot drift apart -- both read the same file. The
+# agent has already shipped once missing aws-creds.js because two hardcoded lists
+# disagreed, and it crash-looped on a machine nobody could SSH into.
+#
+# Only used if modules.txt is genuinely absent in local mode (a stale checkout).
+FALLBACK_MODULES=(server.js obs-control.js r2-upload.js upload-queue.js aws-creds.js self-update.js)
+MODULES=()
+
+parse_manifest() {
+  local file="$1"
+  local line
+  MODULES=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"                                 # strip comments
+    line="${line#"${line%%[![:space:]]*}"}"             # ltrim
+    line="${line%"${line##*[![:space:]]}"}"             # rtrim
+    [[ -z "$line" ]] && continue
+    MODULES+=("$line")
+  done < "$file"
+}
+
 # ---------- pick run mode: local vs standalone ----------
 PROJECT_DIR=""
 if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/server.js" ]]; then
   PROJECT_DIR="$SCRIPT_DIR"
   info "Local mode: using files in $PROJECT_DIR"
+  # Nothing is downloaded in local mode, so modules.txt is already on disk.
+  if [[ -f "$PROJECT_DIR/modules.txt" ]]; then
+    parse_manifest "$PROJECT_DIR/modules.txt"
+  fi
+  if [[ "${#MODULES[@]}" -eq 0 ]]; then
+    MODULES=("${FALLBACK_MODULES[@]}")
+    warn "modules.txt not found (or empty) in $PROJECT_DIR — using the built-in module list."
+    warn "This checkout is stale; 'git pull' to pick up modules.txt."
+  fi
 else
   PROJECT_DIR="$HOME/Documents/es-mini-agent"
   info "Standalone mode: setting up in $PROJECT_DIR"
@@ -96,12 +128,20 @@ else
       exit 1
     fi
   }
-  download "server.js"
+
+  # Manifest first: it decides what else gets downloaded.
+  download "modules.txt"
+  parse_manifest "$PROJECT_DIR/modules.txt"
+  if [[ "${#MODULES[@]}" -eq 0 ]]; then
+    err "modules.txt downloaded but parsed to an empty list — refusing to continue."
+    exit 1
+  fi
+  for m in "${MODULES[@]}"; do
+    download "$m"
+  done
+  # Deliberately NOT in the manifest: it is a launchd template, not a runtime
+  # module, and self-update must never touch it.
   download "com.es.mini-agent.plist"
-  download "obs-control.js"
-  download "r2-upload.js"
-  download "upload-queue.js"
-  download "aws-creds.js"
 fi
 
 cd "$PROJECT_DIR"
@@ -171,29 +211,15 @@ else
   fi
 fi
 
-# ---------- sanity: server.js and template exist ----------
-if [[ ! -f "$PROJECT_DIR/server.js" ]]; then
-  err "server.js not found in $PROJECT_DIR — cannot continue."
-  exit 1
-fi
+# ---------- sanity: every manifest module and the launchd template exist ----------
+for m in "${MODULES[@]}"; do
+  if [[ ! -f "$PROJECT_DIR/$m" ]]; then
+    err "$m not found in $PROJECT_DIR — cannot continue."
+    exit 1
+  fi
+done
 if [[ ! -f "$PROJECT_DIR/com.es.mini-agent.plist" ]]; then
   err "com.es.mini-agent.plist not found in $PROJECT_DIR — cannot continue."
-  exit 1
-fi
-if [[ ! -f "$PROJECT_DIR/obs-control.js" ]]; then
-  err "obs-control.js not found in $PROJECT_DIR — cannot continue."
-  exit 1
-fi
-if [[ ! -f "$PROJECT_DIR/r2-upload.js" ]]; then
-  err "r2-upload.js not found in $PROJECT_DIR — cannot continue."
-  exit 1
-fi
-if [[ ! -f "$PROJECT_DIR/upload-queue.js" ]]; then
-  err "upload-queue.js not found in $PROJECT_DIR — cannot continue."
-  exit 1
-fi
-if [[ ! -f "$PROJECT_DIR/aws-creds.js" ]]; then
-  err "aws-creds.js not found in $PROJECT_DIR — cannot continue."
   exit 1
 fi
 

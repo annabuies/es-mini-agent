@@ -11,6 +11,15 @@ const path = require('path');
 const { createUploadQueue, resolveFfmpegBin } = require('./upload-queue');
 const { runMultipartUploadTest, signR2Request } = require('./r2-upload');
 const { createCredentialsProvider } = require('./aws-creds');
+const { runSelfUpdate, getVersionBlock } = require('./self-update');
+
+// Bumped by hand per release. This is the fastest way to tell what a remote
+// machine is actually running -- it comes back in `diag` even when OBS is
+// unreachable and even on a machine that has never self-updated.
+const AGENT_VERSION = '2026.07.30-2';
+// Where self-update pulls new code from. Overridable for testing; the default is
+// the public repo, fetched with no credentials on purpose (see modules.txt).
+const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
 
 const PORT = parseInt(process.env.PORT || '8787', 10);
 const RECORD_CONTROL_KEY = process.env.RECORD_CONTROL_KEY;
@@ -361,6 +370,37 @@ function sessionSources() {
   return (state.recording && Array.isArray(state.sources) && state.sources.length) ? state.sources : activeSources;
 }
 
+// The `update` op. Defined once and called from BOTH the demo and the real block
+// of handleOp -- the demo block returns early, so an op handled only in the real
+// block is invisible on a demo machine, and a demo machine is exactly the kind we
+// most need to be able to fix remotely. There is nothing OBS-specific about
+// updating.
+async function performUpdate() {
+  const busyReason = () => {
+    if (state.recording) return 'recording';
+    // uploadQueue is null in demo mode / when storage is unconfigured.
+    const q = uploadQueue ? uploadQueue.status() : null;
+    if (q && (q.queued > 0 || q.active)) return 'uploading';
+    return null;
+  };
+
+  const result = await runSelfUpdate({ projectDir: __dirname, repoRawBase: REPO_RAW_BASE, busyReason });
+
+  if (result.ok && result.updated) {
+    // Exit AFTER the reply has gone out. The delay gives the poll loop's result
+    // POST (and the local HTTP response) time to complete before the process
+    // dies; KeepAlive in the launchd plist is what brings it back up on the new
+    // code. Nothing here rebuilds the plist, so every env var on the machine
+    // survives the restart untouched.
+    setTimeout(() => {
+      console.log('[es-mini-agent] self-update: exiting so launchd restarts on the new code');
+      process.exit(0);
+    }, 2500);
+  }
+
+  return result;
+}
+
 async function handleOp(op, body) {
   if (!OBS_MODE_ACTIVE) {
     if (op === 'start') {
@@ -397,7 +437,17 @@ async function handleOp(op, body) {
       return { ok: true, preview: false };
     }
     if (op === 'diag') {
-      return { ok: true, demo: true, recording: state.recording, stats: null, filters: null };
+      return {
+        ok: true,
+        demo: true,
+        recording: state.recording,
+        stats: null,
+        filters: null,
+        version: getVersionBlock({ projectDir: __dirname, agentVersion: AGENT_VERSION }),
+      };
+    }
+    if (op === 'update') {
+      return await performUpdate();
     }
     return null;
   }
@@ -580,6 +630,9 @@ async function handleOp(op, body) {
       credentials: storageCredentialsProvider.describeCredentials(),
     };
     out.ffmpeg = resolveFfmpegBin();
+    // Sits alongside storage/ffmpeg deliberately: all three are assigned before
+    // the OBS call below, so they still come back on a machine whose OBS is down.
+    out.version = getVersionBlock({ projectDir: __dirname, agentVersion: AGENT_VERSION });
 
     let client;
     try {
@@ -699,10 +752,13 @@ async function handleOp(op, body) {
     }
     return { ok: true, preview: false };
   }
+  if (op === 'update') {
+    return await performUpdate();
+  }
   return null;
 }
 
-const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'diag']);
+const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'diag', 'update']);
 
 const server = http.createServer(async (req, res) => {
   try {

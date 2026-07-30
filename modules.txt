@@ -1,0 +1,11 @@
+# Runtime modules the agent needs at boot, one per line.
+# SINGLE SOURCE OF TRUTH for both install.sh's download list and self-update.js.
+# A file missing from this list is a file the agent will not have after an
+# install or a self-update -- which is exactly how the agent once shipped
+# without aws-creds.js and crash-looped on someone else's machine.
+server.js
+obs-control.js
+r2-upload.js
+upload-queue.js
+aws-creds.js
+self-update.js

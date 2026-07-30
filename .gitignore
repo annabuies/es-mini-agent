@@ -3,3 +3,9 @@ node_modules
 *.log
 .r2-test-tmp/
 .r2-uploads/
+# Runtime artifacts of the self-update op. Created on the machine being updated;
+# never source. .update-staging/ is transient, .update-backup/ is the rollback
+# copy, update-state.json records what that specific machine is running.
+.update-staging/
+.update-backup/
+update-state.json

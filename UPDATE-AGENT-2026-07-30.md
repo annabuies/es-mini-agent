@@ -51,11 +51,14 @@ For **each** of cam1, cam2, cam3:
 
 # PART B — one installer re-run
 
-This picks up three fixes at once:
+This picks up four fixes at once:
 
 1. **Cloud storage moves from Cloudflare R2 to AWS S3.** New credentials, new bucket.
 2. **The 1080p playback proxy gets fixed.** It has never once run on this machine. The installer detected the ffmpeg path and then discarded it, and the background service runs with a minimal PATH that excludes Homebrew, so it failed silently every time. Recording and master upload were never affected, which is why nothing looked wrong.
 3. **The `diag` remote diagnostic** from the earlier runbook, if you have not already picked it up.
+4. **Remote updates.** The agent can now fetch and install its own code updates when Anna asks it to, so future changes do not need you at the keyboard.
+
+**This should be the last time anyone installs this by hand.** Point 4 is the reason. After this run, Anna can ship changes to the Mini remotely, and the agent refuses to update itself while a recording or an upload is in progress, so it can never interrupt a session.
 
 ## Step 1 — check what is currently set
 
@@ -63,13 +66,13 @@ This picks up three fixes at once:
 PL=~/Library/LaunchAgents/com.es.mini-agent.plist
 getv() { /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$1" "$PL" 2>/dev/null || true; }
 
-for k in BUILDING_ID RECORD_CONTROL_KEY OBS_SOURCES OBS_WS_URL OBS_WS_PASSWORD \
+for k in PORT BUILDING_ID RECORD_CONTROL_KEY OBS_SOURCES OBS_WS_URL OBS_WS_PASSWORD \
          OBS_RECORD_DIR UPLOAD_CONFIRMED_WEBHOOK_URL; do
   v="$(getv "$k")"; [ -n "$v" ] && echo "  SET     $k" || echo "  MISSING $k"
 done
 ```
 
-Send Anna that list if anything other than `UPLOAD_CONFIRMED_WEBHOOK_URL` shows as MISSING. That one is allowed to be missing, it is supplied remotely now.
+Send Anna that list if anything other than `PORT` or `UPLOAD_CONFIRMED_WEBHOOK_URL` shows as MISSING. Those two are allowed to be missing: `PORT` falls back to 8787, and the webhook is supplied remotely now.
 
 ## Step 2 — re-run the installer
 
@@ -81,6 +84,7 @@ Anna will send you this block with the five `PASTE_` values already filled in. E
 PL=~/Library/LaunchAgents/com.es.mini-agent.plist
 getv() { /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$1" "$PL" 2>/dev/null || true; }
 
+PORT="$(getv PORT)" \
 BUILDING_ID="$(getv BUILDING_ID)" \
 RECORD_CONTROL_KEY="$(getv RECORD_CONTROL_KEY)" \
 OBS_SOURCES="$(getv OBS_SOURCES)" \
