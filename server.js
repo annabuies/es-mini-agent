@@ -16,7 +16,7 @@ const { runSelfUpdate, getVersionBlock } = require('./self-update');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.08.05-5';
+const AGENT_VERSION = '2026.08.05-6';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -740,6 +740,51 @@ async function performUpdate() {
   return result;
 }
 
+async function selectAudioInputDevice(preferredName) {
+  if (state.recording) return { ok: false, reason: 'busy_recording' };
+  try {
+    const client = await getObsClient();
+    const inputRes = await client.request('GetInputList');
+    const inputs = obsResponseData(inputRes).inputs;
+    const audioInputs = Array.isArray(inputs) ? inputs.filter((input) => (
+      input && typeof input.inputName === 'string'
+      && typeof input.inputKind === 'string'
+      && input.inputKind.includes('input_capture')
+      && !activeSources.includes(input.inputName)
+    )) : [];
+    if (audioInputs.length !== 1) {
+      return { ok: false, reason: audioInputs.length ? 'ambiguous_audio_input' : 'no_audio_input_found' };
+    }
+    const inputName = audioInputs[0].inputName;
+    const devicesRes = await client.request('GetInputPropertiesListPropertyItems', {
+      inputName,
+      propertyName: 'device_id',
+    });
+    const devices = obsResponseData(devicesRes).propertyItems;
+    const preferred = Array.isArray(devices) ? devices.find((item) => (
+      item && item.itemEnabled !== false && item.itemName === preferredName
+    )) : null;
+    if (!preferred || !preferred.itemValue) {
+      return { ok: false, reason: 'preferred_audio_device_unavailable', preferredName };
+    }
+    const changed = await client.request('SetInputSettings', {
+      inputName,
+      inputSettings: { device_id: preferred.itemValue },
+      overlay: true,
+    });
+    if (!obsRequestSucceeded(changed)) return { ok: false, reason: 'audio_device_change_rejected' };
+    const readRes = await client.request('GetInputSettings', { inputName });
+    return {
+      ok: true,
+      inputName,
+      deviceName: preferredName,
+      settings: obsResponseData(readRes).inputSettings || null,
+    };
+  } catch (e) {
+    return { ok: false, reason: 'audio_device_change_failed', detail: truncateDetail(e && (e.message || e)) };
+  }
+}
+
 async function handleOp(op, body) {
   if (!OBS_MODE_ACTIVE) {
     if (op === 'start') {
@@ -787,6 +832,9 @@ async function handleOp(op, body) {
     }
     if (op === 'audio_bind') {
       return { ok: true, demo: true, bound: false, reason: 'demo_mode' };
+    }
+    if (op === 'audio_lavalier') {
+      return { ok: true, demo: true, changed: false, reason: 'demo_mode' };
     }
     if (op === 'update') {
       return await performUpdate();
@@ -1038,6 +1086,9 @@ async function handleOp(op, body) {
     }
     out.filters = filters;
     return out;
+  }
+  if (op === 'audio_lavalier') {
+    return await selectAudioInputDevice('USB Lavalier Microphone');
   }
   if (op === 'audio_bind') {
     let audioInput = null;
@@ -1308,7 +1359,7 @@ async function handleOp(op, body) {
   return null;
 }
 
-const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_bind', 'update']);
+const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_bind', 'audio_lavalier', 'update']);
 
 const server = http.createServer(async (req, res) => {
   try {
