@@ -16,7 +16,7 @@ const { runSelfUpdate, getVersionBlock } = require('./self-update');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.08.05-1';
+const AGENT_VERSION = '2026.08.05-2';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -446,6 +446,20 @@ async function createCloudflarePreviewOverlay(client) {
   }
 }
 
+async function removeStaleCloudflarePreviewScenes(client) {
+  try {
+    const listRes = await client.request('GetSceneList');
+    if (!obsRequestSucceeded(listRes)) return;
+    const scenes = obsResponseData(listRes).scenes;
+    if (!Array.isArray(scenes)) return;
+    for (const scene of scenes) {
+      const sceneName = scene && scene.sceneName;
+      if (typeof sceneName !== 'string' || !sceneName.startsWith('__ES_CF_PREVIEW_')) continue;
+      try { await client.request('RemoveScene', { sceneName }); } catch (_) {}
+    }
+  } catch (_) { /* stale overlay cleanup is best-effort */ }
+}
+
 async function selectCloudflarePreviewCamera(index) {
   if (!Number.isInteger(index) || index < 0 || index >= activeSources.length) {
     return { ok: false, reason: 'camera_unavailable' };
@@ -586,10 +600,31 @@ async function startCloudflarePreview(config) {
     const status = await client.request('GetStreamStatus');
     if (!obsRequestSucceeded(status)) throw new Error('obs_stream_status_rejected');
     if (status.responseData && status.responseData.outputActive) {
-      // Never hijack or later stop a stream that this preview session did not start.
-      throw new Error('obs_stream_already_active');
+      // A Mini self-update can restart the agent while OBS itself keeps the old
+      // preview output alive. Reclaim only an unmistakable Cloudflare WHIP
+      // service; never stop RTMP, IVS, or an operator-configured destination.
+      const serviceRes = await client.request('GetStreamServiceSettings');
+      const service = obsResponseData(serviceRes);
+      const server = service.streamServiceSettings && service.streamServiceSettings.server;
+      const staleCloudflareWhip = obsRequestSucceeded(serviceRes)
+        && service.streamServiceType === 'whip_custom'
+        && validCloudflareWebRtcUrl(server, '/webRTC/publish');
+      if (!staleCloudflareWhip) throw new Error('obs_stream_already_active');
+
+      const stopped = await client.request('StopStream');
+      if (!obsRequestSucceeded(stopped)) throw new Error('obs_stale_preview_stop_rejected');
+      let stillActive = true;
+      for (let i = 0; i < 20; i += 1) {
+        await sleep(250);
+        const next = await client.request('GetStreamStatus');
+        stillActive = !!(obsRequestSucceeded(next) && next.responseData && next.responseData.outputActive);
+        if (!stillActive) break;
+      }
+      if (stillActive) throw new Error('obs_stale_preview_stop_timeout');
+      console.log('[es-mini-agent] [preview] recovered stale Cloudflare WebRTC output');
     }
 
+    await removeStaleCloudflarePreviewScenes(client);
     cloudflarePreviewCameraIndex = Math.min(cloudflarePreviewCameraIndex, activeSources.length - 1);
     await createCloudflarePreviewOverlay(client);
 
