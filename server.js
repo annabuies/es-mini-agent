@@ -16,7 +16,7 @@ const { runSelfUpdate, getVersionBlock } = require('./self-update');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.08.05-4';
+const AGENT_VERSION = '2026.08.05-5';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -1127,6 +1127,38 @@ async function handleOp(op, body) {
           }));
         }
       } catch (_) {}
+      // OBS can retain a CoreAudio device id after that interface has been
+      // unplugged. It then exposes a nominal, unmuted Mic/Aux source carrying
+      // only noise/silence. Repair only this provable stale-device case, and
+      // only to the studio's explicitly named main RODECaster program feed.
+      const selectedDeviceId = audioInput.settings && audioInput.settings.device_id;
+      const selectedDeviceAvailable = typeof selectedDeviceId === 'string'
+        && Array.isArray(audioInput.devices)
+        && audioInput.devices.some((device) => device.enabled && device.value === selectedDeviceId);
+      const preferredDevice = Array.isArray(audioInput.devices)
+        ? audioInput.devices.find((device) => device.enabled && device.name === 'RODECaster Video Stereo')
+        : null;
+      if (selectedDeviceId && !selectedDeviceAvailable && preferredDevice && preferredDevice.value) {
+        const setInputRes = await client.request('SetInputSettings', {
+          inputName: candidates[0].name,
+          inputSettings: { device_id: preferredDevice.value },
+          overlay: true,
+        });
+        if (!obsRequestSucceeded(setInputRes)) {
+          return { ok: false, bound: false, reason: 'audio_device_repair_rejected', audioInput };
+        }
+        audioInput.deviceRepaired = true;
+        audioInput.previousDeviceId = selectedDeviceId;
+        try {
+          const readInputRes = await client.request('GetInputSettings', { inputName: candidates[0].name });
+          const readInput = readInputRes && readInputRes.responseData;
+          if (readInput && readInput.inputSettings && typeof readInput.inputSettings === 'object') {
+            audioInput.settings = readInput.inputSettings;
+          }
+        } catch (_) {}
+      } else {
+        audioInput.deviceRepaired = false;
+      }
 
       const keysWritten = { different_audio: true, audio_source: candidates[0].name, audio_track: 1 };
 
