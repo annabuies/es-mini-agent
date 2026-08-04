@@ -16,7 +16,7 @@ const { runSelfUpdate, getVersionBlock } = require('./self-update');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.07.30-5';
+const AGENT_VERSION = '2026.08.04-1';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -76,6 +76,10 @@ let previewTimer = null;
 let previewBusy = false;
 let previewLastOkAt = 0;
 let lastPreviewWarnAt = 0;
+let cloudflarePreviewOwnsStream = false;
+let cloudflarePreviewTimer = null;
+let cloudflarePreviewInputUid = null;
+let cloudflarePreviewPlaybackUrl = null;
 let pendingSources = null;
 
 function log(method, path, status, note) {
@@ -242,7 +246,7 @@ async function getObsClient() {
 }
 
 function previewActive() {
-  return !!(previewTimer && Date.now() <= previewUntil);
+  return !!((previewTimer || cloudflarePreviewOwnsStream) && Date.now() <= previewUntil);
 }
 
 function maybeWarnPreview(detail) {
@@ -322,6 +326,145 @@ async function pushPreviewFrames() {
     maybeWarnPreview('preview tick failed: ' + (e && (e.message || e)));
   } finally {
     previewBusy = false;
+  }
+}
+
+function obsRequestSucceeded(response) {
+  return !!(response && response.requestStatus && response.requestStatus.result === true);
+}
+
+function validCloudflareInputUid(value) {
+  return typeof value === 'string' && /^[a-f0-9]{32}$/i.test(value);
+}
+
+function validCloudflareWebRtcUrl(value, suffix) {
+  if (typeof value !== 'string' || !value) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:'
+      && url.hostname.endsWith('.cloudflarestream.com')
+      && url.pathname.endsWith(suffix);
+  } catch (_) {
+    return false;
+  }
+}
+
+async function requestCloudflareCleanup(inputUid) {
+  if (!validCloudflareInputUid(inputUid)) return;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 3000);
+  try {
+    const response = await fetch(`${RECORD_POLL_URL}/api/record`, {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + RECORD_CONTROL_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ stream_cleanup: true, input_uid: inputUid }),
+      signal: ctrl.signal,
+    });
+    if (!response.ok) maybeWarnPreview('Cloudflare preview cleanup HTTP ' + response.status);
+  } catch (e) {
+    maybeWarnPreview('Cloudflare preview cleanup failed: ' + (e && (e.message || e)));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function stopCloudflarePreview() {
+  if (cloudflarePreviewTimer) {
+    clearInterval(cloudflarePreviewTimer);
+    cloudflarePreviewTimer = null;
+  }
+  const inputUid = cloudflarePreviewInputUid;
+  const owned = cloudflarePreviewOwnsStream;
+  cloudflarePreviewOwnsStream = false;
+  cloudflarePreviewInputUid = null;
+  cloudflarePreviewPlaybackUrl = null;
+  if (owned) {
+    try {
+      const client = await getObsClient();
+      const stopped = await client.request('StopStream');
+      if (!obsRequestSucceeded(stopped)) {
+        maybeWarnPreview('OBS rejected Cloudflare preview StopStream');
+      } else {
+        console.log('[es-mini-agent] [preview] Cloudflare WebRTC stream stopped');
+      }
+    } catch (e) {
+      maybeWarnPreview('Cloudflare preview stop failed: ' + (e && (e.message || e)));
+    }
+  }
+  if (inputUid) await requestCloudflareCleanup(inputUid);
+  return inputUid;
+}
+
+async function startCloudflarePreview(config) {
+  const inputUid = config && typeof config.inputUid === 'string' ? config.inputUid.trim() : '';
+  const publishUrl = config && typeof config.publishUrl === 'string' ? config.publishUrl.trim() : '';
+  const playbackUrl = config && typeof config.playbackUrl === 'string' ? config.playbackUrl.trim() : '';
+  const reuse = !!(config && config.reuse === true);
+  const validIdentity = validCloudflareInputUid(inputUid)
+    && validCloudflareWebRtcUrl(playbackUrl, '/webRTC/play');
+
+  if (cloudflarePreviewOwnsStream) {
+    try {
+      const client = await getObsClient();
+      const current = await client.request('GetStreamStatus');
+      if (obsRequestSucceeded(current) && current.responseData && current.responseData.outputActive) {
+        // A keepalive can race with creation of a replacement input. Keep the
+        // stream we own and ask the relay to delete the unused candidate.
+        return {
+          stream: { inputUid: cloudflarePreviewInputUid, playbackUrl: cloudflarePreviewPlaybackUrl },
+          cleanupInputUid: validIdentity && inputUid !== cloudflarePreviewInputUid ? inputUid : null,
+        };
+      }
+    } catch (_) { /* clear the stale state and start again below */ }
+    const staleInputUid = cloudflarePreviewInputUid;
+    cloudflarePreviewOwnsStream = false;
+    cloudflarePreviewInputUid = null;
+    cloudflarePreviewPlaybackUrl = null;
+    if (staleInputUid) await requestCloudflareCleanup(staleInputUid);
+  }
+
+  if (!validIdentity || reuse || !validCloudflareWebRtcUrl(publishUrl, '/webRTC/publish')) {
+    return { stream: null, cleanupInputUid: !reuse && validIdentity ? inputUid : null };
+  }
+
+  try {
+    const client = await getObsClient();
+    const status = await client.request('GetStreamStatus');
+    if (!obsRequestSucceeded(status)) throw new Error('obs_stream_status_rejected');
+    if (status.responseData && status.responseData.outputActive) {
+      // Never hijack or later stop a stream that this preview session did not start.
+      throw new Error('obs_stream_already_active');
+    }
+
+    const configured = await client.request('SetStreamServiceSettings', {
+      streamServiceType: 'whip_custom',
+      streamServiceSettings: {
+        server: publishUrl,
+        // Cloudflare authenticates with the secret embedded in the WHIP URL.
+        // Clear any bearer left by a previous IVS configuration.
+        bearer_token: '',
+      },
+    });
+    if (!obsRequestSucceeded(configured)) throw new Error('obs_whip_config_rejected');
+
+    const started = await client.request('StartStream');
+    if (!obsRequestSucceeded(started)) throw new Error('obs_stream_start_rejected');
+    cloudflarePreviewOwnsStream = true;
+    cloudflarePreviewInputUid = inputUid;
+    cloudflarePreviewPlaybackUrl = playbackUrl;
+    console.log('[es-mini-agent] [preview] Cloudflare WebRTC stream started');
+    if (!cloudflarePreviewTimer) {
+      cloudflarePreviewTimer = setInterval(() => {
+        if (Date.now() > previewUntil) void stopCloudflarePreview();
+      }, 5000);
+    }
+    return { stream: { inputUid, playbackUrl }, cleanupInputUid: null };
+  } catch (e) {
+    maybeWarnPreview('Cloudflare preview start failed: ' + (e && (e.message || e)));
+    return { stream: null, cleanupInputUid: inputUid };
   }
 }
 
@@ -864,24 +1007,45 @@ async function handleOp(op, body) {
     return { ok: true, recording: true, feeds_writing: null };
   }
   if (op === 'preview_start') {
-    if (!isStorageConfigured()) {
-      return { ok: false, reason: 'r2_unconfigured' };
-    }
     previewUntil = Date.now() + PREVIEW_TTL_MS;
+    const realtime = await startCloudflarePreview(body && body.cloudflare);
+    if (realtime.stream) {
+      if (previewTimer) {
+        clearInterval(previewTimer);
+        previewTimer = null;
+      }
+      return {
+        ok: true,
+        preview: true,
+        stream_mode: 'cloudflare',
+        stream: realtime.stream,
+        cleanup_input_uid: realtime.cleanupInputUid,
+        sources: activeSources.slice(),
+      };
+    }
+    if (!isStorageConfigured()) {
+      return { ok: false, reason: 'r2_unconfigured', cleanup_input_uid: realtime.cleanupInputUid };
+    }
     if (!previewTimer) {
       previewTimer = setInterval(pushPreviewFrames, PREVIEW_INTERVAL_MS);
       console.log('[es-mini-agent] [preview] started');
     }
-    return { ok: true, preview: true, sources: activeSources.slice() };
+    return {
+      ok: true,
+      preview: true,
+      cleanup_input_uid: realtime.cleanupInputUid,
+      sources: activeSources.slice(),
+    };
   }
   if (op === 'preview_stop') {
     previewUntil = 0;
+    const cleanupInputUid = await stopCloudflarePreview();
     if (previewTimer) {
       clearInterval(previewTimer);
       previewTimer = null;
       console.log('[es-mini-agent] [preview] stopped');
     }
-    return { ok: true, preview: false };
+    return { ok: true, preview: false, cleanup_input_uid: cleanupInputUid };
   }
   if (op === 'update') {
     return await performUpdate();
@@ -1204,7 +1368,7 @@ async function pollOnce() {
     const cmd = data && data.command;
     if (!cmd || !cmd.id || !cmd.op) return; // nothing to do — stay quiet to keep agent.log readable
 
-    const result = await handleOp(cmd.op, {});
+    const result = await handleOp(cmd.op, (cmd.payload && typeof cmd.payload === 'object') ? cmd.payload : {});
     if (result == null) {
       console.warn(`[es-mini-agent] relay: unknown op '${cmd.op}' (id=${cmd.id}) — skipping result post`);
       return;
