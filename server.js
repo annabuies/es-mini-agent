@@ -16,7 +16,7 @@ const { runSelfUpdate, getVersionBlock } = require('./self-update');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.08.05-2';
+const AGENT_VERSION = '2026.08.05-3';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -652,14 +652,15 @@ async function startCloudflarePreview(config) {
     }
     return { stream: { inputUid, playbackUrl }, cleanupInputUid: null };
   } catch (e) {
+    const error = truncateDetail(e && (e.message || e));
     if (cloudflarePreviewOverlay) {
       try {
         const client = await getObsClient();
         await removeCloudflarePreviewOverlay(client);
       } catch (_) {}
     }
-    maybeWarnPreview('Cloudflare preview start failed: ' + (e && (e.message || e)));
-    return { stream: null, cleanupInputUid: inputUid };
+    maybeWarnPreview('Cloudflare preview start failed: ' + error);
+    return { stream: null, cleanupInputUid: inputUid, error };
   }
 }
 
@@ -1233,6 +1234,7 @@ async function handleOp(op, body) {
       ok: true,
       preview: true,
       cleanup_input_uid: realtime.cleanupInputUid,
+      stream_error: realtime.error || null,
       sources: activeSources.slice(),
     };
   }
