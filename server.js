@@ -16,7 +16,7 @@ const { runSelfUpdate, getVersionBlock } = require('./self-update');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.08.05-3';
+const AGENT_VERSION = '2026.08.05-4';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -1095,7 +1095,7 @@ async function handleOp(op, body) {
         };
       }
 
-      audioInput = { name: candidates[0].name, muted: null, volumeDb: null };
+      audioInput = { name: candidates[0].name, muted: null, volumeDb: null, settings: null, devices: null };
       try {
         const muteRes = await client.request('GetInputMute', { inputName: candidates[0].name });
         const m = muteRes && muteRes.responseData;
@@ -1105,6 +1105,27 @@ async function handleOp(op, body) {
         const volRes = await client.request('GetInputVolume', { inputName: candidates[0].name });
         const v = volRes && volRes.responseData;
         if (v && typeof v.inputVolumeDb === 'number') audioInput.volumeDb = v.inputVolumeDb;
+      } catch (_) {}
+      try {
+        const settingsRes = await client.request('GetInputSettings', { inputName: candidates[0].name });
+        const s = settingsRes && settingsRes.responseData;
+        if (s && s.inputSettings && typeof s.inputSettings === 'object') {
+          audioInput.settings = s.inputSettings;
+        }
+      } catch (_) {}
+      try {
+        const devicesRes = await client.request('GetInputPropertiesListPropertyItems', {
+          inputName: candidates[0].name,
+          propertyName: 'device_id',
+        });
+        const d = devicesRes && devicesRes.responseData;
+        if (d && Array.isArray(d.propertyItems)) {
+          audioInput.devices = d.propertyItems.map((item) => ({
+            name: item && typeof item.itemName !== 'undefined' ? item.itemName : null,
+            value: item && typeof item.itemValue !== 'undefined' ? item.itemValue : null,
+            enabled: !!(item && item.itemEnabled),
+          }));
+        }
       } catch (_) {}
 
       const keysWritten = { different_audio: true, audio_source: candidates[0].name, audio_track: 1 };
