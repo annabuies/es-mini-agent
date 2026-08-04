@@ -16,7 +16,7 @@ const { runSelfUpdate, getVersionBlock } = require('./self-update');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.08.04-1';
+const AGENT_VERSION = '2026.08.05-1';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -80,6 +80,8 @@ let cloudflarePreviewOwnsStream = false;
 let cloudflarePreviewTimer = null;
 let cloudflarePreviewInputUid = null;
 let cloudflarePreviewPlaybackUrl = null;
+let cloudflarePreviewCameraIndex = 0;
+let cloudflarePreviewOverlay = null;
 let pendingSources = null;
 
 function log(method, path, status, note) {
@@ -333,6 +335,146 @@ function obsRequestSucceeded(response) {
   return !!(response && response.requestStatus && response.requestStatus.result === true);
 }
 
+function obsResponseData(response) {
+  return (response && response.responseData && typeof response.responseData === 'object')
+    ? response.responseData
+    : {};
+}
+
+function cameraIndexForPreviewOp(op) {
+  const match = typeof op === 'string' ? op.match(/^preview_cam([1-3])$/) : null;
+  return match ? Number(match[1]) - 1 : null;
+}
+
+async function removeCloudflarePreviewOverlay(client) {
+  const overlay = cloudflarePreviewOverlay;
+  cloudflarePreviewOverlay = null;
+  if (!overlay) return;
+
+  if (Number.isInteger(overlay.programSceneItemId)) {
+    try {
+      const removedItem = await client.request('RemoveSceneItem', {
+        sceneName: overlay.programSceneName,
+        sceneItemId: overlay.programSceneItemId,
+      });
+      if (!obsRequestSucceeded(removedItem)) {
+        maybeWarnPreview('OBS rejected preview overlay scene-item removal');
+      }
+    } catch (e) {
+      maybeWarnPreview('preview overlay item cleanup failed: ' + (e && (e.message || e)));
+    }
+  }
+
+  try {
+    const removedScene = await client.request('RemoveScene', { sceneName: overlay.sceneName });
+    if (!obsRequestSucceeded(removedScene)) {
+      maybeWarnPreview('OBS rejected preview overlay scene removal');
+    }
+  } catch (e) {
+    maybeWarnPreview('preview overlay scene cleanup failed: ' + (e && (e.message || e)));
+  }
+}
+
+async function createCloudflarePreviewOverlay(client) {
+  if (cloudflarePreviewOverlay) return cloudflarePreviewOverlay;
+  if (activeSources.length < 1) throw new Error('no_preview_cameras');
+
+  const currentRes = await client.request('GetCurrentProgramScene');
+  if (!obsRequestSucceeded(currentRes)) throw new Error('obs_program_scene_rejected');
+  const programSceneName = obsResponseData(currentRes).currentProgramSceneName;
+  if (!programSceneName) throw new Error('obs_program_scene_missing');
+
+  const videoRes = await client.request('GetVideoSettings');
+  if (!obsRequestSucceeded(videoRes)) throw new Error('obs_video_settings_rejected');
+  const video = obsResponseData(videoRes);
+  const width = Number(video.baseWidth) || 1920;
+  const height = Number(video.baseHeight) || 1080;
+  const sceneName = `__ES_CF_PREVIEW_${Date.now()}`;
+
+  const createdScene = await client.request('CreateScene', { sceneName });
+  if (!obsRequestSucceeded(createdScene)) throw new Error('obs_preview_scene_create_rejected');
+
+  const cameraItems = [];
+  let programSceneItemId = null;
+  try {
+    for (let i = 0; i < activeSources.length; i += 1) {
+      const sourceName = activeSources[i];
+      const itemRes = await client.request('CreateSceneItem', {
+        sceneName,
+        sourceName,
+        sceneItemEnabled: i === cloudflarePreviewCameraIndex,
+      });
+      if (!obsRequestSucceeded(itemRes)) throw new Error('obs_preview_camera_add_rejected:' + sourceName);
+      const sceneItemId = Number(obsResponseData(itemRes).sceneItemId);
+      if (!Number.isInteger(sceneItemId)) throw new Error('obs_preview_camera_item_missing:' + sourceName);
+      cameraItems.push({ sourceName, sceneItemId });
+
+      const transformRes = await client.request('SetSceneItemTransform', {
+        sceneName,
+        sceneItemId,
+        sceneItemTransform: {
+          alignment: 5,
+          positionX: 0,
+          positionY: 0,
+          boundsAlignment: 0,
+          boundsType: 'OBS_BOUNDS_STRETCH',
+          boundsWidth: width,
+          boundsHeight: height,
+        },
+      });
+      if (!obsRequestSucceeded(transformRes)) throw new Error('obs_preview_camera_transform_rejected:' + sourceName);
+    }
+
+    const overlayRes = await client.request('CreateSceneItem', {
+      sceneName: programSceneName,
+      sourceName: sceneName,
+      sceneItemEnabled: true,
+    });
+    if (!obsRequestSucceeded(overlayRes)) throw new Error('obs_preview_overlay_add_rejected');
+    programSceneItemId = Number(obsResponseData(overlayRes).sceneItemId);
+    if (!Number.isInteger(programSceneItemId)) throw new Error('obs_preview_overlay_item_missing');
+
+    cloudflarePreviewOverlay = { sceneName, programSceneName, programSceneItemId, cameraItems };
+    console.log('[es-mini-agent] [preview] camera overlay ready source=' + activeSources[cloudflarePreviewCameraIndex]);
+    return cloudflarePreviewOverlay;
+  } catch (e) {
+    // Remove the partial overlay before propagating the start failure. This does
+    // not touch any of the studio's own scenes or Source Record filters.
+    cloudflarePreviewOverlay = { sceneName, programSceneName, programSceneItemId, cameraItems };
+    await removeCloudflarePreviewOverlay(client);
+    throw e;
+  }
+}
+
+async function selectCloudflarePreviewCamera(index) {
+  if (!Number.isInteger(index) || index < 0 || index >= activeSources.length) {
+    return { ok: false, reason: 'camera_unavailable' };
+  }
+  if (!cloudflarePreviewOwnsStream || !cloudflarePreviewOverlay) {
+    return { ok: false, reason: 'preview_not_active' };
+  }
+
+  try {
+    const client = await getObsClient();
+    const overlay = cloudflarePreviewOverlay;
+    for (let i = 0; i < overlay.cameraItems.length; i += 1) {
+      const item = overlay.cameraItems[i];
+      const enabled = i === index;
+      const result = await client.request('SetSceneItemEnabled', {
+        sceneName: overlay.sceneName,
+        sceneItemId: item.sceneItemId,
+        sceneItemEnabled: enabled,
+      });
+      if (!obsRequestSucceeded(result)) throw new Error('obs_preview_camera_toggle_rejected:' + item.sourceName);
+    }
+    cloudflarePreviewCameraIndex = index;
+    console.log('[es-mini-agent] [preview] camera selected source=' + activeSources[index]);
+    return { ok: true, preview: true, source: activeSources[index], camera: index + 1 };
+  } catch (e) {
+    return { ok: false, reason: 'camera_switch_failed', detail: truncateDetail(e && (e.message || e)) };
+  }
+}
+
 function validCloudflareInputUid(value) {
   return typeof value === 'string' && /^[a-f0-9]{32}$/i.test(value);
 }
@@ -382,8 +524,9 @@ async function stopCloudflarePreview() {
   cloudflarePreviewInputUid = null;
   cloudflarePreviewPlaybackUrl = null;
   if (owned) {
+    let client = null;
     try {
-      const client = await getObsClient();
+      client = await getObsClient();
       const stopped = await client.request('StopStream');
       if (!obsRequestSucceeded(stopped)) {
         maybeWarnPreview('OBS rejected Cloudflare preview StopStream');
@@ -392,6 +535,14 @@ async function stopCloudflarePreview() {
       }
     } catch (e) {
       maybeWarnPreview('Cloudflare preview stop failed: ' + (e && (e.message || e)));
+    }
+    if (client) await removeCloudflarePreviewOverlay(client);
+  } else if (cloudflarePreviewOverlay) {
+    try {
+      const client = await getObsClient();
+      await removeCloudflarePreviewOverlay(client);
+    } catch (e) {
+      maybeWarnPreview('preview overlay cleanup failed: ' + (e && (e.message || e)));
     }
   }
   if (inputUid) await requestCloudflareCleanup(inputUid);
@@ -439,6 +590,9 @@ async function startCloudflarePreview(config) {
       throw new Error('obs_stream_already_active');
     }
 
+    cloudflarePreviewCameraIndex = Math.min(cloudflarePreviewCameraIndex, activeSources.length - 1);
+    await createCloudflarePreviewOverlay(client);
+
     const configured = await client.request('SetStreamServiceSettings', {
       streamServiceType: 'whip_custom',
       streamServiceSettings: {
@@ -463,6 +617,12 @@ async function startCloudflarePreview(config) {
     }
     return { stream: { inputUid, playbackUrl }, cleanupInputUid: null };
   } catch (e) {
+    if (cloudflarePreviewOverlay) {
+      try {
+        const client = await getObsClient();
+        await removeCloudflarePreviewOverlay(client);
+      } catch (_) {}
+    }
     maybeWarnPreview('Cloudflare preview start failed: ' + (e && (e.message || e)));
     return { stream: null, cleanupInputUid: inputUid };
   }
@@ -576,7 +736,7 @@ async function handleOp(op, body) {
       state.recording = true;
       return { ok: true, recording: true, feeds_writing: null };
     }
-    if (op === 'preview_start' || op === 'preview_stop') {
+    if (op === 'preview_start' || op === 'preview_stop' || cameraIndexForPreviewOp(op) !== null) {
       return { ok: true, preview: false };
     }
     if (op === 'diag') {
@@ -1006,6 +1166,10 @@ async function handleOp(op, body) {
     state.recording = true;
     return { ok: true, recording: true, feeds_writing: null };
   }
+  const previewCameraIndex = cameraIndexForPreviewOp(op);
+  if (previewCameraIndex !== null) {
+    return await selectCloudflarePreviewCamera(previewCameraIndex);
+  }
   if (op === 'preview_start') {
     previewUntil = Date.now() + PREVIEW_TTL_MS;
     const realtime = await startCloudflarePreview(body && body.cloudflare);
@@ -1040,6 +1204,7 @@ async function handleOp(op, body) {
   if (op === 'preview_stop') {
     previewUntil = 0;
     const cleanupInputUid = await stopCloudflarePreview();
+    cloudflarePreviewCameraIndex = 0;
     if (previewTimer) {
       clearInterval(previewTimer);
       previewTimer = null;
@@ -1053,7 +1218,7 @@ async function handleOp(op, body) {
   return null;
 }
 
-const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'diag', 'audio_bind', 'update']);
+const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_bind', 'update']);
 
 const server = http.createServer(async (req, res) => {
   try {
