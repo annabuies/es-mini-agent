@@ -13,11 +13,12 @@ const { runMultipartUploadTest, signR2Request } = require('./r2-upload');
 const { createCredentialsProvider } = require('./aws-creds');
 const { runSelfUpdate, getVersionBlock } = require('./self-update');
 const { fetchDocs } = require('./fetch-docs');
+const { runAudioEvo } = require('./evo-audio');
 
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.08.18-2';
+const AGENT_VERSION = '2026.08.18-3';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -741,51 +742,6 @@ async function performUpdate() {
   return result;
 }
 
-async function selectAudioInputDevice(preferredName) {
-  if (state.recording) return { ok: false, reason: 'busy_recording' };
-  try {
-    const client = await getObsClient();
-    const inputRes = await client.request('GetInputList');
-    const inputs = obsResponseData(inputRes).inputs;
-    const audioInputs = Array.isArray(inputs) ? inputs.filter((input) => (
-      input && typeof input.inputName === 'string'
-      && typeof input.inputKind === 'string'
-      && input.inputKind.includes('input_capture')
-      && !activeSources.includes(input.inputName)
-    )) : [];
-    if (audioInputs.length !== 1) {
-      return { ok: false, reason: audioInputs.length ? 'ambiguous_audio_input' : 'no_audio_input_found' };
-    }
-    const inputName = audioInputs[0].inputName;
-    const devicesRes = await client.request('GetInputPropertiesListPropertyItems', {
-      inputName,
-      propertyName: 'device_id',
-    });
-    const devices = obsResponseData(devicesRes).propertyItems;
-    const preferred = Array.isArray(devices) ? devices.find((item) => (
-      item && item.itemEnabled !== false && item.itemName === preferredName
-    )) : null;
-    if (!preferred || !preferred.itemValue) {
-      return { ok: false, reason: 'preferred_audio_device_unavailable', preferredName };
-    }
-    const changed = await client.request('SetInputSettings', {
-      inputName,
-      inputSettings: { device_id: preferred.itemValue },
-      overlay: true,
-    });
-    if (!obsRequestSucceeded(changed)) return { ok: false, reason: 'audio_device_change_rejected' };
-    const readRes = await client.request('GetInputSettings', { inputName });
-    return {
-      ok: true,
-      inputName,
-      deviceName: preferredName,
-      settings: obsResponseData(readRes).inputSettings || null,
-    };
-  } catch (e) {
-    return { ok: false, reason: 'audio_device_change_failed', detail: truncateDetail(e && (e.message || e)) };
-  }
-}
-
 async function handleOp(op, body) {
   if (!OBS_MODE_ACTIVE) {
     if (op === 'start') {
@@ -831,11 +787,11 @@ async function handleOp(op, body) {
         version: getVersionBlock({ projectDir: __dirname, agentVersion: AGENT_VERSION }),
       };
     }
-    if (op === 'audio_bind') {
-      return { ok: true, demo: true, bound: false, reason: 'demo_mode' };
+    if (op === 'audio_bind' || op === 'audio_lavalier') {
+      return { ok: false, disabled: true, reason: 'disabled_would_revert_evo_routing', use: 'audio_evo' };
     }
-    if (op === 'audio_lavalier') {
-      return { ok: true, demo: true, changed: false, reason: 'demo_mode' };
+    if (op === 'audio_evo') {
+      return { ok: false, demo: true, reason: 'demo_mode' };
     }
     if (op === 'update') {
       return await performUpdate();
@@ -1092,188 +1048,26 @@ async function handleOp(op, body) {
     out.filters = filters;
     return out;
   }
-  if (op === 'audio_lavalier') {
-    return await selectAudioInputDevice('USB Lavalier Microphone');
+  // audio_bind and audio_lavalier are permanently disabled (2026-08-18): both
+  // write one shared audio_source + track 1 onto every camera's Source Record
+  // filter, which silently reverts the per-camera EVO 8 routing that audio_evo
+  // establishes. Revert-to-lavalier, if ever wanted, is a deliberate new
+  // release, not a queued op. Old implementations live in git history.
+  if (op === 'audio_lavalier' || op === 'audio_bind') {
+    return { ok: false, disabled: true, reason: 'disabled_would_revert_evo_routing', use: 'audio_evo' };
   }
-  if (op === 'audio_bind') {
-    let audioInput = null;
+  if (op === 'audio_evo') {
+    if (state.recording) return { ok: false, reason: 'busy_recording' };
+    let client;
     try {
-      if (state.recording) {
-        return { ok: false, reason: 'busy_recording' };
-      }
-
-      let client;
-      try {
-        client = await getObsClient();
-      } catch (e) {
-        return { ok: true, bound: false, error: 'obs_unreachable' };
-      }
-
-      const inputRes = await client.request('GetInputList');
-      const inputData = inputRes && inputRes.responseData;
-      const inputs = inputData && inputData.inputs;
-      if (!Array.isArray(inputs)) {
-        return { ok: true, bound: false, error: 'input_list_failed' };
-      }
-      const allInputs = inputs.map((i) => ({
-        name: i && typeof i.inputName !== 'undefined' ? i.inputName : null,
-        kind: i && typeof i.inputKind !== 'undefined' ? i.inputKind : null,
-      }));
-      const inputNames = new Set(allInputs
-        .map((i) => i.name)
-        .filter((name) => typeof name === 'string'));
-
-      let defaults = null;
-      try {
-        const defaultsRes = await client.request('GetSourceFilterDefaultSettings', { filterKind: 'source_record_filter' });
-        const defaultsData = defaultsRes && defaultsRes.responseData;
-        const maybeDefaults = defaultsData && defaultsData.defaultFilterSettings;
-        if (maybeDefaults && typeof maybeDefaults === 'object') {
-          defaults = maybeDefaults;
-        }
-      } catch (_) {
-        defaults = null;
-      }
-
-      const candidates = allInputs.filter((i) => (
-        !activeSources.includes(i.name)
-        && typeof i.kind === 'string'
-        && i.kind.includes('input_capture')
-      ));
-      if (candidates.length !== 1) {
-        return {
-          ok: true,
-          bound: false,
-          reason: candidates.length === 0 ? 'no_audio_input_found' : 'ambiguous_audio_input',
-          candidates,
-          inputs: allInputs,
-          defaults,
-        };
-      }
-
-      audioInput = { name: candidates[0].name, muted: null, volumeDb: null, settings: null, devices: null };
-      try {
-        const muteRes = await client.request('GetInputMute', { inputName: candidates[0].name });
-        const m = muteRes && muteRes.responseData;
-        if (m && typeof m.inputMuted === 'boolean') audioInput.muted = m.inputMuted;
-      } catch (_) {}
-      try {
-        const volRes = await client.request('GetInputVolume', { inputName: candidates[0].name });
-        const v = volRes && volRes.responseData;
-        if (v && typeof v.inputVolumeDb === 'number') audioInput.volumeDb = v.inputVolumeDb;
-      } catch (_) {}
-      try {
-        const settingsRes = await client.request('GetInputSettings', { inputName: candidates[0].name });
-        const s = settingsRes && settingsRes.responseData;
-        if (s && s.inputSettings && typeof s.inputSettings === 'object') {
-          audioInput.settings = s.inputSettings;
-        }
-      } catch (_) {}
-      try {
-        const devicesRes = await client.request('GetInputPropertiesListPropertyItems', {
-          inputName: candidates[0].name,
-          propertyName: 'device_id',
-        });
-        const d = devicesRes && devicesRes.responseData;
-        if (d && Array.isArray(d.propertyItems)) {
-          audioInput.devices = d.propertyItems.map((item) => ({
-            name: item && typeof item.itemName !== 'undefined' ? item.itemName : null,
-            value: item && typeof item.itemValue !== 'undefined' ? item.itemValue : null,
-            enabled: !!(item && item.itemEnabled),
-          }));
-        }
-      } catch (_) {}
-      // OBS can retain a CoreAudio device id after that interface has been
-      // unplugged. It then exposes a nominal, unmuted Mic/Aux source carrying
-      // only noise/silence. Repair only this provable stale-device case, and
-      // only to the studio's explicitly named main RODECaster program feed.
-      const selectedDeviceId = audioInput.settings && audioInput.settings.device_id;
-      const selectedDeviceAvailable = typeof selectedDeviceId === 'string'
-        && Array.isArray(audioInput.devices)
-        && audioInput.devices.some((device) => device.enabled && device.value === selectedDeviceId);
-      const preferredDevice = Array.isArray(audioInput.devices)
-        ? audioInput.devices.find((device) => device.enabled && device.name === 'RODECaster Video Stereo')
-        : null;
-      if (selectedDeviceId && !selectedDeviceAvailable && preferredDevice && preferredDevice.value) {
-        const setInputRes = await client.request('SetInputSettings', {
-          inputName: candidates[0].name,
-          inputSettings: { device_id: preferredDevice.value },
-          overlay: true,
-        });
-        if (!obsRequestSucceeded(setInputRes)) {
-          return { ok: false, bound: false, reason: 'audio_device_repair_rejected', audioInput };
-        }
-        audioInput.deviceRepaired = true;
-        audioInput.previousDeviceId = selectedDeviceId;
-        try {
-          const readInputRes = await client.request('GetInputSettings', { inputName: candidates[0].name });
-          const readInput = readInputRes && readInputRes.responseData;
-          if (readInput && readInput.inputSettings && typeof readInput.inputSettings === 'object') {
-            audioInput.settings = readInput.inputSettings;
-          }
-        } catch (_) {}
-      } else {
-        audioInput.deviceRepaired = false;
-      }
-
-      const keysWritten = { different_audio: true, audio_source: candidates[0].name, audio_track: 1 };
-
-      const cameras = [];
-      for (const source of activeSources) {
-        try {
-          const filterListRes = await client.request('GetSourceFilterList', { sourceName: source });
-          const filterListData = filterListRes && filterListRes.responseData;
-          const filters = filterListData && filterListData.filters;
-          if (!Array.isArray(filters)) {
-            cameras.push({ source, error: 'no_source_record_filter' });
-            continue;
-          }
-          const sourceRecordFilter = filters.find((f) => f && f.filterKind === 'source_record_filter');
-          const filterName = sourceRecordFilter && sourceRecordFilter.filterName;
-          if (!filterName) {
-            cameras.push({ source, error: 'no_source_record_filter' });
-            continue;
-          }
-
-          const currentRes = await client.request('GetSourceFilter', { sourceName: source, filterName });
-          const currentData = currentRes && currentRes.responseData;
-          const currentSettings = currentData && currentData.filterSettings;
-          const currentEncoder = currentSettings && currentSettings.audio_encoder;
-          const repaired = (typeof currentEncoder === 'string') && inputNames.has(currentEncoder);
-
-          const newSettings = Object.assign({}, keysWritten);
-          if (repaired) {
-            newSettings.audio_encoder = (defaults && typeof defaults.audio_encoder === 'string') ? defaults.audio_encoder : '';
-          }
-
-          await client.request('SetSourceFilterSettings', {
-            sourceName: source,
-            filterName,
-            filterSettings: newSettings,
-            overlay: true,
-          });
-          const readBackRes = await client.request('GetSourceFilter', { sourceName: source, filterName });
-          const readBackData = readBackRes && readBackRes.responseData;
-          const readBackSettings = readBackData && readBackData.filterSettings;
-          cameras.push({ source, filter: filterName, wrote: newSettings, readBack: readBackSettings, repaired });
-        } catch (e) {
-          cameras.push({ source, error: 'set_failed', detail: truncateDetail(e && (e.message || e)) });
-        }
-      }
-
-      return {
-        ok: true,
-        bound: true,
-        audioSource: candidates[0].name,
-        audioInput,
-        keysWritten,
-        inputs: allInputs,
-        candidates,
-        defaults,
-        cameras,
-      };
+      client = await getObsClient();
     } catch (e) {
-      return { ok: false, reason: 'audio_bind_exception', detail: truncateDetail(e && (e.message || e)), audioInput };
+      return { ok: false, reason: 'obs_unreachable', detail: truncateDetail(e && (e.message || e)) };
+    }
+    try {
+      return await runAudioEvo(client, activeSources, body || {});
+    } catch (e) {
+      return { ok: false, reason: 'audio_evo_exception', detail: truncateDetail(e && (e.message || e)) };
     }
   }
   if (op === 'pause') {
@@ -1367,7 +1161,7 @@ async function handleOp(op, body) {
   return null;
 }
 
-const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_bind', 'audio_lavalier', 'update', 'fetch_docs']);
+const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_bind', 'audio_lavalier', 'audio_evo', 'update', 'fetch_docs']);
 
 const server = http.createServer(async (req, res) => {
   try {

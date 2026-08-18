@@ -10,3 +10,4 @@ upload-queue.js
 aws-creds.js
 self-update.js
 fetch-docs.js
+evo-audio.js
