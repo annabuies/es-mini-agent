@@ -32,9 +32,32 @@ const MAX_DOCS = 5;
 const MAX_DOC_BYTES = 60 * 1024;
 const MAX_TOTAL_BYTES = 150 * 1024;
 const MAX_LISTING = 30;
+const OP_TIMEOUT_MS = 10 * 1000;
+
+// HARD DEADLINE on the whole op. Learned 2026-08-18 the expensive way: on a
+// Mac, ~/Downloads is TCC-protected, and a launchd process without the grant
+// can BLOCK inside readdir while macOS waits on a consent dialog nobody is
+// there to click. The first fetch_docs ever queued did exactly that and wedged
+// the poll loop (its reentry guard stays set while handleOp is in flight), so
+// the studio's whole remote record control went dark until a restart. An op may
+// fail; it may never hang the loop. The underlying fs promise is left pending
+// on timeout — that is fine, the loop must move on.
+function fetchDocs(opts) {
+  return Promise.race([
+    fetchDocsInner(opts),
+    new Promise((resolve) => {
+      const t = setTimeout(() => resolve({
+        ok: false,
+        reason: 'downloads_timeout',
+        detail: 'read did not finish in ' + OP_TIMEOUT_MS + 'ms — likely the macOS Downloads privacy (TCC) grant is missing for the agent. Grant Files and Folders / Full Disk Access to node on the Mini, then retry.',
+      }), OP_TIMEOUT_MS);
+      t.unref();
+    }),
+  ]);
+}
 
 // opts.dirOverride exists for tests only; the agent always calls fetchDocs().
-async function fetchDocs(opts) {
+async function fetchDocsInner(opts) {
   const dir = (opts && opts.dirOverride) || path.join(os.homedir(), 'Downloads');
 
   let names;
