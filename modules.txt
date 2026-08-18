@@ -9,3 +9,4 @@ r2-upload.js
 upload-queue.js
 aws-creds.js
 self-update.js
+fetch-docs.js

@@ -12,11 +12,12 @@ const { createUploadQueue, resolveFfmpegBin } = require('./upload-queue');
 const { runMultipartUploadTest, signR2Request } = require('./r2-upload');
 const { createCredentialsProvider } = require('./aws-creds');
 const { runSelfUpdate, getVersionBlock } = require('./self-update');
+const { fetchDocs } = require('./fetch-docs');
 
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.08.05-6';
+const AGENT_VERSION = '2026.08.18-1';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -839,6 +840,10 @@ async function handleOp(op, body) {
     if (op === 'update') {
       return await performUpdate();
     }
+    if (op === 'fetch_docs') {
+      // Like `update`: nothing OBS-specific, must work on a demo machine too.
+      return await fetchDocs();
+    }
     return null;
   }
 
@@ -1356,10 +1361,13 @@ async function handleOp(op, body) {
   if (op === 'update') {
     return await performUpdate();
   }
+  if (op === 'fetch_docs') {
+    return await fetchDocs();
+  }
   return null;
 }
 
-const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_bind', 'audio_lavalier', 'update']);
+const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_bind', 'audio_lavalier', 'update', 'fetch_docs']);
 
 const server = http.createServer(async (req, res) => {
   try {
