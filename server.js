@@ -15,11 +15,12 @@ const { createCredentialsProvider } = require('./aws-creds');
 const { runSelfUpdate, getVersionBlock } = require('./self-update');
 const { fetchDocs } = require('./fetch-docs');
 const { runAudioEvo } = require('./evo-audio');
+const { executeLook, normalizeCameras, normalizeLooks } = require('./ptz');
 
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.08.18-3';
+const AGENT_VERSION = '2026.08.30-1';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -78,7 +79,18 @@ if (!BUILDING_ID) {
 }
 
 const START_TIME = Date.now();
-const state = { recording: false, paused: false, recordingStartedAt: null, sources: null, masterActive: false, sessionRef: null, clientCode: null };
+const state = {
+  recording: false,
+  paused: false,
+  recordingStartedAt: null,
+  sources: null,
+  masterActive: false,
+  sessionRef: null,
+  clientCode: null,
+  cameras: [],
+  looks: {},
+  default_look: null,
+};
 const r2Tests = new Map();
 let obsClient = null;
 let feedsPrevSamples = new Map();
@@ -765,6 +777,38 @@ function applyWebhookUrl(next) {
   console.log('[es-mini-agent] upload webhook updated (remote)');
 }
 
+function applyPtzConfig(data) {
+  if (!data || typeof data !== 'object') return;
+
+  if (Object.prototype.hasOwnProperty.call(data, 'cameras')) {
+    const cameras = normalizeCameras(data.cameras);
+    if (cameras === null) {
+      console.warn('[es-mini-agent] relay: ignoring invalid cameras config');
+    } else {
+      state.cameras = cameras;
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(data, 'looks')) {
+    const looks = normalizeLooks(data.looks);
+    if (looks === null) {
+      console.warn('[es-mini-agent] relay: ignoring invalid looks config');
+    } else {
+      state.looks = looks;
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(data, 'default_look')) {
+    if (data.default_look === null) {
+      state.default_look = null;
+    } else if (typeof data.default_look === 'string' && data.default_look.trim()) {
+      state.default_look = data.default_look.trim();
+    } else {
+      console.warn('[es-mini-agent] relay: ignoring invalid default_look config');
+    }
+  }
+}
+
 function sessionSources() {
   return (state.recording && Array.isArray(state.sources) && state.sources.length) ? state.sources : activeSources;
 }
@@ -815,6 +859,12 @@ function startSessionResponse() {
 }
 
 async function handleOp(op, body) {
+  if (op === 'look') {
+    const queueStatus = uploadQueue ? uploadQueue.status() : null;
+    const uploading = !!(queueStatus && (queueStatus.queued > 0 || queueStatus.active));
+    return await executeLook({ ...state, uploading }, body && body.look, { timeoutMs: 3000 });
+  }
+
   if (!OBS_MODE_ACTIVE) {
     if (op === 'start') {
       state.recording = true;
@@ -1322,7 +1372,7 @@ async function handleOp(op, body) {
   return null;
 }
 
-const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_bind', 'audio_lavalier', 'audio_evo', 'update', 'fetch_docs']);
+const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_bind', 'audio_lavalier', 'audio_evo', 'update', 'fetch_docs', 'look']);
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -1583,6 +1633,7 @@ async function refreshSources() {
     }
 
     const data = await getRes.json().catch(() => ({}));
+    applyPtzConfig(data);
     const remoteSources = data && data.sources;
     if (Array.isArray(remoteSources) && remoteSources.length) {
       const next = [];
@@ -1669,10 +1720,8 @@ server.listen(PORT, () => {
   console.log(`[es-mini-agent] relay: polling ${RECORD_POLL_URL}/api/record every ${POLL_INTERVAL_MS}ms`);
   console.log('[es-mini-agent] sources (env): ' + activeSources.join(','));
   pollTimer = setInterval(pollOnce, POLL_INTERVAL_MS);
-  if (OBS_MODE_ACTIVE) {
-    sourcesTimer = setInterval(refreshSources, SOURCES_REFRESH_MS);
-    refreshSources().catch(() => {});
-  }
+  sourcesTimer = setInterval(refreshSources, SOURCES_REFRESH_MS);
+  refreshSources().catch(() => {});
   if (uploadQueue) {
     uploadQueue.sweep().catch((e) => {
       console.warn('[es-mini-agent] upload queue sweep failed:', e && (e.stack || e.message || e));

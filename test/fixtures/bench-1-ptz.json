@@ -1,0 +1,15 @@
+{
+  "building_id": "bench-1",
+  "cameras": [
+    { "name": "cam1", "host": "__FAKE_CAMERA__" },
+    { "name": "cam2", "host": "__FAKE_CAMERA__" },
+    { "name": "cam3", "host": "__FAKE_CAMERA__" }
+  ],
+  "looks": {
+    "1": { "cam1": 4, "cam2": 1 },
+    "2": { "cam1": 1, "cam2": 1, "cam3": 1 },
+    "3": { "cam1": 3, "cam2": 2, "cam3": 1 },
+    "4": { "cam1": 2, "cam2": 2, "cam3": 2 }
+  },
+  "default_look": null
+}

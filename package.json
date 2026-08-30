@@ -6,7 +6,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "test:ptz-demo": "node test/ptz-demo.js"
   },
   "engines": {
     "node": ">=22"

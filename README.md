@@ -2,7 +2,7 @@
 
 **This agent proves the app-to-Mini connection is real. It now supports optional OBS Source Record control while keeping the existing in-memory demo mode as the default fallback.**
 
-Small zero-dependency Node HTTP service that runs on a FLEET Mac Mini (or a bench-test Mac standing in for one). The Vercel proxy at `es-os-app/api/record.js` forwards `/record/{start|stop|status|pause|resume}` calls here once `RECORD_CONTROL_URL` and `RECORD_CONTROL_KEY` are set on Vercel. If OBS env vars are omitted, the legacy demo/mock path remains unchanged.
+Small zero-dependency Node HTTP service that runs on a FLEET Mac Mini (or a bench-test Mac standing in for one). The Vercel proxy at `es-os-app/api/record.js` forwards record and PTZ look commands here once `RECORD_CONTROL_KEY` is set. If OBS env vars are omitted, the legacy demo/mock recording path remains unchanged; PTZ look recall remains available from remotely supplied building config.
 
 ## Requirements
 
@@ -147,8 +147,9 @@ After a master upload confirms, the agent probes its audio streams and stream-co
 - `start`, `status`, `resume` → `{ ok, recording, feeds_writing }` (demo mode keeps `feeds_writing: null`; OBS mode reports a verified count when recording and `0` when idle)
 - `stop` → `{ ok, saved }`
 - `pause` → `{ ok, paused }`
+- `look` → `{ ok, look, cameras: { cam1: 'ok'|'timeout'|'http_<code>'|'auth_required'|'error' }, reason? }`
 
-Request body from the proxy: `{ building_id, client_code }`. Auth: `Authorization: Bearer <RECORD_CONTROL_KEY>`.
+`look` requests include `{ building_id, look }`. The agent refuses look changes while a take is recording or paused, recalls mapped cameras in parallel with a three-second timeout per camera, and never moves a camera omitted from the selected look. Auth: `Authorization: Bearer <RECORD_CONTROL_KEY>`.
 
 ## OBS control (optional)
 
