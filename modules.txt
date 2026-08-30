@@ -12,3 +12,5 @@ self-update.js
 fetch-docs.js
 evo-audio.js
 ptz.js
+visca.js
+room-check.js

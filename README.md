@@ -25,6 +25,14 @@ Core + optional env vars:
 | `OBS_WS_PASSWORD`    | no       | `(empty)`                     | optional — enables real OBS control; omit for demo mode |
 | `OBS_SOURCES`        | no       | `cam1,cam2`                   | optional — enables real OBS control; omit for demo mode |
 | `OBS_RECORD_DIR`     | no       | `~/es-mini-obs-recordings`    | optional in demo mode; required when `OBS_SOURCES` is set |
+| `PTZ_VISCA_PORT`     | no       | `1259`                        | raw VISCA UDP port; keep the default until the room probe proves otherwise |
+| `PTZ_VISCA_TCP_PORT` | no       | `5678`                        | documented TCP fallback, tried only when UDP is unavailable |
+| `PTZ_RESET_SETTLE_MS` | no      | `30000`                       | fixed reset settle when VISCA position readback is unavailable |
+| `PTZ_RESET_SETTLE_CAP_MS` | no  | `60000`                       | maximum VISCA position-settle polling window |
+| `PTZ_RECALL_SETTLE_MS` | no     | `2000`                        | wait after preset recall before capturing a camera frame |
+| `ROOM_CHECK_SSIM_MIN` | no      | `0.80`                        | minimum grayscale reference-frame SSIM score |
+| `ROOM_CHECK_LEAD_MIN` | no      | `20`                          | minutes before booking start to run the pre-session check |
+| `BOOT_CALIBRATE_UPTIME_S` | no  | `600`                         | calibrate at agent start only when the Mini itself booted recently |
 
 Copy `.env.example` for local dev, or edit the `EnvironmentVariables` dict in `com.es.mini-agent.plist` for launchd.
 
@@ -136,8 +144,17 @@ When R2 credentials are configured (`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, 
 - `stop` → `{ ok, saved }`
 - `pause` → `{ ok, paused }`
 - `look` → `{ ok, look, cameras: { cam1: 'ok'|'timeout'|'http_<code>'|'auth_required'|'error' }, reason? }`
+- `calibrate` → per-camera probe, pan/tilt reset, settle, image-profile push, preset recall, and optional VISCA readback
+- `room_check` → per-camera snapshot, reference SSIM, VISCA profile comparison, and OBS feed result
+- `capture_reference` → uploaded reference-frame and captured camera-profile fragments
 
 `look` requests include `{ building_id, look }`. The agent refuses look changes while a take is recording or paused, recalls mapped cameras in parallel with a three-second timeout per camera, and never moves a camera omitted from the selected look. Auth: `Authorization: Bearer <RECORD_CONTROL_KEY>`.
+
+### Room self-check safety
+
+`calibrate`, `room_check`, and `capture_reference` are operator-only queued operations. They refuse while recording, paused, or inside the configured booking access window unless an operator explicitly supplies `force:true`. Boot calibration runs only when OS uptime is below `BOOT_CALIBRATE_UPTIME_S`; an ordinary agent restart on a long-running Mini does not move cameras. A camera that fails two consecutive 60-second probes and becomes reachable again is calibrated by itself. A booking is checked once between T-20 and the access window.
+
+The camera HTTP-CGI name `get_image_default_conf` is a destructive trap: despite the `get_` prefix, it resets image settings and this agent never calls it. The `posset` command stores a preset and is also forbidden; this agent only uses `poscall` to recall an existing preset. Camera power, VISCA memory-set, and camera setting-save commands are outside this agent's room-check contract.
 
 ## OBS control (optional)
 

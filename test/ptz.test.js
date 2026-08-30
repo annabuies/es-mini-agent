@@ -5,9 +5,14 @@ const http = require('node:http');
 const test = require('node:test');
 const {
   executeLook,
+  applyCgiProfile,
   normalizeCameras,
   normalizeLooks,
+  panTiltReset,
+  probe,
   recall,
+  setImageValue,
+  snapshot,
 } = require('../ptz');
 
 function listen(server) {
@@ -123,4 +128,60 @@ test('remote PTZ config normalization is all-or-nothing', () => {
     '1': { cam1: 0 }, '2': { cam1: 1 },
   });
   assert.equal(normalizeLooks({ '1': { cam1: -1 } }), null);
+});
+
+test('room-check CGI helpers use the safe endpoints and ordered profile writes', async (t) => {
+  const requests = [];
+  const jpeg = Buffer.from('fake-jpeg-fixture');
+  const server = http.createServer((req, res) => {
+    requests.push(req.url);
+    if (req.url === '/snapshot.jpg') {
+      res.writeHead(200, { 'Content-Type': 'image/jpeg' });
+      res.end(jpeg);
+      return;
+    }
+    if (req.url && req.url.endsWith('&hue&7')) {
+      res.writeHead(500);
+      res.end();
+      return;
+    }
+    res.writeHead(204);
+    res.end();
+  });
+  const port = await listen(server);
+  t.after(() => close(server));
+  const host = `127.0.0.1:${port}`;
+
+  assert.equal(await probe(host), 'ok');
+  assert.equal(await panTiltReset(host), 'ok');
+  assert.equal(await setImageValue(host, 'bright', 99), 'error');
+  const profile = await applyCgiProfile(host, {
+    hue: 7,
+    sharpness: 7,
+    contrast: 7,
+    saturation: 7,
+    bright: 7,
+    mirror: 0,
+    flip: 0,
+    wbmode: 'manual',
+    aemode: 'auto',
+  });
+  assert.equal(profile.status, 'partial');
+  assert.deepEqual(profile.failures, ['hue']);
+  assert.deepEqual(await snapshot(host), jpeg);
+
+  assert.deepEqual(requests, [
+    '/cgi-bin/param.cgi?get_device_conf',
+    '/cgi-bin/param.cgi?pan_tiltdrive_reset',
+    '/cgi-bin/param.cgi?post_image_value&aemode&auto',
+    '/cgi-bin/param.cgi?post_image_value&wbmode&manual',
+    '/cgi-bin/param.cgi?post_image_value&flip&0',
+    '/cgi-bin/param.cgi?post_image_value&mirror&0',
+    '/cgi-bin/param.cgi?post_image_value&bright&7',
+    '/cgi-bin/param.cgi?post_image_value&saturation&7',
+    '/cgi-bin/param.cgi?post_image_value&contrast&7',
+    '/cgi-bin/param.cgi?post_image_value&sharpness&7',
+    '/cgi-bin/param.cgi?post_image_value&hue&7',
+    '/snapshot.jpg',
+  ]);
 });

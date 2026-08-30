@@ -5,6 +5,7 @@
 // Optional OBS Source Record control; in-memory demo mode remains the fallback.
 
 const http = require('http');
+const os = require('node:os');
 const { ObsClient, callVendor, getNewestFileSample, getSourceScreenshot, sampleFeedsWriting } = require('./obs-control');
 const crypto = require('crypto');
 const path = require('path');
@@ -14,12 +15,22 @@ const { createCredentialsProvider } = require('./aws-creds');
 const { runSelfUpdate, getVersionBlock } = require('./self-update');
 const { fetchDocs } = require('./fetch-docs');
 const { runAudioEvo } = require('./evo-audio');
-const { executeLook, normalizeCameras, normalizeLooks } = require('./ptz');
+const ptz = require('./ptz');
+const { executeLook, normalizeCameras, normalizeLooks } = ptz;
+const visca = require('./visca');
+const {
+  calibrate: calibrateRoom,
+  captureReference,
+  roomCheck,
+  scheduleDecision,
+  shouldBootCalibrate,
+  updateCameraHealth,
+} = require('./room-check');
 
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.08.30-1';
+const AGENT_VERSION = '2026.08.30-2';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -32,11 +43,19 @@ const BUILDING_ID = process.env.BUILDING_ID;
 // RECORD_CONTROL_KEY) keeps working unchanged after this update.
 const RECORD_POLL_URL = process.env.RECORD_POLL_URL || 'https://es-os-app.vercel.app';
 const POLL_INTERVAL_MS = 1000;
-const SOURCES_REFRESH_MS = 60000;
+const SOURCES_REFRESH_MS = envNumber('SOURCES_REFRESH_MS', 60000);
 const PREVIEW_INTERVAL_MS = 500;
 const PREVIEW_TTL_MS = 60000;
 const PREVIEW_WIDTH = 640;
 const PREVIEW_JPEG_QUALITY = 60;
+const BOOT_CALIBRATE_UPTIME_S = envNumber('BOOT_CALIBRATE_UPTIME_S', 600);
+const BOOT_CALIBRATE_WAIT_MS = envNumber('BOOT_CALIBRATE_WAIT_MS', 5 * 60 * 1000);
+const PTZ_RESET_SETTLE_MS = envNumber('PTZ_RESET_SETTLE_MS', 30000);
+const PTZ_RESET_SETTLE_CAP_MS = envNumber('PTZ_RESET_SETTLE_CAP_MS', 60000);
+const PTZ_RESET_POLL_MS = envNumber('PTZ_RESET_POLL_MS', 1000);
+const PTZ_RECALL_SETTLE_MS = envNumber('PTZ_RECALL_SETTLE_MS', 2000);
+const ROOM_CHECK_SSIM_MIN = envNumber('ROOM_CHECK_SSIM_MIN', 0.80);
+const ROOM_CHECK_LEAD_MIN = envNumber('ROOM_CHECK_LEAD_MIN', 20);
 const OBS_WS_URL = process.env.OBS_WS_URL || 'ws://127.0.0.1:4455';
 const OBS_WS_PASSWORD = process.env.OBS_WS_PASSWORD || '';
 const OBS_SOURCES_RAW = process.env.OBS_SOURCES || '';
@@ -78,6 +97,13 @@ const state = {
   cameras: [],
   looks: {},
   default_look: null,
+  check_look: null,
+  camera_profiles: {},
+  reference_frames: {},
+  upcoming: null,
+  cameraHealth: {},
+  last_calibration: null,
+  last_room_check: null,
 };
 const r2Tests = new Map();
 let obsClient = null;
@@ -94,6 +120,24 @@ let cloudflarePreviewPlaybackUrl = null;
 let cloudflarePreviewCameraIndex = 0;
 let cloudflarePreviewOverlay = null;
 let pendingSources = null;
+const scheduledRoomChecks = new Set();
+const uptimeOverride = Number(process.env.BOOT_CALIBRATE_UPTIME_OVERRIDE_S);
+const observedBootUptimeS = Number.isFinite(uptimeOverride) && uptimeOverride >= 0 ? uptimeOverride : os.uptime();
+const bootCalibration = {
+  eligible: shouldBootCalibrate({ uptimeS: observedBootUptimeS, thresholdS: BOOT_CALIBRATE_UPTIME_S }),
+  deadline: Date.now() + BOOT_CALIBRATE_WAIT_MS,
+  done: false,
+};
+let roomTriggerBusy = false;
+
+function envNumber(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+function isPlainObject(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
 
 function log(method, path, status, note) {
   const ts = new Date().toISOString();
@@ -201,6 +245,39 @@ const storageR2Config = {
   getCredentials: () => storageCredentialsProvider.getCredentials(),
 };
 
+async function storageRequest(method, key, body) {
+  if (!isStorageConfigured()) throw new Error('storage_unconfigured');
+  const creds = await storageCredentialsProvider.getCredentials();
+  const signed = signR2Request({
+    method,
+    key,
+    query: {},
+    accessKeyId: creds.accessKeyId,
+    secretAccessKey: creds.secretAccessKey,
+    sessionToken: creds.sessionToken,
+    bucket: STORAGE_BUCKET,
+    endpoint: STORAGE_ENDPOINT,
+    region: STORAGE_REGION,
+  });
+  const response = await fetch(signed.url, {
+    method,
+    headers: method === 'PUT' ? Object.assign({}, signed.headers, { 'content-type': 'image/jpeg' }) : signed.headers,
+    ...(method === 'PUT' ? { body } : {}),
+  });
+  if (!response.ok) throw new Error(`storage_http_${response.status}`);
+  return response;
+}
+
+async function putStorageFrame(key, frame) {
+  await storageRequest('PUT', key, frame);
+  return { ok: true, key };
+}
+
+async function getStorageFrame(key) {
+  const response = await storageRequest('GET', key);
+  return Buffer.from(await response.arrayBuffer());
+}
+
 const uploadQueue = isStorageConfigured()
   ? createUploadQueue({
     r2Config: storageR2Config,
@@ -301,29 +378,7 @@ async function pushPreviewFrames() {
 
       try {
         const key = `preview/${BUILDING_ID}/${source}.jpg`;
-        const creds = await storageCredentialsProvider.getCredentials();
-        const signed = signR2Request({
-          method: 'PUT',
-          key,
-          query: {},
-          accessKeyId: creds.accessKeyId,
-          secretAccessKey: creds.secretAccessKey,
-          sessionToken: creds.sessionToken,
-          bucket: STORAGE_BUCKET,
-          endpoint: STORAGE_ENDPOINT,
-          region: STORAGE_REGION,
-        });
-        const putRes = await fetch(signed.url, {
-          method: 'PUT',
-          headers: Object.assign({}, signed.headers, {
-            'content-type': 'image/jpeg',
-          }),
-          body: frame,
-        });
-        if (!putRes.ok) {
-          maybeWarnPreview('preview put failed source=' + source + ' status=' + putRes.status);
-          continue;
-        }
+        await putStorageFrame(key, frame);
         previewLastOkAt = Date.now();
       } catch (e) {
         maybeWarnPreview('preview upload failed source=' + source + ': ' + (e && (e.message || e)));
@@ -716,6 +771,15 @@ function applyWebhookUrl(next) {
   console.log('[es-mini-agent] upload webhook updated (remote)');
 }
 
+function normalizeUpcoming(value) {
+  if (value === null) return null;
+  if (!isPlainObject(value)) return undefined;
+  const keys = ['id', 'starts_at', 'ends_at', 'access_from', 'access_until'];
+  if (!keys.every((key) => typeof value[key] === 'string' && value[key].trim())) return undefined;
+  if (keys.slice(1).some((key) => Number.isNaN(new Date(value[key]).getTime()))) return undefined;
+  return Object.fromEntries(keys.map((key) => [key, value[key].trim()]));
+}
+
 function applyPtzConfig(data) {
   if (!data || typeof data !== 'object') return;
 
@@ -745,6 +809,27 @@ function applyPtzConfig(data) {
     } else {
       console.warn('[es-mini-agent] relay: ignoring invalid default_look config');
     }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(data, 'check_look')) {
+    if (data.check_look === null) state.check_look = null;
+    else if (typeof data.check_look === 'string' && data.check_look.trim()) state.check_look = data.check_look.trim();
+    else console.warn('[es-mini-agent] relay: ignoring invalid check_look config');
+  }
+
+  for (const [remoteKey, stateKey] of [
+    ['camera_profiles', 'camera_profiles'],
+    ['reference_frames', 'reference_frames'],
+  ]) {
+    if (!Object.prototype.hasOwnProperty.call(data, remoteKey)) continue;
+    if (isPlainObject(data[remoteKey])) state[stateKey] = data[remoteKey];
+    else console.warn(`[es-mini-agent] relay: ignoring invalid ${remoteKey} config`);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(data, 'upcoming')) {
+    const upcoming = normalizeUpcoming(data.upcoming);
+    if (typeof upcoming === 'undefined') console.warn('[es-mini-agent] relay: ignoring invalid upcoming config');
+    else state.upcoming = upcoming;
   }
 }
 
@@ -783,7 +868,113 @@ async function performUpdate() {
   return result;
 }
 
+function roomOperationContext() {
+  return {
+    state,
+    buildingId: BUILDING_ID,
+    cameras: state.cameras,
+    looks: state.looks,
+    check_look: state.check_look,
+    camera_profiles: state.camera_profiles,
+    reference_frames: state.reference_frames,
+    upcoming: state.upcoming,
+    obs_sources: activeSources.slice(),
+    ptz,
+    visca,
+    storage: { upload: putStorageFrame, download: getStorageFrame },
+    ffmpegBin: resolveFfmpegBin().bin,
+    getObsClient,
+    getSourceScreenshot,
+    sleep,
+    resetSettleMs: PTZ_RESET_SETTLE_MS,
+    resetSettleCapMs: PTZ_RESET_SETTLE_CAP_MS,
+    resetPollMs: PTZ_RESET_POLL_MS,
+    recallSettleMs: PTZ_RECALL_SETTLE_MS,
+    ssimMin: ROOM_CHECK_SSIM_MIN,
+  };
+}
+
+function roomResultSummary(result) {
+  if (!result || typeof result !== 'object') return null;
+  const out = {
+    ok: result.ok === true,
+    kind: result.kind || null,
+    trigger: result.trigger || null,
+    look: result.look || null,
+    at: result.finished_at || result.started_at || new Date().toISOString(),
+  };
+  if (result.booking_id) out.booking_id = result.booking_id;
+  if (result.reason) out.reason = result.reason;
+  return out;
+}
+
+async function postRoomCheckResult(kind, trigger, bookingId, result) {
+  try {
+    const response = await fetch(`${RECORD_POLL_URL}/api/record`, {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + RECORD_CONTROL_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        mini_room_check: true,
+        kind,
+        trigger,
+        ...(bookingId ? { booking_id: bookingId } : {}),
+        result,
+      }),
+    });
+    if (!response.ok) console.warn(`[es-mini-agent] room-check write-back HTTP ${response.status} kind=${kind}`);
+  } catch (error) {
+    console.warn('[es-mini-agent] room-check write-back failed:', error && (error.message || error));
+  }
+}
+
+async function runRoomOperation(kind, body, triggerOverride) {
+  const options = Object.assign({}, isPlainObject(body) ? body : {}, {
+    trigger: triggerOverride || (body && body.trigger) || 'queued',
+  });
+  let result;
+  try {
+    if (kind === 'calibrate') result = await calibrateRoom(roomOperationContext(), options);
+    else if (kind === 'room_check') result = await roomCheck(roomOperationContext(), options);
+    else if (kind === 'capture_reference') result = await captureReference(roomOperationContext(), options);
+    else return null;
+  } catch (error) {
+    result = { ok: false, kind, trigger: options.trigger, reason: 'internal_error', detail: truncateDetail(error && (error.stack || error.message || error)) };
+  }
+  if (!result.trigger) result.trigger = options.trigger;
+  result.finished_at = new Date().toISOString();
+  if (kind === 'calibrate') state.last_calibration = roomResultSummary(result);
+  if (kind === 'room_check') state.last_room_check = roomResultSummary(result);
+  if (kind === 'capture_reference' && result.ok) {
+    if (isPlainObject(result.reference_frames)) {
+      const merged = Object.assign({}, state.reference_frames);
+      for (const [camera, looks] of Object.entries(result.reference_frames)) {
+        merged[camera] = Object.assign({}, isPlainObject(merged[camera]) ? merged[camera] : {}, looks);
+      }
+      state.reference_frames = merged;
+    }
+    if (isPlainObject(result.camera_profiles)) {
+      state.camera_profiles = Object.assign({}, state.camera_profiles, result.camera_profiles);
+    }
+  }
+  await postRoomCheckResult(kind, options.trigger, options.booking_id || result.booking_id, result);
+  return result;
+}
+
+async function runSelfTriggeredRoomOperation(kind, options) {
+  const trigger = options && options.trigger ? options.trigger : 'schedule';
+  console.log(`[es-mini-agent] room-check start kind=${kind} trigger=${trigger}`);
+  const result = await runRoomOperation(kind, options, trigger);
+  console.log(`[es-mini-agent] room-check end kind=${kind} trigger=${trigger} ok=${!!(result && result.ok)}`);
+  return result;
+}
+
 async function handleOp(op, body) {
+  if (op === 'calibrate' || op === 'room_check' || op === 'capture_reference') {
+    return await runRoomOperation(op, body, 'queued');
+  }
   if (op === 'look') {
     return await executeLook(state, body && body.look, { timeoutMs: 3000 });
   }
@@ -805,7 +996,14 @@ async function handleOp(op, body) {
       return { ok: true, cancelled: true, saved: false };
     }
     if (op === 'status') {
-      return { ok: true, recording: state.recording, feeds_writing: null, preview: false };
+      return {
+        ok: true,
+        recording: state.recording,
+        feeds_writing: null,
+        preview: false,
+        last_calibration: state.last_calibration,
+        last_room_check: state.last_room_check,
+      };
     }
     if (op === 'pause') {
       if (!state.recording) {
@@ -1007,13 +1205,29 @@ async function handleOp(op, body) {
   if (op === 'status') {
     const sources = sessionSources();
     if (!state.recording) {
-      const out = { ok: true, recording: false, feeds_writing: 0, preview: previewActive(), sources: sources.slice() };
+      const out = {
+        ok: true,
+        recording: false,
+        feeds_writing: 0,
+        preview: previewActive(),
+        sources: sources.slice(),
+        last_calibration: state.last_calibration,
+        last_room_check: state.last_room_check,
+      };
       if (uploadQueue) out.uploads = uploadQueue.status();
       return out;
     }
     const sampled = sampleFeedsWriting(sources, OBS_RECORD_DIR, feedsPrevSamples);
     feedsPrevSamples = sampled.samples;
-    const out = { ok: true, recording: true, feeds_writing: sampled.count, preview: previewActive(), sources: sources.slice() };
+    const out = {
+      ok: true,
+      recording: true,
+      feeds_writing: sampled.count,
+      preview: previewActive(),
+      sources: sources.slice(),
+      last_calibration: state.last_calibration,
+      last_room_check: state.last_room_check,
+    };
     if (uploadQueue) out.uploads = uploadQueue.status();
     return out;
   }
@@ -1206,7 +1420,7 @@ async function handleOp(op, body) {
   return null;
 }
 
-const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_bind', 'audio_lavalier', 'audio_evo', 'update', 'fetch_docs', 'look']);
+const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_bind', 'audio_lavalier', 'audio_evo', 'update', 'fetch_docs', 'look', 'calibrate', 'room_check', 'capture_reference']);
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -1454,6 +1668,62 @@ let polling = false;
 let pollTimer = null;
 let sourcesTimer = null;
 
+async function probeCamerasAndRunTriggers() {
+  if (roomTriggerBusy) return;
+  roomTriggerBusy = true;
+  try {
+    const cameras = Array.isArray(state.cameras) ? state.cameras : [];
+    const probeEntries = await Promise.all(cameras.map(async (camera) => {
+      const status = await ptz.probe(camera.host, { timeoutMs: 3000 });
+      const update = updateCameraHealth(state.cameraHealth[camera.name], status, new Date());
+      state.cameraHealth[camera.name] = update.health;
+      return { camera, status, recovered: update.recovered };
+    }));
+    const allReachable = probeEntries.length > 0 && probeEntries.every((entry) => entry.status === 'ok');
+
+    let bootRan = false;
+    if (bootCalibration.eligible && !bootCalibration.done) {
+      if (Date.now() > bootCalibration.deadline) {
+        bootCalibration.done = true;
+        console.warn('[es-mini-agent] room-check boot calibration skipped: camera/config wait exceeded 5 minutes');
+      } else if (allReachable) {
+        bootCalibration.done = true;
+        bootRan = true;
+        await runSelfTriggeredRoomOperation('calibrate', { trigger: 'boot' });
+      }
+    }
+
+    const bootStillWaiting = bootCalibration.eligible && !bootCalibration.done;
+    if (!bootRan && !bootStillWaiting) {
+      for (const entry of probeEntries.filter((item) => item.recovered)) {
+        await runSelfTriggeredRoomOperation('calibrate', {
+          trigger: 'reboot',
+          cameras: [entry.camera.name],
+        });
+      }
+    }
+
+    const decision = scheduleDecision({
+      now: new Date(),
+      upcoming: state.upcoming,
+      done: scheduledRoomChecks,
+      leadMin: ROOM_CHECK_LEAD_MIN,
+    });
+    if (decision.action === 'skip_inside_access') {
+      scheduledRoomChecks.add(decision.booking_id);
+      console.log(`[es-mini-agent] room-check schedule skipped inside access window booking=${decision.booking_id}`);
+    } else if (decision.action === 'run') {
+      scheduledRoomChecks.add(decision.booking_id);
+      await runSelfTriggeredRoomOperation('room_check', {
+        trigger: 'schedule',
+        booking_id: decision.booking_id,
+      });
+    }
+  } finally {
+    roomTriggerBusy = false;
+  }
+}
+
 async function refreshSources() {
   try {
     const url = `${RECORD_POLL_URL}/api/record?building_id=${encodeURIComponent(BUILDING_ID)}&want_sources=1`;
@@ -1491,14 +1761,15 @@ async function refreshSources() {
     }
 
     const remoteWebhookUrl = data && data.upload_webhook_url;
-    if (typeof remoteWebhookUrl !== 'string') return;
-    const trimmedWebhookUrl = remoteWebhookUrl.trim();
-    if (!trimmedWebhookUrl) return;
-    if (!trimmedWebhookUrl.startsWith('https://')) {
-      console.warn('[es-mini-agent] relay: ignoring non-https upload webhook');
-      return;
+    if (typeof remoteWebhookUrl === 'string' && remoteWebhookUrl.trim()) {
+      const trimmedWebhookUrl = remoteWebhookUrl.trim();
+      if (!trimmedWebhookUrl.startsWith('https://')) {
+        console.warn('[es-mini-agent] relay: ignoring non-https upload webhook');
+      } else {
+        applyWebhookUrl(trimmedWebhookUrl);
+      }
     }
-    applyWebhookUrl(trimmedWebhookUrl);
+    await probeCamerasAndRunTriggers();
   } catch (e) {
     console.error('[es-mini-agent] relay: sources refresh error:', e && (e.stack || e.message || e));
   }

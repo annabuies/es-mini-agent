@@ -315,6 +315,10 @@ cat > "$TMP_PLIST" <<PLIST
         <string>${AWS_ROLE_ARN_X}</string>
         <key>FFMPEG_BIN</key>
         <string>${FFMPEG_BIN_X}</string>
+        <!-- Optional after the read-only camera bench probe confirms VISCA UDP:
+        <key>PTZ_VISCA_PORT</key>
+        <string>1259</string>
+        -->
         <key>UPLOAD_CONFIRMED_WEBHOOK_URL</key>
         <string>${UPLOAD_CONFIRMED_WEBHOOK_URL_X}</string>
     </dict>

@@ -26,6 +26,7 @@ const COMMITS_API = 'https://api.github.com/repos/annabuies/es-mini-agent/commit
 // A manifest is remote input. Constrain it to bare .js filenames so it can never
 // name '../' paths or reach outside the project dir.
 const MODULE_NAME_RE = /^[A-Za-z0-9._-]+\.js$/;
+const REQUIRED_RUNTIME_MODULES = ['server.js', 'visca.js', 'room-check.js'];
 const BOOT_TEST_TIMEOUT_MS = 15000;
 const BOOT_TEST_POLL_MS = 250;
 const STDERR_KEEP_CHARS = 500;
@@ -44,6 +45,17 @@ function parseManifest(text) {
     .split('\n')
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith('#'));
+}
+
+function validateManifest(modules) {
+  if (!Array.isArray(modules) || !modules.length) return 'modules.txt parsed to an empty list';
+  for (const required of REQUIRED_RUNTIME_MODULES) {
+    if (!modules.includes(required)) return `modules.txt does not list ${required}`;
+  }
+  for (const name of modules) {
+    if (!MODULE_NAME_RE.test(name)) return `rejected manifest entry: ${name}`;
+  }
+  return null;
 }
 
 // Ask the OS for a port nobody is using by binding port 0 and reading back what
@@ -228,11 +240,8 @@ async function runSelfUpdate({ projectDir, repoRawBase, busyReason }) {
     } catch (e) {
       return fail('manifest', `modules.txt fetch failed: ${e && (e.message || e)}`);
     }
-    if (!modules.length) return fail('manifest', 'modules.txt parsed to an empty list');
-    if (!modules.includes('server.js')) return fail('manifest', 'modules.txt does not list server.js');
-    for (const name of modules) {
-      if (!MODULE_NAME_RE.test(name)) return fail('manifest', `rejected manifest entry: ${name}`);
-    }
+    const manifestError = validateManifest(modules);
+    if (manifestError) return fail('manifest', manifestError);
 
     // ---------- stage: download ----------
     // Any single failure fails the whole stage. A partial set must never reach
@@ -350,4 +359,4 @@ async function runSelfUpdate({ projectDir, repoRawBase, busyReason }) {
   }
 }
 
-module.exports = { runSelfUpdate, getVersionBlock };
+module.exports = { runSelfUpdate, getVersionBlock, _test: { parseManifest, validateManifest } };
