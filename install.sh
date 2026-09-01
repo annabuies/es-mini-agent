@@ -13,7 +13,7 @@
 #
 # Optional:
 #   PORT=8787           # port the agent listens on
-#   AUTO_TUNNEL=1       # also start a cloudflared quick tunnel at the end
+#   RECORD_POLL_URL=https://es-os-app.crmes.workers.dev  # documented fallback
 
 set -euo pipefail
 
@@ -29,8 +29,8 @@ err()  { printf '%s[error]%s %s\n' "$RED" "$RST" "$*" 1>&2; }
 : "${BUILDING_ID:=}"
 : "${RECORD_CONTROL_KEY:=}"
 PORT="${PORT:-8787}"
-AUTO_TUNNEL="${AUTO_TUNNEL:-0}"
-# Optional OBS control (empty OBS_SOURCES => demo mode, unchanged behavior).
+RECORD_POLL_URL="${RECORD_POLL_URL:-https://api.evrybdystudios.com}"
+# Production OBS control configuration.
 OBS_SOURCES="${OBS_SOURCES:-}"
 OBS_WS_URL="${OBS_WS_URL:-ws://127.0.0.1:4455}"
 OBS_WS_PASSWORD="${OBS_WS_PASSWORD:-}"
@@ -60,7 +60,8 @@ If you already cloned the repo, run it directly from inside the repo folder:
 
 Optional:
   PORT=8787           (defaults to 8787)
-  AUTO_TUNNEL=1       (also start a cloudflared quick tunnel and print the public URL)
+  RECORD_POLL_URL=https://es-os-app.crmes.workers.dev
+                      (fallback if the permanent hostname is unavailable)
 
 EOF
   exit 1
@@ -145,6 +146,20 @@ else
 fi
 
 cd "$PROJECT_DIR"
+
+# Persist the outbound relay target separately from secrets so the installed
+# target is inspectable and survives restarts even before launchd is loaded.
+ENV_FILE="$PROJECT_DIR/.env"
+TMP_ENV="$(mktemp -t es-mini-agent.env.XXXXXX)"
+umask 077
+if [[ -f "$ENV_FILE" ]]; then
+  awk '!/^RECORD_POLL_URL=/' "$ENV_FILE" > "$TMP_ENV"
+fi
+printf 'RECORD_POLL_URL=%s\n' "$RECORD_POLL_URL" >> "$TMP_ENV"
+chmod 600 "$TMP_ENV"
+mv "$TMP_ENV" "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+ok "Persisted RECORD_POLL_URL in $ENV_FILE (mode 600)"
 
 # ---------- find node ----------
 NODE_BIN=""
@@ -249,6 +264,7 @@ PROJECT_DIR_X="$(xml_escape "$PROJECT_DIR")"
 LOG_OUT_X="$(xml_escape "$LOG_OUT")"
 LOG_ERR_X="$(xml_escape "$LOG_ERR")"
 PORT_X="$(xml_escape "$PORT")"
+RECORD_POLL_URL_X="$(xml_escape "$RECORD_POLL_URL")"
 KEY_X="$(xml_escape "$RECORD_CONTROL_KEY")"
 BID_X="$(xml_escape "$BUILDING_ID")"
 OBS_SOURCES_X="$(xml_escape "$OBS_SOURCES")"
@@ -289,6 +305,8 @@ cat > "$TMP_PLIST" <<PLIST
     <dict>
         <key>PORT</key>
         <string>${PORT_X}</string>
+        <key>RECORD_POLL_URL</key>
+        <string>${RECORD_POLL_URL_X}</string>
         <key>RECORD_CONTROL_KEY</key>
         <string>${KEY_X}</string>
         <key>BUILDING_ID</key>
@@ -370,6 +388,7 @@ ${GRN}${BOLD}  SUCCESS — es-mini-agent is running.${RST}
 ${GRN}${BOLD}=====================================================================${RST}
 
   building_id : ${BOLD}${BUILDING_ID}${RST}
+  relay target: ${BOLD}${RECORD_POLL_URL}${RST}
   local URL   : ${BOLD}${HEALTH_URL}${RST}
   health JSON : ${HEALTH_JSON}
 
@@ -403,70 +422,14 @@ EOF
   exit 1
 fi
 
-# ---------- optional cloudflared quick tunnel ----------
-TUNNEL_URL=""
-if [[ "$AUTO_TUNNEL" == "1" ]]; then
-  if command -v cloudflared >/dev/null 2>&1; then
-    TUNNEL_LOG="$PROJECT_DIR/tunnel.log"
-    info "Starting cloudflared quick tunnel in the background..."
-    : > "$TUNNEL_LOG"
-    # nohup + disown so it survives this shell exiting.
-    nohup cloudflared tunnel --url "http://localhost:${PORT}" \
-      >> "$TUNNEL_LOG" 2>&1 &
-    TUNNEL_PID=$!
-    disown "$TUNNEL_PID" 2>/dev/null || true
-
-    # cloudflared prints the URL within a couple seconds. Give it up to ~15s.
-    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-      sleep 1
-      TUNNEL_URL="$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$TUNNEL_LOG" | head -n1 || true)"
-      if [[ -n "$TUNNEL_URL" ]]; then break; fi
-    done
-
-    if [[ -n "$TUNNEL_URL" ]]; then
-      cat <<EOF
-
-${CYA}${BOLD}=====================================================================${RST}
-${CYA}${BOLD}  PUBLIC TUNNEL URL — GIVE THIS URL TO ANNA${RST}
-${CYA}${BOLD}=====================================================================${RST}
-
-     ${BOLD}${TUNNEL_URL}${RST}
-
-  Tunnel PID    : ${TUNNEL_PID}
-  Tunnel log    : ${TUNNEL_LOG}
-
-  Anna will set this as ${BOLD}RECORD_CONTROL_URL${RST} on Vercel.
-  This is a QUICK tunnel — if this Mac reboots, the URL changes.
-  For production, install a named cloudflared tunnel instead.
-
-EOF
-    else
-      warn "cloudflared started (PID $TUNNEL_PID) but no https://*.trycloudflare.com URL appeared in $TUNNEL_LOG within 15s."
-      warn "Check the log: tail -f $TUNNEL_LOG"
-    fi
-  else
-    warn "AUTO_TUNNEL=1 requested but 'cloudflared' is not installed."
-    warn "Install it with:  brew install cloudflared"
-    warn "Then re-run this installer with AUTO_TUNNEL=1, or start the tunnel manually:"
-    warn "  cloudflared tunnel --url http://localhost:${PORT}"
-    warn "(The agent itself is installed and running — only the tunnel step was skipped.)"
-  fi
-fi
-
 # ---------- final reminder ----------
 cat <<EOF
 
 ${BOLD}What to tell Anna:${RST}
   1. Local agent health URL (on this Mac only):
        ${HEALTH_URL}
-$(if [[ -n "$TUNNEL_URL" ]]; then
-    printf '  2. Public tunnel URL to put in Vercel as RECORD_CONTROL_URL:\n       %s\n' "$TUNNEL_URL"
-    printf '  3. She also sets RECORD_CONTROL_KEY on Vercel to the same secret you used here.\n'
-  else
-    printf '  2. Anna needs a public URL that reaches this Mac. Once she has one\n'
-    printf '     (e.g. a cloudflared tunnel URL), she sets it on Vercel as\n'
-    printf '     RECORD_CONTROL_URL, and sets RECORD_CONTROL_KEY on Vercel to the\n'
-    printf '     same secret you used here. That flips the app live.\n'
-  fi)
+  2. Outbound Cloudflare relay target:
+       ${RECORD_POLL_URL}
+  3. Confirm agent.log shows successful polling of that exact target.
 
 EOF

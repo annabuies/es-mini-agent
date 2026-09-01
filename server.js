@@ -1,8 +1,7 @@
 'use strict';
 
 // EVRYBDY Studios FLEET — Mini-side agent.
-// Proves the app -> Vercel proxy -> Mini connection is real.
-// Optional OBS Source Record control; in-memory demo mode remains the fallback.
+// Connects the Cloudflare relay to the Mini's real OBS Source Record control.
 
 const http = require('http');
 const { ObsClient, callVendor, getNewestFileSample, getSourceScreenshot, sampleFeedsWriting } = require('./obs-control');
@@ -18,7 +17,7 @@ const { runAudioEvo } = require('./evo-audio');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.08.18-3';
+const AGENT_VERSION = '2026.09.01-1';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -26,10 +25,9 @@ const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubuserconten
 const PORT = parseInt(process.env.PORT || '8787', 10);
 const RECORD_CONTROL_KEY = process.env.RECORD_CONTROL_KEY;
 const BUILDING_ID = process.env.BUILDING_ID;
-// Optional: outbound poll target. Defaults to the app's stable public URL so
-// Robbie's existing install command (which only sets BUILDING_ID and
-// RECORD_CONTROL_KEY) keeps working unchanged after this update.
-const RECORD_POLL_URL = process.env.RECORD_POLL_URL || 'https://es-os-app.vercel.app';
+// Outbound-only poll target. The custom hostname is the permanent production
+// endpoint; RECORD_POLL_URL remains overridable for rollback and diagnostics.
+const RECORD_POLL_URL = process.env.RECORD_POLL_URL || 'https://api.evrybdystudios.com';
 const POLL_INTERVAL_MS = 1000;
 const SOURCES_REFRESH_MS = 60000;
 const PREVIEW_INTERVAL_MS = 500;
@@ -1400,7 +1398,7 @@ server.on('clientError', (err, socket) => {
 });
 
 // ---------- outbound poll loop ----------
-// Reach OUT to the Vercel app every POLL_INTERVAL_MS to claim any pending
+// Reach OUT to the Cloudflare Worker every POLL_INTERVAL_MS to claim any pending
 // command, run it locally via handleOp(), and POST the result back. This
 // replaces the old inbound cloudflared quick-tunnel path — no inbound port
 // exposure needed from this Mac. The inbound handler above is left intact
@@ -1468,7 +1466,7 @@ async function pollOnce() {
       headers: { 'Authorization': 'Bearer ' + RECORD_CONTROL_KEY },
     });
     if (!getRes.ok) {
-      // 401/5xx from Vercel — log once per tick and move on. Do not crash.
+      // 401/5xx from the Worker — log once per tick and move on. Do not crash.
       console.warn(`[es-mini-agent] relay: poll GET ${getRes.status} from ${RECORD_POLL_URL}`);
       return;
     }

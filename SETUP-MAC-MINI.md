@@ -12,7 +12,8 @@
 
 | Name | Value | Notes |
 |---|---|---|
-| `RECORD_CONTROL_KEY` | `<<RECORD_CONTROL_KEY>>` | MUST match what's set on Vercel for es-os-app. Secret. |
+| `RECORD_POLL_URL` | `https://api.evrybdystudios.com` | Permanent Cloudflare target. Fallback: `https://es-os-app.crmes.workers.dev`. |
+| `RECORD_CONTROL_KEY` | `<<RECORD_CONTROL_KEY>>` | MUST match the Cloudflare Worker secret. |
 | `BUILDING_ID` | `bench-1` | The bench mini's id. Leave as `bench-1` unless Anna says otherwise. |
 | `OBS_SOURCES` | `cam1` | The OBS source name for the first camera. One name, no spaces. |
 | `OBS_RECORD_DIR` | `$HOME/es-mini-recordings` | Where OBS writes per-source folders. |
@@ -133,6 +134,7 @@ Run the one-command installer with all the env vars. This downloads the current 
 ```bash
 BUILDING_ID="bench-1" \
 RECORD_CONTROL_KEY="<<RECORD_CONTROL_KEY>>" \
+RECORD_POLL_URL="https://api.evrybdystudios.com" \
 OBS_SOURCES="cam1" \
 OBS_WS_URL="ws://127.0.0.1:4455" \
 OBS_WS_PASSWORD="<<OBS_WS_PASSWORD>>" \
@@ -142,7 +144,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/annabuies/es-mini-agent/main
 
 The installer ends by hitting `http://localhost:8787/health` and printing SUCCESS or FAILURE. If it prints FAILURE, read the error log it points you to (`~/Documents/es-mini-agent/agent.error.log`) and fix the cause (usually a missing env var or OBS not running), then re-run the same command. Do not proceed on a FAILURE.
 
-Confirm OBS mode actually engaged (not demo mode) — the log should show it connecting to OBS, and health should be ok:
+Confirm the production OBS configuration engaged — the log should show it connecting to OBS and polling `https://api.evrybdystudios.com/api/record`, and health should be ok:
 ```bash
 curl -s http://localhost:8787/health
 tail -n 30 ~/Documents/es-mini-agent/agent.log
@@ -186,10 +188,10 @@ echo "--- final file (should be closed, non-zero size) ---"; ls -la "$REC"
 **Pass conditions (all must hold):**
 1. `start` returns `{"ok":true,"recording":true,...}`
 2. A real video file appears in `~/es-mini-recordings/cam1/` and **grows** between the two `ls` calls
-3. `status` returns `feeds_writing` ≥ 1 (NOT null — null means demo mode, meaning OBS mode didn't engage)
+3. `status` returns `feeds_writing` ≥ 1 (NOT null; null is not production proof)
 4. `stop` returns `{"ok":true,"saved":...}` and the file is closed with non-zero size
 
-If `feeds_writing` is `null`: OBS mode did not engage. Check that `OBS_SOURCES=cam1` made it into the plist (`plutil -p ~/Library/LaunchAgents/com.es.mini-agent.plist | grep -A1 OBS_SOURCES`), that OBS is running, and that the websocket password is correct. Re-run step 6 with corrected values.
+If `feeds_writing` is `null`: the production OBS configuration did not engage. Check that `OBS_SOURCES=cam1` made it into the plist (`plutil -p ~/Library/LaunchAgents/com.es.mini-agent.plist | grep -A1 OBS_SOURCES`), that OBS is running, and that the websocket password is correct. Re-run step 6 with corrected values.
 
 ---
 
@@ -222,4 +224,4 @@ Then tell Robbie to **leave OBS open and the mini awake** — Anna will fire a r
 ### If you get stuck
 - Agent won't boot → `tail -n 50 ~/Documents/es-mini-agent/agent.error.log`. A `Cannot find module './obs-control'` error means the download didn't pull that file — re-run step 6.
 - `feeds_writing: null` → OBS mode is off (env var or OBS-not-running or wrong ws password). See step 7.
-- Rollback the agent to the last known-good demo version: re-run the installer but first `cd ~/Documents/es-mini-agent && git fetch && git checkout pre-obs-agent-2026-07-16` (only if the repo was cloned; the curl installer always pulls latest `main`).
+- Rollback for a repoint attempt: restore the previously saved `.env` and `~/Library/LaunchAgents/com.es.mini-agent.plist`, then reload only after Robbie confirms the room is free and nothing is recording.

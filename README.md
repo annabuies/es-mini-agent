@@ -1,12 +1,14 @@
 # es-mini-agent
 
-**This agent proves the app-to-Mini connection is real. It now supports optional OBS Source Record control while keeping the existing in-memory demo mode as the default fallback.**
+**Production Mac Mini agent for EVRYBDY FLEET camera preview and recording.**
 
-Small zero-dependency Node HTTP service that runs on a FLEET Mac Mini (or a bench-test Mac standing in for one). The Vercel proxy at `es-os-app/api/record.js` forwards `/record/{start|stop|status|pause|resume}` calls here once `RECORD_CONTROL_URL` and `RECORD_CONTROL_KEY` are set on Vercel. If OBS env vars are omitted, the legacy demo/mock path remains unchanged.
+This zero-dependency Node service runs on a FLEET Mac Mini, polls the Cloudflare Worker outbound for commands, controls real OBS Source Record filters, and posts results back to the same relay. The Mini needs no inbound tunnel or public port.
 
 ## Requirements
 
-- Node.js `>=22` (uses only built-ins, including the stable global `WebSocket` client for OBS control).
+- Node.js `>=22` (uses only built-ins, including the stable global `WebSocket` client for OBS control)
+- OBS Studio 28+ with obs-websocket enabled
+- Source Record filters and directories for every source in `OBS_SOURCES`
 
 ## Install
 
@@ -16,17 +18,18 @@ Nothing to install. `npm install` is a no-op (no dependencies).
 
 Core + optional env vars:
 
-| var                  | required | example                       | notes |
-|----------------------|----------|-------------------------------|-------|
-| `PORT`               | no       | `8787`                        | default `8787` |
-| `RECORD_CONTROL_KEY` | **yes**  | long random string            | must match the value set on Vercel; agent refuses to start if unset |
-| `BUILDING_ID`        | **yes**  | `bench-1`                     | this Mini's identity; one Mini serves exactly one building |
-| `OBS_WS_URL`         | no       | `ws://127.0.0.1:4455`         | optional — enables real OBS control; omit for demo mode |
-| `OBS_WS_PASSWORD`    | no       | `(empty)`                     | optional — enables real OBS control; omit for demo mode |
-| `OBS_SOURCES`        | no       | `cam1,cam2`                   | optional — enables real OBS control; omit for demo mode |
-| `OBS_RECORD_DIR`     | no       | `~/es-mini-obs-recordings`    | optional in demo mode; required when `OBS_SOURCES` is set |
+| var                  | required | example                                    | notes |
+|----------------------|----------|--------------------------------------------|-------|
+| `PORT`               | no       | `8787`                                     | default `8787` |
+| `RECORD_POLL_URL`    | no       | `https://api.evrybdystudios.com`           | permanent Cloudflare target; fallback: `https://es-os-app.crmes.workers.dev` |
+| `RECORD_CONTROL_KEY` | **yes**  | long random string                         | must match the Cloudflare Worker secret; agent refuses to start if unset |
+| `BUILDING_ID`        | **yes**  | `bench-1`                                  | this Mini's identity; one Mini serves exactly one building |
+| `OBS_WS_URL`         | **yes**  | `ws://127.0.0.1:4455`                      | real OBS control endpoint |
+| `OBS_WS_PASSWORD`    | as set   | `(secret)`                                 | must match OBS websocket configuration |
+| `OBS_SOURCES`        | **yes**  | `cam1,cam2,cam3`                           | real production source names |
+| `OBS_RECORD_DIR`     | **yes**  | `~/es-mini-obs-recordings`                 | base directory containing one folder per source |
 
-Copy `.env.example` for local dev, or edit the `EnvironmentVariables` dict in `com.es.mini-agent.plist` for launchd.
+The installer defaults `RECORD_POLL_URL` to the permanent hostname and persists it in both `.env` and the generated launchd plist. Override it with the workers.dev fallback only when the permanent hostname is unavailable.
 
 ## Run locally (quick bench test)
 
@@ -130,25 +133,26 @@ When R2 credentials are configured (`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, 
 - Recording files are never deleted from the Mac mini by this upload path
 - Failed uploads are logged in `agent.log` and surfaced again during boot sweep; failed states are left in place and are not auto-retried
 
-## Contract (what the Vercel proxy expects back)
+## Contract (what the Cloudflare relay expects back)
 
-- `start`, `status`, `resume` → `{ ok, recording, feeds_writing }` (demo mode keeps `feeds_writing: null`; OBS mode reports a verified count when recording and `0` when idle)
+- `start`, `status`, `resume` → `{ ok, recording, feeds_writing }` (`feeds_writing` is verified from real output files)
 - `stop` → `{ ok, saved }`
 - `pause` → `{ ok, paused }`
 
 Request body from the proxy: `{ building_id, client_code }`. Auth: `Authorization: Bearer <RECORD_CONTROL_KEY>`.
 
-## OBS control (optional)
+## OBS control
 
 - Requires OBS Studio 28+ (obs-websocket v5 is built in). Enable/configure it in **Tools -> obs-websocket Settings** (port/password must match env vars here).
 - Requires exeldro's **Source Record** plugin installed, with a Source Record filter added to each source listed in `OBS_SOURCES`.
 - For `feeds_writing` detection to work, each source's Source Record filter **Path** must be set to `<OBS_RECORD_DIR>/<sourceName>/` (example: source `cam1` writes to `<OBS_RECORD_DIR>/cam1/`).
-- If `OBS_SOURCES` is unset/empty, the agent stays in demo mode (same in-memory behavior as before).
+- Production installation requires non-empty `OBS_SOURCES`; do not treat an unconfigured OBS result as a successful recording.
 
 ## Install as a launchd LaunchAgent (auto-start + auto-restart)
 
 1. Edit `com.es.mini-agent.plist`:
-   - Replace `REPLACE_ME_WITH_REAL_SECRET` with the same secret you set on Vercel.
+   - Keep `RECORD_POLL_URL` on `https://api.evrybdystudios.com`; use `https://es-os-app.crmes.workers.dev` only as the documented fallback.
+   - Replace `REPLACE_ME_WITH_REAL_SECRET` with the secret matching the Cloudflare Worker.
    - Replace `REPLACE_ME_e_g_bench-1` with this Mini's `BUILDING_ID`.
    - Confirm the `ProgramArguments` node path matches `which node` on this Mac. On Apple Silicon w/ Homebrew it is typically `/opt/homebrew/opt/node@24/bin/node`.
 
@@ -181,10 +185,4 @@ Request body from the proxy: `{ building_id, client_code }`. Auth: `Authorizatio
 
 `KeepAlive: true` means launchd restarts the process if it crashes — the "self-recovery agent" behavior the FLEET docs describe. `RunAtLoad: true` starts it immediately on load / on user login.
 
-## What this agent explicitly does NOT do (yet)
-
-- No direct control of physical camera/audio hardware outside OBS itself.
-- No file writing of media.
-- No persistence — state (`recording`, `paused`) is in-memory only and resets on restart. That is intentional for the bench-test phase.
-
-Those come in a follow-up track once the physical studio rig exists.
+The agent controls cameras and recording through OBS; it does not expose the Mini through an inbound HTTP tunnel. Command transport is the outbound Supabase-backed queue served by the Cloudflare Worker.

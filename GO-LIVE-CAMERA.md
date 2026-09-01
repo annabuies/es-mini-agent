@@ -1,8 +1,8 @@
-# Go live with the camera — leave demo mode
+# Go live with the camera on Cloudflare
 
-**You are Claude Code running on Robbie's Mac mini.** Your job: get OBS installed, get the real PTZOptics camera showing a live picture in OBS, then flip the EVRYBDY agent **out of demo mode** so it records that camera for real. When you're done, Anna fires a single command from her laptop and sees a real feed writing to disk.
+**You are Claude Code running on Robbie's Mac mini.** Your job: get OBS installed, get the real PTZOptics camera showing a live picture in OBS, then install the EVRYBDY agent with its production OBS configuration and outbound Cloudflare relay target. When you're done, Anna sees the real feed from the authenticated Cloudflare web app.
 
-> **Honesty rule (non-negotiable):** never report "ready" or "live" unless a real recording actually wrote a **growing** file to disk AND the agent reported `feeds_writing` **≥ 1** (not `null`, not `0`). `null` means you're still in demo mode. If something failed, say exactly what failed and stop. Do not paper over it.
+> **Honesty rule (non-negotiable):** never report "ready" or "live" unless a real recording actually wrote a **growing** file to disk AND the agent reported `feeds_writing` **≥ 1** (not `null`, not `0`). A null result is unconfigured and is not production proof. If something failed, say exactly what failed and stop. Do not paper over it.
 >
 > **You do setup only.** Once the agent is running it drives OBS on its own with no AI in the record path. Do not wire yourself into recording.
 
@@ -10,11 +10,11 @@
 
 ## What's already done (don't touch it)
 
-The cloud side is fully wired and is **not** the demo. On Vercel (`es-os-app`), `RECORD_CONTROL_KEY`, `ES_SUPABASE_URL`, `ES_SUPABASE_KEY`, and `RECORD_TARGET_BUILDING_ID=bench-1` are all set. The relay enqueues real commands to Supabase and the mini polls them outbound every second. **Nothing needs a tunnel or an inbound port on this Mac.**
+The Cloudflare Worker at `https://api.evrybdystudios.com` is the permanent relay. `https://es-os-app.crmes.workers.dev` is the fallback. The relay enqueues real commands to Supabase and the Mini polls them outbound every second. **Nothing needs a tunnel or an inbound port on this Mac.**
 
-**The demo is 100% on this mini:** the agent runs in demo mode whenever `OBS_SOURCES` is empty, and in demo mode every command returns `feeds_writing: null` and touches no camera. This runbook's whole point is to install the camera and reinstall the agent WITH `OBS_SOURCES=cam1`.
+Production requires the real OBS source names and directories. This runbook installs the camera configuration with `OBS_SOURCES=cam1` for the one-camera proof; use the governed multi-camera values for the room deployment.
 
-**Success = one line:** from Anna's laptop, `POST /api/record {"op":"start"}` returns `"live": true` and `"feeds_writing": 1` (or higher). That is a real camera recording. Anything with `feeds_writing: null` is still demo.
+**Success = one line:** the authenticated Cloudflare app receives `"live": true` and `"feeds_writing": 1` (or higher). That is a real camera recording. A null result is not success.
 
 ---
 
@@ -22,14 +22,15 @@ The cloud side is fully wired and is **not** the demo. On Vercel (`es-os-app`), 
 
 | Name | Value | Notes |
 |---|---|---|
-| `RECORD_CONTROL_KEY` | `<<GET FROM ANNA>>` | MUST match the value already set on Vercel for `es-os-app`. Anna reveals it in the Vercel dashboard. |
-| `BUILDING_ID` | `bench-1` | This mini's id. Leave as `bench-1` unless Anna says otherwise. It must match `RECORD_TARGET_BUILDING_ID` on Vercel. |
-| `OBS_SOURCES` | `cam1` | The OBS source name for the camera. One word, no spaces. **This is the setting that leaves demo mode.** |
+| `RECORD_POLL_URL` | `https://api.evrybdystudios.com` | Permanent Cloudflare target. Fallback: `https://es-os-app.crmes.workers.dev`. |
+| `RECORD_CONTROL_KEY` | `<<GET FROM ANNA>>` | MUST match the Cloudflare Worker secret. |
+| `BUILDING_ID` | `bench-1` | This Mini's id. Leave as `bench-1` unless Anna says otherwise. It must match the Worker's `RECORD_TARGET_BUILDING_ID`. |
+| `OBS_SOURCES` | `cam1` | The real OBS source name for the camera. One word, no spaces. |
 | `OBS_RECORD_DIR` | `$HOME/es-mini-recordings` | Where OBS writes per-camera folders. |
 | `OBS_WS_PASSWORD` | `<<SET IN STEP 6>>` | The obs-websocket password you set in Step 6. |
 | `OBS_WS_URL` | `ws://127.0.0.1:4455` | Default. Only change if you use a different port. |
 
-If `RECORD_CONTROL_KEY` is still the literal `<<GET FROM ANNA>>` placeholder, **STOP** and ask Anna for it. Nothing works without it, and it must match Vercel exactly.
+If `RECORD_CONTROL_KEY` is still the literal `<<GET FROM ANNA>>` placeholder, **STOP** and ask Anna for it. Nothing works without it, and it must match the Worker exactly.
 
 ---
 
@@ -155,13 +156,14 @@ Do not continue until port 4455 is listening.
 
 ---
 
-## Step 7 — Reinstall the agent WITH OBS mode ON (this is what kills demo mode)
+## Step 7 — Install the production agent configuration
 
-Run the installer with **all** the OBS env vars. The presence of `OBS_SOURCES` is the single thing that moves the agent from demo to live:
+Run the installer with **all** the OBS env vars and the explicit permanent relay target:
 
 ```bash
 BUILDING_ID="bench-1" \
 RECORD_CONTROL_KEY="<<GET FROM ANNA>>" \
+RECORD_POLL_URL="https://api.evrybdystudios.com" \
 OBS_SOURCES="cam1" \
 OBS_WS_URL="ws://127.0.0.1:4455" \
 OBS_WS_PASSWORD="<<the password from Step 6>>" \
@@ -172,7 +174,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/annabuies/es-mini-agent/main
 The installer writes a launchd service, starts it, and ends by hitting `http://localhost:8787/health`. On FAILURE, read `~/Documents/es-mini-agent/agent.error.log`, fix the cause (usually a missing env var or OBS not running), and re-run the same command. Then confirm it's healthy and actually polling:
 ```bash
 curl -s http://localhost:8787/health
-tail -n 30 ~/Documents/es-mini-agent/agent.log     # should show: relay: polling https://es-os-app.vercel.app/api/record
+tail -n 30 ~/Documents/es-mini-agent/agent.log     # must show: relay: polling https://api.evrybdystudios.com/api/record
 ```
 
 ---
@@ -204,10 +206,10 @@ echo "--- final file (closed, non-zero) ---"; ls -la "$REC"
 **Pass conditions (ALL must hold):**
 1. `start` → `{"ok":true,"recording":true,...}`
 2. A real video file appears in `~/es-mini-recordings/cam1/` and **grows** between the two `ls` calls
-3. `status` → **`feeds_writing` ≥ 1** (NOT `null` — `null` means demo mode didn't flip)
+3. `status` → **`feeds_writing` ≥ 1** (NOT `null`; null is not production proof)
 4. `stop` → `{"ok":true,"saved":true}`, file closed with non-zero size
 
-If `feeds_writing` is `null`: OBS mode did not engage. Check `OBS_SOURCES` made it into the plist (`plutil -p ~/Library/LaunchAgents/com.es.mini-agent.plist | grep -A1 OBS_SOURCES`), OBS is running, and the ws password is right. Re-run Step 7 with corrected values.
+If `feeds_writing` is `null`: the real OBS configuration did not engage. Check `OBS_SOURCES` made it into the plist (`plutil -p ~/Library/LaunchAgents/com.es.mini-agent.plist | grep -A1 OBS_SOURCES`), OBS is running, and the ws password is right. Re-run Step 7 with corrected values.
 
 ---
 
@@ -217,13 +219,7 @@ Once Step 8 passes:
 - **Leave OBS open and the mini awake** (System Settings → Displays/Energy: prevent sleep). The agent polls the relay every second, so as long as it's awake, Anna's command reaches it in ~1s.
 - Tell Anna: **"bench-1 is live, OBS_SOURCES=cam1, Step 8 passed, feeds_writing was N."** Paste the actual `status` JSON.
 
-**Anna's end (from her laptop, no key needed, the relay handles auth):**
-```bash
-curl -s -X POST https://es-os-app.vercel.app/api/record -H 'Content-Type: application/json' -d '{"op":"start"}'
-curl -s -X POST https://es-os-app.vercel.app/api/record -H 'Content-Type: application/json' -d '{"op":"status"}'
-curl -s -X POST https://es-os-app.vercel.app/api/record -H 'Content-Type: application/json' -d '{"op":"stop"}'
-```
-She's looking for `"live": true` and `"feeds_writing": 1` (or higher). `null` = still demo. `"error":"timeout"` = mini asleep or not polling.
+**Anna's end:** use a real authenticated member session at `https://api.evrybdystudios.com`. Confirm the camera preview and controller responses there; do not use unauthenticated raw record commands. She is looking for `"live": true` and `"feeds_writing": 1` (or higher). A null result is not success. `"error":"timeout"` means the Mini is asleep or not polling.
 
 ---
 
@@ -241,9 +237,9 @@ Short and honest:
 
 ## Troubleshooting
 
-- **`feeds_writing: null`** → demo mode still on. `OBS_SOURCES` missing from the plist, OBS not running, or wrong ws password. See Step 8.
-- **`feeds_writing: 0` while recording** → OBS mode is on but no file is growing. The Source Record filter **Path** doesn't match `<OBS_RECORD_DIR>/cam1/`, or the filter isn't on `cam1`. Re-check Step 5.
+- **`feeds_writing: null`** → production OBS configuration is incomplete. `OBS_SOURCES` is missing from the plist, OBS is not running, or the websocket password is wrong. See Step 8.
+- **`feeds_writing: 0` while recording** → OBS is connected but no file is growing. The Source Record filter **Path** doesn't match `<OBS_RECORD_DIR>/cam1/`, or the filter isn't on `cam1`. Re-check Step 5.
 - **Black/frozen preview** → camera light or the NDI/RTSP source, not the agent. Fix the picture in OBS first (Step 4).
 - **Agent won't boot** → `tail -n 50 ~/Documents/es-mini-agent/agent.error.log`. `Cannot find module './obs-control'` means the download was incomplete — re-run Step 7.
-- **Anna gets `"error":"timeout"`** → the mini isn't polling: mini asleep, agent not running (`curl localhost:8787/health`), or wrong `RECORD_CONTROL_KEY` (must match Vercel).
+- **Anna gets `"error":"timeout"`** → the Mini isn't polling: Mini asleep, agent not running (`curl localhost:8787/health`), wrong `RECORD_POLL_URL`, or wrong `RECORD_CONTROL_KEY` (must match the Worker).
 - **Deeper reference:** `SETUP-MAC-MINI.md` in this repo has the original bench walkthrough and the optional R2 upload test (Step 8 there). File transfer/R2 is a **separate, later** gate — do not let it block today's camera proof.

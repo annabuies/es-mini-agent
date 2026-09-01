@@ -42,6 +42,8 @@
     <dict>
         <key>PORT</key>
         <string>8787</string>
+        <key>RECORD_POLL_URL</key>
+        <string>https://api.evrybdystudios.com</string>
         <key>RECORD_CONTROL_KEY</key>
         <string>REPLACE_ME_WITH_REAL_SECRET</string>
         <key>BUILDING_ID</key>
