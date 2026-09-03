@@ -121,6 +121,37 @@ function createFakeObs(requests, options = {}) {
   return server;
 }
 
+function createFakeR2(requests) {
+  const sizes = new Map();
+  return http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const url = new URL(req.url, 'http://127.0.0.1');
+    requests.push({ method: req.method, path: url.pathname, query: url.searchParams });
+    if (req.method === 'POST' && url.searchParams.has('uploads')) {
+      res.end('<InitiateMultipartUploadResult><UploadId>fake-upload</UploadId></InitiateMultipartUploadResult>');
+      return;
+    }
+    if (req.method === 'PUT' && url.searchParams.has('partNumber')) {
+      sizes.set(url.pathname, Buffer.concat(chunks).length);
+      res.setHeader('etag', 'fake-etag');
+      res.end();
+      return;
+    }
+    if (req.method === 'POST' && url.searchParams.has('uploadId')) {
+      res.end('<CompleteMultipartUploadResult/>');
+      return;
+    }
+    if (req.method === 'HEAD') {
+      res.setHeader('content-length', String(sizes.get(url.pathname) || 0));
+      res.end();
+      return;
+    }
+    res.statusCode = 400;
+    res.end('unexpected fake R2 request');
+  });
+}
+
 async function postAgent(port, op) {
   const response = await fetch(`http://127.0.0.1:${port}/record/${op}`, {
     method: 'POST',
@@ -263,23 +294,41 @@ test('an already-active OBS master refuses a new camera session', { timeout: 800
   ]);
 });
 
-test('stop includes the returned master output path with the camera files', { timeout: 12000 }, async (t) => {
+test('stop enqueues three camera files plus the returned master output path', { timeout: 16000 }, async (t) => {
   const recordDir = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-master-stop-'));
   const masterPath = path.join(recordDir, 'master', 'master.mp4');
   for (const source of ['cam1', 'cam2', 'cam3', 'master']) {
     fs.mkdirSync(path.join(recordDir, source), { recursive: true });
     fs.writeFileSync(path.join(recordDir, source, source === 'master' ? 'master.mp4' : source + '.mp4'), 'recording');
   }
-  const agent = await startAgent(t, { recordDir, obs: { masterOutputPath: masterPath } });
+  const uploads = [];
+  const r2Server = createFakeR2(uploads);
+  const r2Port = await listen(r2Server);
+  t.after(() => close(r2Server));
+  const agent = await startAgent(t, {
+    recordDir,
+    obs: { masterOutputPath: masterPath },
+    env: {
+      S3_ACCESS_KEY_ID: 'fake-access-key', S3_SECRET_ACCESS_KEY: 'fake-secret-key',
+      S3_BUCKET: 'fake-bucket', S3_ENDPOINT: `http://127.0.0.1:${r2Port}`,
+    },
+  });
   t.after(() => fs.rmSync(recordDir, { recursive: true, force: true }));
   await postAgent(agent.agentPort, 'start');
   const result = await postAgent(agent.agentPort, 'stop');
-  assert.deepEqual(result, { ok: true, saved: true });
+  assert.deepEqual(result, { ok: true, saved: true, upload_queued: 4 });
   assert.deepEqual(agent.obsRequests.map((request) => request.type).slice(-4).sort(), [
     'CallVendorRequest', 'CallVendorRequest', 'CallVendorRequest', 'StopRecord',
   ].sort());
   assert.deepEqual(agent.obsRequests.filter((request) => request.type === 'CallVendorRequest').slice(-3)
     .map((request) => request.data.requestType), ['record_stop', 'record_stop', 'record_stop']);
+  await waitFor(() => uploads.filter((request) => request.method === 'POST' && request.query.has('uploads')).length === 4, 12000);
+  assert.deepEqual(uploads.filter((request) => request.method === 'POST' && request.query.has('uploads')).map((request) => request.path).sort(), [
+    '/fake-bucket/recordings/bench-1/cam1/cam1.mp4',
+    '/fake-bucket/recordings/bench-1/cam2/cam2.mp4',
+    '/fake-bucket/recordings/bench-1/cam3/cam3.mp4',
+    '/fake-bucket/recordings/bench-1/master/master.mp4',
+  ]);
 });
 
 test('MASTER_RECORD=0 preserves the camera-only request sequence', { timeout: 8000 }, async (t) => {
