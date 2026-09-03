@@ -5,6 +5,7 @@
 // Optional OBS Source Record control; in-memory demo mode remains the fallback.
 
 const http = require('http');
+const fs = require('fs');
 const { ObsClient, callVendor, getNewestFileSample, getSourceScreenshot, sampleFeedsWriting } = require('./obs-control');
 const crypto = require('crypto');
 const path = require('path');
@@ -43,6 +44,10 @@ let activeSources = OBS_SOURCES_RAW.split(',').map((v) => v.trim()).filter(Boole
 const OBS_RECORD_DIR = process.env.OBS_RECORD_DIR || '';
 const OBS_ENABLED = !!(OBS_SOURCES_RAW && OBS_SOURCES_RAW.trim());
 const OBS_MODE_ACTIVE = OBS_ENABLED && activeSources.length > 0;
+const MASTER_SOURCE = 'master';
+// Master recording is on by default for a real OBS installation. Setting this
+// to 0 is an immediate rollback to the camera-only behavior.
+const MASTER_RECORD = OBS_MODE_ACTIVE && process.env.MASTER_RECORD !== '0';
 const STORAGE_ACCESS_KEY_ID = process.env.S3_ACCESS_KEY_ID || process.env.R2_ACCESS_KEY_ID || '';
 const STORAGE_SECRET_ACCESS_KEY = process.env.S3_SECRET_ACCESS_KEY || process.env.R2_SECRET_ACCESS_KEY || '';
 const STORAGE_BUCKET = process.env.S3_BUCKET || process.env.R2_BUCKET || '';
@@ -69,7 +74,7 @@ if (!BUILDING_ID) {
 }
 
 const START_TIME = Date.now();
-const state = { recording: false, paused: false, recordingStartedAt: null, sources: null };
+const state = { recording: false, paused: false, recordingStartedAt: null, sources: null, masterActive: false };
 const r2Tests = new Map();
 let obsClient = null;
 let feedsPrevSamples = new Map();
@@ -674,6 +679,54 @@ function didSourceFileStabilize(beforeSamples, afterSamples, source) {
   return before.size === after.size;
 }
 
+function getFileSample(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    return stat.isFile() ? { size: stat.size, mtimeMs: stat.mtimeMs } : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function didFileStabilize(before, after) {
+  return !!(before && after && before.size === after.size);
+}
+
+async function stopStartedSources(client, sources) {
+  await Promise.all(sources.map(async (source) => {
+    try {
+      await callVendor(client, 'record_stop', source);
+    } catch (_) {
+      // The original master-start error is the useful caller-facing detail.
+    }
+  }));
+}
+
+function masterResponseError(response, fallback) {
+  if (obsRequestSucceeded(response)) return null;
+  const data = obsResponseData(response);
+  const comment = response && response.requestStatus && response.requestStatus.comment;
+  return String(comment || data.error || fallback || 'obs_request_rejected');
+}
+
+async function getMasterRecordStatus(client) {
+  const response = await client.request('GetRecordStatus');
+  const error = masterResponseError(response, 'get_record_status_failed');
+  if (error) throw new Error(error);
+  return obsResponseData(response);
+}
+
+async function getMasterActiveSafe() {
+  if (!MASTER_RECORD) return false;
+  try {
+    const client = await getObsClient();
+    return !!(await getMasterRecordStatus(client)).outputActive;
+  } catch (e) {
+    console.warn('[es-mini-agent] WARN: OBS master status failed:', e && (e.message || e));
+    return false;
+  }
+}
+
 function sameSources(a, b) {
   if (!Array.isArray(a) || !Array.isArray(b)) return false;
   if (a.length !== b.length) return false;
@@ -760,7 +813,7 @@ async function handleOp(op, body) {
       return { ok: true, cancelled: true, saved: false };
     }
     if (op === 'status') {
-      return { ok: true, recording: state.recording, feeds_writing: null, preview: false };
+      return { ok: true, recording: state.recording, feeds_writing: null, preview: false, master_active: false, master_enabled: false };
     }
     if (op === 'pause') {
       if (!state.recording) {
@@ -784,6 +837,8 @@ async function handleOp(op, body) {
         recording: state.recording,
         stats: null,
         filters: null,
+        master_active: false,
+        master_enabled: false,
         version: getVersionBlock({ projectDir: __dirname, agentVersion: AGENT_VERSION }),
       };
     }
@@ -829,43 +884,75 @@ async function handleOp(op, body) {
       return { ok: false, reason: 'obs_start_failed', detail: truncateDetail(detail) };
     }
 
+    if (MASTER_RECORD) {
+      try {
+        const recordStatus = await getMasterRecordStatus(client);
+        if (recordStatus.outputActive) {
+          throw new Error('recording_already_active');
+        }
+        const started = await client.request('StartRecord');
+        const startError = masterResponseError(started, 'start_record_failed');
+        if (startError) throw new Error(startError);
+      } catch (e) {
+        await stopStartedSources(client, startingSources);
+        const detail = 'master: ' + (e && (e.message || e) || 'start_record_failed');
+        return { ok: false, reason: 'obs_start_failed', detail: truncateDetail(detail) };
+      }
+    }
+
     feedsPrevSamples = new Map();
     state.recording = true;
     state.paused = false;
     state.recordingStartedAt = Date.now();
     state.sources = startingSources;
+    state.masterActive = MASTER_RECORD;
     return { ok: true, recording: true, feeds_writing: null };
   }
   if (op === 'stop') {
     const sources = sessionSources();
+    const masterWasActive = state.masterActive;
     let response = { ok: true, saved: false };
     try {
       let stopResults;
+      let masterStop = { success: !masterWasActive, outputPath: null };
       try {
         const client = await getObsClient();
-        stopResults = await Promise.all(sources.map(async (source) => {
+        const cameraStops = sources.map(async (source) => {
           const vendor = await callVendor(client, 'record_stop', source);
           return { source, vendor };
-        }));
+        });
+        const masterStopCall = masterWasActive
+          ? client.request('StopRecord').then((result) => {
+            const error = masterResponseError(result, 'stop_record_failed');
+            return { success: !error, outputPath: obsResponseData(result).outputPath || null, error };
+          }).catch((e) => ({ success: false, outputPath: null, error: e && (e.message || String(e)) || 'stop_record_failed' }))
+          : Promise.resolve(masterStop);
+        [stopResults, masterStop] = await Promise.all([Promise.all(cameraStops), masterStopCall]);
       } catch (e) {
         stopResults = sources.map((source) => ({
           source,
           vendor: { success: false, error: e && (e.message || String(e)) || 'obs_stop_error' },
         }));
+        masterStop = { success: !masterWasActive, outputPath: null, error: e && (e.message || String(e)) || 'obs_stop_error' };
       }
 
       let filesStable = false;
       if (OBS_RECORD_DIR) {
         let prevSample = sampleFeedsWriting(sources, OBS_RECORD_DIR, new Map()).samples;
+        let prevMasterSample = masterWasActive ? getFileSample(masterStop.outputPath) : null;
         for (let i = 0; i < 4; i += 1) {
           await sleep(900);
           const newSample = sampleFeedsWriting(sources, OBS_RECORD_DIR, prevSample).samples;
-          if (sources.every((source) => didSourceFileStabilize(prevSample, newSample, source))) {
+          const newMasterSample = masterWasActive ? getFileSample(masterStop.outputPath) : null;
+          const camerasStable = sources.every((source) => didSourceFileStabilize(prevSample, newSample, source));
+          const masterStable = !masterWasActive || didFileStabilize(prevMasterSample, newMasterSample);
+          if (camerasStable && masterStable) {
             filesStable = true;
             prevSample = newSample;
             break;
           }
           prevSample = newSample;
+          prevMasterSample = newMasterSample;
         }
         feedsPrevSamples = prevSample;
       } else {
@@ -873,7 +960,7 @@ async function handleOp(op, body) {
       }
 
       const allStopsSucceeded = stopResults.every((entry) => entry.vendor.success);
-      const saved = allStopsSucceeded && filesStable;
+      const saved = allStopsSucceeded && masterStop.success && filesStable;
       const recordingStartedAt = state.recordingStartedAt;
       let uploadQueued = 0;
 
@@ -893,6 +980,14 @@ async function handleOp(op, body) {
               console.warn('[es-mini-agent] upload enqueue failed source=' + source + ':', e && (e.stack || e.message || e));
             }
           }
+          if (masterWasActive && masterStop.success && masterStop.outputPath) {
+            try {
+              const out = uploadQueue.enqueue({ filePath: masterStop.outputPath, source: MASTER_SOURCE });
+              if (out && out.queued) uploadQueued += 1;
+            } catch (e) {
+              console.warn('[es-mini-agent] upload enqueue failed source=' + MASTER_SOURCE + ':', e && (e.stack || e.message || e));
+            }
+          }
         }
       }
 
@@ -903,6 +998,7 @@ async function handleOp(op, body) {
       state.paused = false;
       state.recordingStartedAt = null;
       state.sources = null;
+      state.masterActive = false;
       if (pendingSources) {
         applySources(pendingSources);
       }
@@ -911,31 +1007,46 @@ async function handleOp(op, body) {
   }
   if (op === 'cancel') {
     const sources = sessionSources();
+    const masterWasActive = state.masterActive;
     try {
       let stopResults;
+      let masterStop = { success: !masterWasActive, outputPath: null };
       try {
         const client = await getObsClient();
-        stopResults = await Promise.all(sources.map(async (source) => {
+        const cameraStops = sources.map(async (source) => {
           const vendor = await callVendor(client, 'record_stop', source);
           return { source, vendor };
-        }));
+        });
+        const masterStopCall = masterWasActive
+          ? client.request('StopRecord').then((result) => ({
+            success: !masterResponseError(result, 'stop_record_failed'),
+            outputPath: obsResponseData(result).outputPath || null,
+          })).catch(() => ({ success: false, outputPath: null }))
+          : Promise.resolve(masterStop);
+        [stopResults, masterStop] = await Promise.all([Promise.all(cameraStops), masterStopCall]);
       } catch (e) {
         stopResults = sources.map((source) => ({
           source,
           vendor: { success: false, error: e && (e.message || String(e)) || 'obs_stop_error' },
         }));
+        masterStop = { success: !masterWasActive, outputPath: null };
       }
 
       if (OBS_RECORD_DIR) {
         let prevSample = sampleFeedsWriting(sources, OBS_RECORD_DIR, new Map()).samples;
+        let prevMasterSample = masterWasActive ? getFileSample(masterStop.outputPath) : null;
         for (let i = 0; i < 4; i += 1) {
           await sleep(900);
           const newSample = sampleFeedsWriting(sources, OBS_RECORD_DIR, prevSample).samples;
-          if (sources.every((source) => didSourceFileStabilize(prevSample, newSample, source))) {
+          const newMasterSample = masterWasActive ? getFileSample(masterStop.outputPath) : null;
+          const camerasStable = sources.every((source) => didSourceFileStabilize(prevSample, newSample, source));
+          const masterStable = !masterWasActive || didFileStabilize(prevMasterSample, newMasterSample);
+          if (camerasStable && masterStable) {
             prevSample = newSample;
             break;
           }
           prevSample = newSample;
+          prevMasterSample = newMasterSample;
         }
         feedsPrevSamples = prevSample;
       } else {
@@ -954,6 +1065,7 @@ async function handleOp(op, body) {
       state.paused = false;
       state.recordingStartedAt = null;
       state.sources = null;
+      state.masterActive = false;
       if (pendingSources) {
         applySources(pendingSources);
       }
@@ -961,19 +1073,20 @@ async function handleOp(op, body) {
   }
   if (op === 'status') {
     const sources = sessionSources();
+    const masterActive = await getMasterActiveSafe();
     if (!state.recording) {
-      const out = { ok: true, recording: false, feeds_writing: 0, preview: previewActive(), sources: sources.slice() };
+      const out = { ok: true, recording: false, feeds_writing: 0, preview: previewActive(), sources: sources.slice(), master_active: masterActive, master_enabled: MASTER_RECORD };
       if (uploadQueue) out.uploads = uploadQueue.status();
       return out;
     }
     const sampled = sampleFeedsWriting(sources, OBS_RECORD_DIR, feedsPrevSamples);
     feedsPrevSamples = sampled.samples;
-    const out = { ok: true, recording: true, feeds_writing: sampled.count, preview: previewActive(), sources: sources.slice() };
+    const out = { ok: true, recording: true, feeds_writing: sampled.count, preview: previewActive(), sources: sources.slice(), master_active: masterActive, master_enabled: MASTER_RECORD };
     if (uploadQueue) out.uploads = uploadQueue.status();
     return out;
   }
   if (op === 'diag') {
-    const out = { ok: true, demo: false, recording: state.recording, stats: null, filters: null };
+    const out = { ok: true, demo: false, recording: state.recording, stats: null, filters: null, master_active: false, master_enabled: MASTER_RECORD };
     out.storage = {
       bucket: STORAGE_BUCKET,
       region: STORAGE_REGION,
@@ -1010,6 +1123,12 @@ async function handleOp(op, body) {
         };
       }
     } catch (_) { /* stats are best-effort — a failed GetStats must still return the filter data */ }
+
+    if (MASTER_RECORD) {
+      try {
+        out.master_active = !!(await getMasterRecordStatus(client)).outputActive;
+      } catch (_) { /* master status is additive diagnostic context */ }
+    }
 
     const filters = [];
     for (const source of sessionSources()) {
@@ -1082,6 +1201,11 @@ async function handleOp(op, body) {
       if (failed) {
         console.warn('[es-mini-agent] WARN: OBS pause vendor call failed:', failed.error || 'vendor_error');
       }
+      if (state.masterActive) {
+        const paused = await client.request('PauseRecord');
+        const masterError = masterResponseError(paused, 'pause_record_failed');
+        if (masterError) console.warn('[es-mini-agent] WARN: OBS master pause failed:', masterError);
+      }
     } catch (e) {
       console.warn('[es-mini-agent] WARN: OBS pause connect/request failed:', e && (e.message || e));
     }
@@ -1096,6 +1220,11 @@ async function handleOp(op, body) {
       const failed = resumeResults.find((result) => !result.success);
       if (failed) {
         console.warn('[es-mini-agent] WARN: OBS resume vendor call failed:', failed.error || 'vendor_error');
+      }
+      if (state.masterActive) {
+        const resumed = await client.request('ResumeRecord');
+        const masterError = masterResponseError(resumed, 'resume_record_failed');
+        if (masterError) console.warn('[es-mini-agent] WARN: OBS master resume failed:', masterError);
       }
     } catch (e) {
       console.warn('[es-mini-agent] WARN: OBS resume connect/request failed:', e && (e.message || e));

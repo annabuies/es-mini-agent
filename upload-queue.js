@@ -10,6 +10,7 @@ const { runMultipartUpload, signR2Request } = require('./r2-upload');
 const STABILITY_POLL_MS = 2000;
 const STABILITY_WARN_MS = 60000;
 const MAX_ERROR_LEN = 300;
+const MASTER_SOURCE = 'master';
 let ffmpegBinMemo = null;
 
 function sleep(ms) {
@@ -289,12 +290,16 @@ function createUploadQueue(opts) {
       };
       const partsUploaded = summary && Number(summary.partsUploaded) || activeSnapshot.partsCompleted || 0;
       console.log('[upload-queue] confirmed ' + job.key + ' (' + partsUploaded + ' parts)');
-      try {
-        maybeMakeProxy(job).catch((e) => {
-          console.warn('[upload-queue] proxy step failed key=' + job.key + ':', e && (e.stack || e.message || e));
-        });
-      } catch (e) {
-        console.warn('[upload-queue] proxy step threw synchronously key=' + job.key + ':', e && (e.stack || e.message || e));
+      if (job.source === MASTER_SOURCE) {
+        console.log('[upload-queue] proxy skipped for master key=' + job.key);
+      } else {
+        try {
+          maybeMakeProxy(job).catch((e) => {
+            console.warn('[upload-queue] proxy step failed key=' + job.key + ':', e && (e.stack || e.message || e));
+          });
+        } catch (e) {
+          console.warn('[upload-queue] proxy step threw synchronously key=' + job.key + ':', e && (e.stack || e.message || e));
+        }
       }
     } catch (e) {
       const detail = truncateError(e && (e.message || e.stack || e));

@@ -15,7 +15,7 @@
 //     This is the evidence Anna's side needs to pick the exact channel fix.
 //   { action: 'apply', mics: {...}, cameras: {...} } — guarded writes.
 //     mics:    { "Mic 1": { device_id: "...", ... } }  — input settings,
-//              names restricted to Mic 1/2/3, flat scalar values only.
+//              names restricted to Mic 1/2/3/4, flat scalar values only.
 //     cameras: { "cam1": { audio_source: "Mic 1", audio_track: 1 } } — Source
 //              Record filter audio keys only; source must be an active camera.
 //     Everything is validated before ANY write, then written, then read back —
@@ -24,7 +24,7 @@
 // This module never touches scenes, video settings, or Source Record output
 // paths, and the caller (server.js) refuses to run it while recording.
 
-const MIC_NAME_RE = /^Mic [1-3]$/;
+const MIC_NAME_RE = /^Mic [1-4]$/;
 const CAMERA_FILTER_KEYS = ['audio_source', 'audio_track', 'different_audio'];
 const MAX_MIC_SETTING_KEYS = 8;
 

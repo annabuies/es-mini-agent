@@ -5,7 +5,8 @@
   "description": "EVRYBDY Studios FLEET — Mini-side HTTP agent. Zero-dependency Node service that the Vercel proxy talks to, with optional OBS Source Record control and demo-mode fallback.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=22"

@@ -25,6 +25,7 @@ Core + optional env vars:
 | `OBS_WS_PASSWORD`    | no       | `(empty)`                     | optional — enables real OBS control; omit for demo mode |
 | `OBS_SOURCES`        | no       | `cam1,cam2`                   | optional — enables real OBS control; omit for demo mode |
 | `OBS_RECORD_DIR`     | no       | `~/es-mini-obs-recordings`    | optional in demo mode; required when `OBS_SOURCES` is set |
+| `MASTER_RECORD`      | no       | `1`                           | defaults to `1` when `OBS_SOURCES` is set; use `0` to disable the OBS main recording rollback |
 
 Copy `.env.example` for local dev, or edit the `EnvironmentVariables` dict in `com.es.mini-agent.plist` for launchd.
 
@@ -130,6 +131,12 @@ When R2 credentials are configured (`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, 
 - Recording files are never deleted from the Mac mini by this upload path
 - Failed uploads are logged in `agent.log` and surfaced again during boot sweep; failed states are left in place and are not auto-retried
 
+## Master recording (Mic 4)
+
+When `OBS_SOURCES` is configured, the agent also controls OBS's main recording by default (`MASTER_RECORD=1`). The master starts, pauses, resumes, stops, and uploads with the three camera Source Record files as `recordings/<building_id>/master/<filename>`. It is an additional artifact: `cam1`, `cam2`, and `cam3` remain the only camera sources.
+
+OBS must be configured with its main recording enabled for tracks 1–4, hybrid MP4 output, and the recording path `<OBS_RECORD_DIR>/master/`. The master’s 360p video is intentionally uploaded without a 1080p proxy. To roll back immediately, set `MASTER_RECORD=0` and reload the agent; that restores camera-only session behavior without changing OBS.
+
 ## Contract (what the Vercel proxy expects back)
 
 - `start`, `status`, `resume` → `{ ok, recording, feeds_writing }` (demo mode keeps `feeds_writing: null`; OBS mode reports a verified count when recording and `0` when idle)
@@ -143,6 +150,7 @@ Request body from the proxy: `{ building_id, client_code }`. Auth: `Authorizatio
 - Requires OBS Studio 28+ (obs-websocket v5 is built in). Enable/configure it in **Tools -> obs-websocket Settings** (port/password must match env vars here).
 - Requires exeldro's **Source Record** plugin installed, with a Source Record filter added to each source listed in `OBS_SOURCES`.
 - For `feeds_writing` detection to work, each source's Source Record filter **Path** must be set to `<OBS_RECORD_DIR>/<sourceName>/` (example: source `cam1` writes to `<OBS_RECORD_DIR>/cam1/`).
+- The OBS main recording path must be `<OBS_RECORD_DIR>/master/` so the four-track master stays alongside the camera recordings.
 - If `OBS_SOURCES` is unset/empty, the agent stays in demo mode (same in-memory behavior as before).
 
 ## Install as a launchd LaunchAgent (auto-start + auto-restart)
