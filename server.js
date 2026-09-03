@@ -48,6 +48,9 @@ const MASTER_SOURCE = 'master';
 // Master recording is on by default for a real OBS installation. Setting this
 // to 0 is an immediate rollback to the camera-only behavior.
 const MASTER_RECORD = OBS_MODE_ACTIVE && process.env.MASTER_RECORD !== '0';
+// Audio split is an additive master post-processing step. It defaults on only
+// when the master itself is enabled, and can be rolled back independently.
+const AUDIO_SPLIT = MASTER_RECORD && process.env.AUDIO_SPLIT !== '0';
 const STORAGE_ACCESS_KEY_ID = process.env.S3_ACCESS_KEY_ID || process.env.R2_ACCESS_KEY_ID || '';
 const STORAGE_SECRET_ACCESS_KEY = process.env.S3_SECRET_ACCESS_KEY || process.env.R2_SECRET_ACCESS_KEY || '';
 const STORAGE_BUCKET = process.env.S3_BUCKET || process.env.R2_BUCKET || '';
@@ -62,6 +65,7 @@ let activeWebhookUrl = process.env.UPLOAD_CONFIRMED_WEBHOOK_URL || '';
 const R2_PART_SIZE_BYTES = 25 * 1024 * 1024;
 const R2_DEFAULT_TEST_SIZE_BYTES = 300 * 1024 * 1024;
 const R2_TEST_TMP_DIR = path.join(__dirname, '.r2-test-tmp');
+const UPLOAD_STATE_DIR = process.env.UPLOAD_STATE_DIR || path.join(__dirname, '.r2-uploads');
 // Node >=22 is required (global WebSocket client is stable as of Node 22.4.0).
 
 if (!RECORD_CONTROL_KEY) {
@@ -74,7 +78,7 @@ if (!BUILDING_ID) {
 }
 
 const START_TIME = Date.now();
-const state = { recording: false, paused: false, recordingStartedAt: null, sources: null, masterActive: false };
+const state = { recording: false, paused: false, recordingStartedAt: null, sources: null, masterActive: false, sessionRef: null, clientCode: null };
 const r2Tests = new Map();
 let obsClient = null;
 let feedsPrevSamples = new Map();
@@ -200,10 +204,11 @@ const storageR2Config = {
 const uploadQueue = isStorageConfigured()
   ? createUploadQueue({
     r2Config: storageR2Config,
-    stateDir: path.join(__dirname, '.r2-uploads'),
+    stateDir: UPLOAD_STATE_DIR,
     isRecording: () => state.recording,
     webhookUrl: () => activeWebhookUrl,
     buildingId: BUILDING_ID,
+    audioSplit: AUDIO_SPLIT,
   })
   : null;
 
@@ -795,25 +800,45 @@ async function performUpdate() {
   return result;
 }
 
+function sessionValue(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return /^[A-Za-z0-9_-]{1,64}$/.test(trimmed) ? trimmed : null;
+}
+
+function activeSessionResponse() {
+  return state.recording ? { session_ref: state.sessionRef, client_code: state.clientCode } : {};
+}
+
+function startSessionResponse() {
+  return state.sessionRef === null ? {} : { session_ref: state.sessionRef };
+}
+
 async function handleOp(op, body) {
   if (!OBS_MODE_ACTIVE) {
     if (op === 'start') {
       state.recording = true;
       state.paused = false;
-      return { ok: true, recording: true, feeds_writing: null };
+      state.sessionRef = sessionValue(body && body.session_ref);
+      state.clientCode = sessionValue(body && body.client_code);
+      return Object.assign({ ok: true, recording: true, feeds_writing: null }, startSessionResponse());
     }
     if (op === 'stop') {
       state.recording = false;
       state.paused = false;
+      state.sessionRef = null;
+      state.clientCode = null;
       return { ok: true, saved: true };
     }
     if (op === 'cancel') {
       state.recording = false;
       state.paused = false;
+      state.sessionRef = null;
+      state.clientCode = null;
       return { ok: true, cancelled: true, saved: false };
     }
     if (op === 'status') {
-      return { ok: true, recording: state.recording, feeds_writing: null, preview: false, master_active: false, master_enabled: false };
+      return Object.assign({ ok: true, recording: state.recording, feeds_writing: null, preview: false, master_active: false, master_enabled: false }, activeSessionResponse());
     }
     if (op === 'pause') {
       if (!state.recording) {
@@ -831,7 +856,7 @@ async function handleOp(op, body) {
       return { ok: true, preview: false };
     }
     if (op === 'diag') {
-      return {
+      return Object.assign({
         ok: true,
         demo: true,
         recording: state.recording,
@@ -840,7 +865,7 @@ async function handleOp(op, body) {
         master_active: false,
         master_enabled: false,
         version: getVersionBlock({ projectDir: __dirname, agentVersion: AGENT_VERSION }),
-      };
+      }, activeSessionResponse());
     }
     if (op === 'audio_bind' || op === 'audio_lavalier') {
       return { ok: false, disabled: true, reason: 'disabled_would_revert_evo_routing', use: 'audio_evo' };
@@ -906,7 +931,9 @@ async function handleOp(op, body) {
     state.recordingStartedAt = Date.now();
     state.sources = startingSources;
     state.masterActive = MASTER_RECORD;
-    return { ok: true, recording: true, feeds_writing: null };
+    state.sessionRef = sessionValue(body && body.session_ref);
+    state.clientCode = sessionValue(body && body.client_code);
+    return Object.assign({ ok: true, recording: true, feeds_writing: null }, startSessionResponse());
   }
   if (op === 'stop') {
     const sources = sessionSources();
@@ -962,6 +989,7 @@ async function handleOp(op, body) {
       const allStopsSucceeded = stopResults.every((entry) => entry.vendor.success);
       const saved = allStopsSucceeded && masterStop.success && filesStable;
       const recordingStartedAt = state.recordingStartedAt;
+      const sessionRef = state.sessionRef;
       let uploadQueued = 0;
 
       if (uploadQueue && OBS_RECORD_DIR) {
@@ -974,7 +1002,7 @@ async function handleOp(op, body) {
               const newest = getNewestFileSample(sourceDir);
               if (!newest || !newest.absPath) continue;
               if (newest.mtimeMs < (recordingStartedAt - 60000)) continue;
-              const out = uploadQueue.enqueue({ filePath: newest.absPath, source });
+              const out = uploadQueue.enqueue({ filePath: newest.absPath, source, sessionRef });
               if (out && out.queued) uploadQueued += 1;
             } catch (e) {
               console.warn('[es-mini-agent] upload enqueue failed source=' + source + ':', e && (e.stack || e.message || e));
@@ -982,7 +1010,7 @@ async function handleOp(op, body) {
           }
           if (masterWasActive && masterStop.success && masterStop.outputPath) {
             try {
-              const out = uploadQueue.enqueue({ filePath: masterStop.outputPath, source: MASTER_SOURCE });
+              const out = uploadQueue.enqueue({ filePath: masterStop.outputPath, source: MASTER_SOURCE, sessionRef });
               if (out && out.queued) uploadQueued += 1;
             } catch (e) {
               console.warn('[es-mini-agent] upload enqueue failed source=' + MASTER_SOURCE + ':', e && (e.stack || e.message || e));
@@ -999,6 +1027,8 @@ async function handleOp(op, body) {
       state.recordingStartedAt = null;
       state.sources = null;
       state.masterActive = false;
+      state.sessionRef = null;
+      state.clientCode = null;
       if (pendingSources) {
         applySources(pendingSources);
       }
@@ -1066,6 +1096,8 @@ async function handleOp(op, body) {
       state.recordingStartedAt = null;
       state.sources = null;
       state.masterActive = false;
+      state.sessionRef = null;
+      state.clientCode = null;
       if (pendingSources) {
         applySources(pendingSources);
       }
@@ -1081,12 +1113,12 @@ async function handleOp(op, body) {
     }
     const sampled = sampleFeedsWriting(sources, OBS_RECORD_DIR, feedsPrevSamples);
     feedsPrevSamples = sampled.samples;
-    const out = { ok: true, recording: true, feeds_writing: sampled.count, preview: previewActive(), sources: sources.slice(), master_active: masterActive, master_enabled: MASTER_RECORD };
+    const out = Object.assign({ ok: true, recording: true, feeds_writing: sampled.count, preview: previewActive(), sources: sources.slice(), master_active: masterActive, master_enabled: MASTER_RECORD }, activeSessionResponse());
     if (uploadQueue) out.uploads = uploadQueue.status();
     return out;
   }
   if (op === 'diag') {
-    const out = { ok: true, demo: false, recording: state.recording, stats: null, filters: null, master_active: false, master_enabled: MASTER_RECORD };
+    const out = Object.assign({ ok: true, demo: false, recording: state.recording, stats: null, filters: null, master_active: false, master_enabled: MASTER_RECORD }, activeSessionResponse());
     out.storage = {
       bucket: STORAGE_BUCKET,
       region: STORAGE_REGION,

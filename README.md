@@ -26,6 +26,7 @@ Core + optional env vars:
 | `OBS_SOURCES`        | no       | `cam1,cam2`                   | optional — enables real OBS control; omit for demo mode |
 | `OBS_RECORD_DIR`     | no       | `~/es-mini-obs-recordings`    | optional in demo mode; required when `OBS_SOURCES` is set |
 | `MASTER_RECORD`      | no       | `1`                           | defaults to `1` when `OBS_SOURCES` is set; use `0` to disable the OBS main recording rollback |
+| `AUDIO_SPLIT`        | no       | `1` with master recording     | split confirmed master audio tracks; use `0` to keep the master but skip mic files |
 
 Copy `.env.example` for local dev, or edit the `EnvironmentVariables` dict in `com.es.mini-agent.plist` for launchd.
 
@@ -136,6 +137,10 @@ When R2 credentials are configured (`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, 
 When `OBS_SOURCES` is configured, the agent also controls OBS's main recording by default (`MASTER_RECORD=1`). The master starts, pauses, resumes, stops, and uploads with the three camera Source Record files as `recordings/<building_id>/master/<filename>`. It is an additional artifact: `cam1`, `cam2`, and `cam3` remain the only camera sources.
 
 OBS must be configured with its main recording enabled for tracks 1–4, hybrid MP4 output, and the recording path `<OBS_RECORD_DIR>/master/`. The master’s 360p video is intentionally uploaded without a 1080p proxy. To roll back immediately, set `MASTER_RECORD=0` and reload the agent; that restores camera-only session behavior without changing OBS.
+
+## Audio split (mic files)
+
+After a master upload confirms, the agent probes its audio streams and stream-copies up to four standalone M4A files: `recordings/<building_id>/audio/<master-base>-mic1.m4a` through `mic4.m4a`. These upload as `kind: audio` and `source: mic<N>`; no audio is re-encoded and audio jobs do not create proxies. Set `AUDIO_SPLIT=0` and reload the agent to roll back only this split while preserving the master upload.
 
 ## Contract (what the Vercel proxy expects back)
 

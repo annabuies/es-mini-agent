@@ -11,6 +11,7 @@ const STABILITY_POLL_MS = 2000;
 const STABILITY_WARN_MS = 60000;
 const MAX_ERROR_LEN = 300;
 const MASTER_SOURCE = 'master';
+const AUDIO_KIND = 'audio';
 let ffmpegBinMemo = null;
 
 function sleep(ms) {
@@ -92,6 +93,10 @@ function createUploadQueue(opts) {
   const webhookUrl = options.webhookUrl;
   const buildingId = String(options.buildingId || '').trim() || 'unknown';
   const uploader = typeof options.uploader === 'function' ? options.uploader : runMultipartUpload;
+  const audioSplit = !!options.audioSplit;
+  const stabilityPollMs = Number.isFinite(options.stabilityPollMs) && options.stabilityPollMs >= 0
+    ? options.stabilityPollMs
+    : STABILITY_POLL_MS;
 
   const queue = [];
   const pendingProxyJobs = [];
@@ -109,10 +114,12 @@ function createUploadQueue(opts) {
   function buildBaseState(job, status) {
     return {
       version: 1,
-      kind: 'recording',
+      kind: job.kind,
       filePath: job.filePath,
       key: job.key,
       source: job.source,
+      sessionRef: job.sessionRef,
+      removeAfterConfirm: job.removeAfterConfirm,
       sizeBytes: null,
       status,
       enqueuedAt: job.enqueuedAt,
@@ -206,7 +213,7 @@ function createUploadQueue(opts) {
         console.warn('[upload-queue] still waiting for stable file size key=' + key + ' file=' + filePath);
         warnAt = Date.now() + STABILITY_WARN_MS;
       }
-      await sleep(STABILITY_POLL_MS);
+      await sleep(stabilityPollMs);
     }
   }
 
@@ -230,6 +237,57 @@ function createUploadQueue(opts) {
         else reject(new Error('ffmpeg exited with code ' + code + (stderrTail ? ': ' + stderrTail : '')));
       });
     });
+  }
+
+  function runFfprobe(args) {
+    return new Promise((resolve, reject) => {
+      const configured = String(process.env.FFPROBE_BIN || '').trim();
+      const ffprobeBin = configured || path.join(path.dirname(resolveFfmpegBin().bin), 'ffprobe');
+      let proc;
+      try {
+        proc = spawn(ffprobeBin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      } catch (e) {
+        reject(e);
+        return;
+      }
+      let stdout = '';
+      let stderrTail = '';
+      proc.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
+      proc.stderr.on('data', (chunk) => { stderrTail = (stderrTail + chunk.toString('utf8')).slice(-MAX_ERROR_LEN); });
+      proc.on('error', reject);
+      proc.on('close', (code) => {
+        if (code === 0) resolve(stdout);
+        else reject(new Error('ffprobe exited with code ' + code + (stderrTail ? ': ' + stderrTail : '')));
+      });
+    });
+  }
+
+  async function splitMasterAudio(job) {
+    if (!audioSplit) {
+      console.log('[upload-queue] audio split disabled key=' + job.key);
+      return;
+    }
+    try {
+      const output = await runFfprobe(['-v', 'error', '-select_streams', 'a', '-show_streams', '-of', 'json', job.filePath]);
+      const parsed = JSON.parse(output);
+      const streamCount = Array.isArray(parsed.streams) ? parsed.streams.length : 0;
+      if (streamCount < 4) console.warn('[upload-queue] WARN: master has ' + streamCount + ' audio streams; splitting available tracks key=' + job.key);
+      const splitCount = Math.min(streamCount, 4);
+      const base = path.basename(job.filePath, path.extname(job.filePath));
+      for (let index = 0; index < splitCount; index += 1) {
+        const mic = 'mic' + (index + 1);
+        const filePath = path.join(path.dirname(job.filePath), base + '-' + mic + '.m4a');
+        // Stream-copy invariant: ffmpeg -c copy; mic tracks are never re-encoded.
+        await runFfmpeg(['-y', '-i', job.filePath, '-map', '0:a:' + index, '-c', 'copy', filePath]);
+        const out = enqueue({ filePath, source: mic, kind: AUDIO_KIND, sessionRef: job.sessionRef, removeAfterConfirm: true });
+        if (!out.queued) {
+          await removeFileIfExists(filePath);
+          console.warn('[upload-queue] audio enqueue skipped source=' + mic + ' key=' + job.key + ' reason=' + out.reason);
+        }
+      }
+    } catch (e) {
+      console.warn('[upload-queue] audio split failed key=' + job.key + ' error=' + truncateError(e && (e.message || e.stack || e)));
+    }
   }
 
   async function runJob(job) {
@@ -268,7 +326,7 @@ function createUploadQueue(opts) {
         isRecording,
         shouldAbort: () => false,
         webhookUrl: typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl,
-        webhookExtra: { kind: 'recording', building_id: buildingId, source: job.source },
+        webhookExtra: { kind: job.kind, building_id: buildingId, source: job.source, session_ref: job.sessionRef },
         abortOnFailure: false,
         deleteObjectAfterVerify: false,
         onProgress: (partial) => {
@@ -282,6 +340,7 @@ function createUploadQueue(opts) {
       });
 
       await removeFileIfExists(job.stateFilePath);
+      if (job.removeAfterConfirm) await removeFileIfExists(job.filePath);
       completedFilePaths.add(job.filePath);
       lastConfirmed = {
         key: summary && summary.key ? summary.key : job.key,
@@ -292,6 +351,9 @@ function createUploadQueue(opts) {
       console.log('[upload-queue] confirmed ' + job.key + ' (' + partsUploaded + ' parts)');
       if (job.source === MASTER_SOURCE) {
         console.log('[upload-queue] proxy skipped for master key=' + job.key);
+        await splitMasterAudio(job);
+      } else if (job.kind === AUDIO_KIND) {
+        console.log('[upload-queue] proxy skipped for audio key=' + job.key);
       } else {
         try {
           maybeMakeProxy(job).catch((e) => {
@@ -358,7 +420,7 @@ function createUploadQueue(opts) {
         isRecording,
         shouldAbort: () => false,
         webhookUrl: undefined,
-        webhookExtra: { kind: 'proxy', building_id: buildingId, source: job.source },
+        webhookExtra: { kind: 'proxy', building_id: buildingId, source: job.source, session_ref: job.sessionRef },
         abortOnFailure: false,
         deleteObjectAfterVerify: false,
       });
@@ -397,6 +459,8 @@ function createUploadQueue(opts) {
     try {
       const filePathRaw = input && input.filePath ? String(input.filePath) : '';
       const source = input && input.source ? String(input.source) : '';
+      const kind = input && input.kind === AUDIO_KIND ? AUDIO_KIND : 'recording';
+      const sessionRef = input && typeof input.sessionRef === 'string' ? input.sessionRef : null;
       if (!filePathRaw || !source) {
         return { queued: false, reason: 'invalid_input' };
       }
@@ -411,11 +475,15 @@ function createUploadQueue(opts) {
         return { queued: false, reason: 'duplicate' };
       }
 
-      const key = 'recordings/' + buildingId + '/' + source + '/' + path.basename(filePath);
+      const keyFolder = kind === AUDIO_KIND ? 'audio' : source;
+      const key = 'recordings/' + buildingId + '/' + keyFolder + '/' + path.basename(filePath);
       const stateFilePath = stateFilePathForKey(key);
       const job = {
         filePath,
         source,
+        kind,
+        sessionRef,
+        removeAfterConfirm: !!(input && input.removeAfterConfirm),
         key,
         stateFilePath,
         enqueuedAt: new Date().toISOString(),
@@ -487,7 +555,7 @@ function createUploadQueue(opts) {
 
           if (sourceExists) {
             const source = stateData.source ? String(stateData.source) : '';
-            const out = enqueue({ filePath: sourceFilePath, source });
+            const out = enqueue({ filePath: sourceFilePath, source, kind: stateData.kind, sessionRef: stateData.sessionRef, removeAfterConfirm: stateData.removeAfterConfirm });
             if (!out.queued) {
               console.warn('[upload-queue] sweep enqueue skipped key=' + String(stateData.key || '?') + ' reason=' + String(out.reason || 'unknown'));
             }

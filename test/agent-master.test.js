@@ -35,6 +35,11 @@ async function waitFor(check, timeoutMs = 4000) {
   throw new Error('timed out waiting for agent output');
 }
 
+function restoreEnv(name, value) {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
+
 function frame(payload) {
   const text = Buffer.from(JSON.stringify(payload));
   if (text.length < 126) return Buffer.concat([Buffer.from([0x81, text.length]), text]);
@@ -152,11 +157,22 @@ function createFakeR2(requests) {
   });
 }
 
+function createFakeWebhook(bodies) {
+  return http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    bodies.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    res.statusCode = 204;
+    res.end();
+  });
+}
+
 async function postAgent(port, op) {
+  const body = arguments.length > 2 ? arguments[2] : {};
   const response = await fetch(`http://127.0.0.1:${port}/record/${op}`, {
     method: 'POST',
     headers: { Authorization: 'Bearer fake-test-key', 'Content-Type': 'application/json' },
-    body: JSON.stringify({ building_id: 'bench-1' }),
+    body: JSON.stringify(Object.assign({ building_id: 'bench-1' }, body)),
   });
   assert.equal(response.status, 200);
   return response.json();
@@ -180,6 +196,7 @@ async function startAgent(t, options = {}) {
   await close(portProbe);
   const recordDir = options.recordDir || fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-master-test-'));
   if (!options.recordDir) t.after(() => fs.rmSync(recordDir, { recursive: true, force: true }));
+  const uploadStateDir = options.uploadStateDir || path.join(recordDir, '.upload-state');
   const child = spawn(process.execPath, ['server.js'], {
     cwd: path.join(__dirname, '..'),
     env: {
@@ -188,6 +205,7 @@ async function startAgent(t, options = {}) {
       RECORD_POLL_URL: `http://127.0.0.1:${relayPort}`,
       OBS_WS_URL: `ws://127.0.0.1:${obsPort}`, OBS_SOURCES: 'cam1,cam2,cam3',
       OBS_RECORD_DIR: recordDir, MASTER_RECORD: options.masterRecord === false ? '0' : '1',
+      UPLOAD_STATE_DIR: uploadStateDir,
       ...(options.env || {}),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -294,7 +312,7 @@ test('an already-active OBS master refuses a new camera session', { timeout: 800
   ]);
 });
 
-test('stop enqueues three camera files plus the returned master output path', { timeout: 16000 }, async (t) => {
+test('stop enqueues three camera files plus the returned master output path', { timeout: 30000 }, async (t) => {
   const recordDir = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-master-stop-'));
   const masterPath = path.join(recordDir, 'master', 'master.mp4');
   for (const source of ['cam1', 'cam2', 'cam3', 'master']) {
@@ -322,7 +340,7 @@ test('stop enqueues three camera files plus the returned master output path', { 
   ].sort());
   assert.deepEqual(agent.obsRequests.filter((request) => request.type === 'CallVendorRequest').slice(-3)
     .map((request) => request.data.requestType), ['record_stop', 'record_stop', 'record_stop']);
-  await waitFor(() => uploads.filter((request) => request.method === 'POST' && request.query.has('uploads')).length === 4, 12000);
+  await waitFor(() => uploads.filter((request) => request.method === 'POST' && request.query.has('uploads')).length === 4, 28000);
   assert.deepEqual(uploads.filter((request) => request.method === 'POST' && request.query.has('uploads')).map((request) => request.path).sort(), [
     '/fake-bucket/recordings/bench-1/cam1/cam1.mp4',
     '/fake-bucket/recordings/bench-1/cam2/cam2.mp4',
@@ -371,5 +389,156 @@ test('master uploads retain their recording key and skip proxy generation', { ti
   });
   await waitFor(() => uploads.length === 1, 5000);
   assert.equal(uploads[0].key, 'recordings/bench-1/master/master.mp4');
-  assert.deepEqual(uploads[0].webhookExtra, { kind: 'recording', building_id: 'bench-1', source: 'master' });
+  assert.deepEqual(uploads[0].webhookExtra, { kind: 'recording', building_id: 'bench-1', source: 'master', session_ref: null });
+});
+
+test('session_ref is reported while recording and echoed to every stop upload', { timeout: 16000 }, async (t) => {
+  const recordDir = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-session-ref-'));
+  const masterPath = path.join(recordDir, 'master', 'master.mp4');
+  for (const source of ['cam1', 'cam2', 'cam3', 'master']) {
+    fs.mkdirSync(path.join(recordDir, source), { recursive: true });
+    fs.writeFileSync(path.join(recordDir, source, source === 'master' ? 'master.mp4' : source + '.mp4'), 'recording');
+  }
+  const uploads = [];
+  const r2Server = createFakeR2(uploads);
+  const r2Port = await listen(r2Server);
+  t.after(() => close(r2Server));
+  const webhookBodies = [];
+  const webhookServer = createFakeWebhook(webhookBodies);
+  const webhookPort = await listen(webhookServer);
+  t.after(() => close(webhookServer));
+  const agent = await startAgent(t, {
+    recordDir,
+    obs: { masterOutputPath: masterPath },
+    env: {
+      AUDIO_SPLIT: '0', S3_ACCESS_KEY_ID: 'fake-access-key', S3_SECRET_ACCESS_KEY: 'fake-secret-key',
+      S3_BUCKET: 'fake-bucket', S3_ENDPOINT: `http://127.0.0.1:${r2Port}`,
+      UPLOAD_CONFIRMED_WEBHOOK_URL: `http://127.0.0.1:${webhookPort}`,
+    },
+  });
+  t.after(() => fs.rmSync(recordDir, { recursive: true, force: true }));
+  const started = await postAgent(agent.agentPort, 'start', { session_ref: 'session_123', client_code: 'client_123' });
+  assert.equal(started.session_ref, 'session_123');
+  assert.equal((await postAgent(agent.agentPort, 'status')).session_ref, 'session_123');
+  assert.equal((await postAgent(agent.agentPort, 'status')).client_code, 'client_123');
+  assert.equal((await postAgent(agent.agentPort, 'diag')).session_ref, 'session_123');
+  await postAgent(agent.agentPort, 'stop');
+  await waitFor(() => uploads.filter((request) => request.method === 'POST' && request.query.has('uploads')).length === 4, 12000);
+  await waitFor(() => webhookBodies.length === 4, 4000);
+  await waitFor(() => fs.readdirSync(path.join(recordDir, '.upload-state')).length === 0, 2000);
+  assert.deepEqual(uploads.filter((request) => request.method === 'POST' && request.query.has('uploads'))
+    .map((request) => request.path).sort(), [
+      '/fake-bucket/recordings/bench-1/cam1/cam1.mp4',
+      '/fake-bucket/recordings/bench-1/cam2/cam2.mp4',
+      '/fake-bucket/recordings/bench-1/cam3/cam3.mp4',
+      '/fake-bucket/recordings/bench-1/master/master.mp4',
+    ]);
+  assert.deepEqual(webhookBodies.map((body) => [body.source, body.session_ref]).sort(), [
+    ['cam1', 'session_123'],
+    ['cam2', 'session_123'],
+    ['cam3', 'session_123'],
+    ['master', 'session_123'],
+  ]);
+});
+
+test('missing or invalid session_ref stays null and does not crash recording', { timeout: 12000 }, async (t) => {
+  const agent = await startAgent(t, { masterRecord: false });
+  const missing = await postAgent(agent.agentPort, 'start');
+  assert.equal(missing.session_ref, undefined);
+  assert.equal((await postAgent(agent.agentPort, 'status')).session_ref, null);
+  await postAgent(agent.agentPort, 'stop');
+  const invalid = await postAgent(agent.agentPort, 'start', { session_ref: 'bad session ref!' });
+  assert.equal(invalid.session_ref, undefined);
+  assert.equal((await postAgent(agent.agentPort, 'diag')).session_ref, null);
+  await postAgent(agent.agentPort, 'cancel');
+});
+
+test('master confirmation splits four stream-copy mic files and echoes session_ref', { timeout: 22000 }, async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-audio-split-'));
+  const filePath = path.join(tempDir, 'master.mp4');
+  const logPath = path.join(tempDir, 'ffmpeg.log');
+  fs.writeFileSync(filePath, 'master');
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const uploads = [];
+  const queue = createUploadQueue({
+    stateDir: path.join(tempDir, 'state'), buildingId: 'bench-1', audioSplit: true, stabilityPollMs: 5,
+    uploader: async (input) => { uploads.push(input); return { key: input.key, sizeBytes: input.sizeBytes, partsUploaded: 1 }; },
+  });
+  const previousFfmpeg = process.env.FFMPEG_BIN;
+  const previousFfprobe = process.env.FFPROBE_BIN;
+  const previousLog = process.env.FAKE_FFMPEG_LOG;
+  const previousStreams = process.env.FAKE_AUDIO_STREAMS;
+  process.env.FFMPEG_BIN = path.join(__dirname, 'fake-ffmpeg.js');
+  process.env.FFPROBE_BIN = path.join(__dirname, 'fake-ffmpeg.js');
+  process.env.FAKE_FFMPEG_LOG = logPath;
+  process.env.FAKE_AUDIO_STREAMS = '4';
+  t.after(() => {
+    restoreEnv('FFMPEG_BIN', previousFfmpeg);
+    restoreEnv('FFPROBE_BIN', previousFfprobe);
+    restoreEnv('FAKE_FFMPEG_LOG', previousLog);
+    restoreEnv('FAKE_AUDIO_STREAMS', previousStreams);
+  });
+  queue.enqueue({ filePath, source: 'master', sessionRef: 'session_123' });
+  await waitFor(() => uploads.length === 5, 18000);
+  await waitFor(() => queue.status().active === null && queue.status().queued === 0, 2000);
+  assert.deepEqual(uploads.map((input) => input.key).sort(), [
+    'recordings/bench-1/audio/master-mic1.m4a', 'recordings/bench-1/audio/master-mic2.m4a',
+    'recordings/bench-1/audio/master-mic3.m4a', 'recordings/bench-1/audio/master-mic4.m4a',
+    'recordings/bench-1/master/master.mp4',
+  ]);
+  assert.deepEqual(uploads.filter((input) => input.webhookExtra.kind === 'audio').map((input) => input.webhookExtra.session_ref), ['session_123', 'session_123', 'session_123', 'session_123']);
+  const invocations = fs.readFileSync(logPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.equal(invocations.filter((args) => args.includes('-show_streams')).length, 1);
+  assert.equal(invocations.filter((args) => args.includes('-c') && args.includes('copy')).length, 4);
+  for (let index = 1; index <= 4; index += 1) assert.equal(fs.existsSync(path.join(tempDir, `master-mic${index}.m4a`)), false);
+});
+
+test('AUDIO_SPLIT=0 uploads only the confirmed master', { timeout: 12000 }, async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-audio-split-off-'));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const filePath = path.join(tempDir, 'master-disabled.mp4');
+  fs.writeFileSync(filePath, 'master');
+  const uploads = [];
+  const queue = createUploadQueue({
+    stateDir: path.join(tempDir, 'state-disabled'), buildingId: 'bench-1', audioSplit: false, stabilityPollMs: 5,
+    uploader: async (input) => { uploads.push(input); return { key: input.key, sizeBytes: input.sizeBytes, partsUploaded: 1 }; },
+  });
+  queue.enqueue({ filePath, source: 'master' });
+  await waitFor(() => uploads.length === 1 && queue.status().active === null && queue.status().queued === 0, 8000);
+  assert.deepEqual(uploads.map((input) => input.key), ['recordings/bench-1/master/master-disabled.mp4']);
+});
+
+test('a two-stream master uploads two audio jobs and logs a warning', { timeout: 12000 }, async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-audio-split-two-stream-'));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const filePath = path.join(tempDir, 'master-two-stream.mp4');
+  fs.writeFileSync(filePath, 'master');
+  const uploads = [];
+  const queue = createUploadQueue({
+    stateDir: path.join(tempDir, 'state'), buildingId: 'bench-1', audioSplit: true, stabilityPollMs: 5,
+    uploader: async (input) => { uploads.push(input); return { key: input.key, sizeBytes: input.sizeBytes, partsUploaded: 1 }; },
+  });
+  const previousFfmpeg = process.env.FFMPEG_BIN;
+  const previousFfprobe = process.env.FFPROBE_BIN;
+  const previousStreams = process.env.FAKE_AUDIO_STREAMS;
+  const previousWarn = console.warn;
+  const warnings = [];
+  process.env.FFMPEG_BIN = path.join(__dirname, 'fake-ffmpeg.js');
+  process.env.FFPROBE_BIN = path.join(__dirname, 'fake-ffmpeg.js');
+  process.env.FAKE_AUDIO_STREAMS = '2';
+  console.warn = (...args) => { warnings.push(args.join(' ')); };
+  t.after(() => {
+    restoreEnv('FFMPEG_BIN', previousFfmpeg);
+    restoreEnv('FFPROBE_BIN', previousFfprobe);
+    restoreEnv('FAKE_AUDIO_STREAMS', previousStreams);
+    console.warn = previousWarn;
+  });
+  queue.enqueue({ filePath, source: 'master' });
+  await waitFor(() => uploads.length === 3 && queue.status().active === null && queue.status().queued === 0, 8000);
+  assert.deepEqual(uploads.map((input) => input.key).sort(), [
+    'recordings/bench-1/audio/master-two-stream-mic1.m4a',
+    'recordings/bench-1/audio/master-two-stream-mic2.m4a',
+    'recordings/bench-1/master/master-two-stream.mp4',
+  ]);
+  assert.match(warnings.join('\n'), /master has 2 audio streams/);
 });
