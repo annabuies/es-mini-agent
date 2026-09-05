@@ -149,7 +149,11 @@ After a master upload confirms, the agent probes its audio streams and stream-co
 - `pause` → `{ ok, paused }`
 - `look` → `{ ok, look, cameras: { cam1: 'ok'|'timeout'|'http_<code>'|'auth_required'|'error' }, reason? }`
 
-`look` requests include `{ building_id, look }`. The agent refuses look changes while a take is recording or paused, recalls mapped cameras in parallel with a three-second timeout per camera, and never moves a camera omitted from the selected look. Auth: `Authorization: Bearer <RECORD_CONTROL_KEY>`.
+`look` requests include `{ building_id, look }`. The agent refuses look changes while a take is recording or paused or while the upload queue is draining, recalls mapped cameras in parallel with a three-second timeout per camera, and never moves a camera omitted from the selected look. Auth: `Authorization: Bearer <RECORD_CONTROL_KEY>`.
+
+`PTZ_HTTP_USER` and `PTZ_HTTP_PASS` remain placeholders for a future authenticated-camera follow-up; current recall does not read them and returns `auth_required` on HTTP 401.
+
+PTZ look support was rebased onto `10fa9a8` on 2026-09-05.
 
 ## OBS control (optional)
 
