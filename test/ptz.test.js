@@ -9,6 +9,7 @@ const {
   normalizeLooks,
   recall,
 } = require('../ptz');
+const { buildAuthorization, parseChallenge } = require('../digest-auth');
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -48,6 +49,30 @@ test('recall classifies ok, timeout, HTTP errors, auth, and network errors', asy
   const closedPort = await listen(closedServer);
   await close(closedServer);
   assert.equal(await recall(`127.0.0.1:${closedPort}`, 1, { timeoutMs: 40 }), 'error');
+});
+
+test('recall distinguishes no configured login from a rejected configured login', async (t) => {
+  const challenge = 'Digest realm="fake-camera", nonce="nonce", qop="auth", algorithm=MD5';
+  const server = http.createServer((req, res) => {
+    const cnonce = req.headers.authorization && /cnonce="([^"]+)"/.exec(req.headers.authorization)?.[1];
+    const expected = cnonce && buildAuthorization({
+      method: 'GET', uri: req.url, username: 'fake-user', password: 'fake-password',
+      challenge: parseChallenge(challenge), nc: '00000001', cnonce,
+    });
+    if (req.headers.authorization && req.headers.authorization === expected) {
+      res.writeHead(204, { Connection: 'close' });
+      res.end();
+      return;
+    }
+    res.writeHead(401, { 'WWW-Authenticate': challenge, Connection: 'close' });
+    res.end();
+  });
+  const port = await listen(server);
+  t.after(() => close(server));
+  const host = `127.0.0.1:${port}`;
+  assert.equal(await recall(host, 1, { timeoutMs: 200 }), 'auth_required');
+  assert.equal(await recall(host, 1, { timeoutMs: 200, credentials: { username: 'fake-user', password: 'fake-password' } }), 'ok');
+  assert.equal(await recall(host, 1, { timeoutMs: 200, credentials: { username: 'fake-user', password: 'wrong-fake-password' } }), 'auth_failed');
 });
 
 test('executeLook recalls only mapped cameras in parallel and reports each result', async (t) => {

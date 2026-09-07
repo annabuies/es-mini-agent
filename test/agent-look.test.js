@@ -140,6 +140,7 @@ test('demo-mode agent pulls PTZ config and executes a queued look', { timeout: 8
   assert.equal(ptzRequests().length, 3);
   assert.equal(ptzRequests().every((url) => url.endsWith('?ptzcmd&poscall&1')), true);
   assert.equal(cameraRequests.filter((url) => url === '/').length, 3);
+  assert.equal((await postAgent(agentPort, 'diag')).ptz_auth, 'none');
 
   assert.deepEqual(await postAgent(agentPort, 'start'), { ok: true, recording: true, feeds_writing: null });
   assert.deepEqual(await postAgent(agentPort, 'look', { look: '2' }), {

@@ -21,7 +21,7 @@ const { probeCameras } = require('./cam-reach');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.09.07-3';
+const AGENT_VERSION = '2026.09.07-4';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -29,6 +29,9 @@ const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubuserconten
 const PORT = parseInt(process.env.PORT || '8787', 10);
 const RECORD_CONTROL_KEY = process.env.RECORD_CONTROL_KEY;
 const BUILDING_ID = process.env.BUILDING_ID;
+const PTZ_HTTP_USER = process.env.PTZ_HTTP_USER || '';
+const PTZ_HTTP_PASS = process.env.PTZ_HTTP_PASS || '';
+const PTZ_CREDENTIALS = PTZ_HTTP_USER ? { username: PTZ_HTTP_USER, password: PTZ_HTTP_PASS } : null;
 // Optional: outbound poll target. Defaults to the app's stable public URL so
 // Robbie's existing install command (which only sets BUILDING_ID and
 // RECORD_CONTROL_KEY) keeps working unchanged after this update.
@@ -867,7 +870,7 @@ async function handleOp(op, body) {
   if (op === 'look') {
     const queueStatus = uploadQueue ? uploadQueue.status() : null;
     const uploading = !!(queueStatus && (queueStatus.queued > 0 || queueStatus.active));
-    return await executeLook({ ...state, uploading }, body && body.look, { timeoutMs: 3000 });
+    return await executeLook({ ...state, uploading }, body && body.look, { timeoutMs: 3000, credentials: PTZ_CREDENTIALS });
   }
 
   if (!OBS_MODE_ACTIVE) {
@@ -919,6 +922,7 @@ async function handleOp(op, body) {
         filters: null,
         master_active: false,
         master_enabled: false,
+        ptz_auth: PTZ_CREDENTIALS ? 'configured' : 'none',
         version: getVersionBlock({ projectDir: __dirname, agentVersion: AGENT_VERSION }),
       }, activeSessionResponse());
     }
@@ -1181,6 +1185,7 @@ async function handleOp(op, body) {
       credentials: storageCredentialsProvider.describeCredentials(),
     };
     out.ffmpeg = resolveFfmpegBin();
+    out.ptz_auth = PTZ_CREDENTIALS ? 'configured' : 'none';
     // Sits alongside storage/ffmpeg deliberately: all three are assigned before
     // the OBS call below, so they still come back on a machine whose OBS is down.
     out.version = getVersionBlock({ projectDir: __dirname, agentVersion: AGENT_VERSION });

@@ -1,6 +1,6 @@
 'use strict';
 
-const http = require('http');
+const { requestWithDigest } = require('./digest-auth');
 
 const DEFAULT_TIMEOUT_MS = 3000;
 const SAFE_HOST_RE = /^[A-Za-z0-9.-]+(?::[0-9]{1,5})?$/;
@@ -52,40 +52,18 @@ function recall(host, preset, options) {
   const url = `http://${rawHost}/cgi-bin/ptzctrl.cgi?ptzcmd&poscall&${preset}`;
   console.log(`[es-mini-agent] ptz: GET ${url}`);
 
-  return new Promise((resolve) => {
-    let settled = false;
-    let timedOut = false;
-    const finish = (status) => {
-      if (settled) return;
-      settled = true;
-      resolve(status);
-    };
-
-    let request;
-    try {
-      request = http.get(url, (response) => {
-        response.resume();
-        if (response.statusCode === 401) {
-          finish('auth_required');
-          return;
-        }
-        if (response.statusCode >= 200 && response.statusCode < 300) {
-          finish('ok');
-          return;
-        }
-        finish(Number.isInteger(response.statusCode) ? `http_${response.statusCode}` : 'error');
-      });
-    } catch (_) {
-      finish('error');
-      return;
-    }
-
-    request.setTimeout(timeoutMs, () => {
-      timedOut = true;
-      request.destroy();
-    });
-    request.on('error', () => finish(timedOut ? 'timeout' : 'error'));
-  });
+  const credentials = options && options.credentials;
+  return requestWithDigest({
+    url,
+    username: credentials && credentials.username,
+    password: credentials && credentials.password,
+    timeoutMs,
+  }).then((result) => {
+    if (result.timedOut) return 'timeout';
+    if (result.statusCode >= 200 && result.statusCode < 300) return 'ok';
+    if (result.statusCode === 401) return result.attempted ? 'auth_failed' : 'auth_required';
+    return Number.isInteger(result.statusCode) ? `http_${result.statusCode}` : 'error';
+  }).catch(() => 'error');
 }
 
 async function executeLook(config, look, options) {
@@ -117,7 +95,10 @@ async function executeLook(config, look, options) {
     const camera = byName.get(cameraName);
     if (!camera) return [cameraName, 'error'];
     try {
-      return [cameraName, await recallFn(camera.host, preset, { timeoutMs: timeoutMs || DEFAULT_TIMEOUT_MS })];
+      return [cameraName, await recallFn(camera.host, preset, {
+        timeoutMs: timeoutMs || DEFAULT_TIMEOUT_MS,
+        credentials: options && options.credentials,
+      })];
     } catch (_) {
       return [cameraName, 'error'];
     }

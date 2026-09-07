@@ -46,6 +46,11 @@
         <string>REPLACE_ME_WITH_REAL_SECRET</string>
         <key>BUILDING_ID</key>
         <string>REPLACE_ME_e_g_bench-1</string>
+        <!-- camera web-UI admin login; lives only on this Mini -->
+        <key>PTZ_HTTP_USER</key>
+        <string></string>
+        <key>PTZ_HTTP_PASS</key>
+        <string></string>
         <key>OBS_WS_URL</key>
         <string>ws://127.0.0.1:4455</string>
         <key>OBS_WS_PASSWORD</key>

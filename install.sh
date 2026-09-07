@@ -43,6 +43,9 @@ S3_ENDPOINT="${S3_ENDPOINT:-${R2_ENDPOINT:-}}"
 S3_REGION="${S3_REGION:-}"
 AWS_ROLE_ARN="${AWS_ROLE_ARN:-}"
 UPLOAD_CONFIRMED_WEBHOOK_URL="${UPLOAD_CONFIRMED_WEBHOOK_URL:-}"
+# Optional camera web-UI admin login; lives only on this Mini.
+PTZ_HTTP_USER="${PTZ_HTTP_USER:-}"
+PTZ_HTTP_PASS="${PTZ_HTTP_PASS:-}"
 REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/annabuies/es-mini-agent/main}"
 
 if [[ -z "$BUILDING_ID" || -z "$RECORD_CONTROL_KEY" ]]; then
@@ -251,6 +254,8 @@ LOG_ERR_X="$(xml_escape "$LOG_ERR")"
 PORT_X="$(xml_escape "$PORT")"
 KEY_X="$(xml_escape "$RECORD_CONTROL_KEY")"
 BID_X="$(xml_escape "$BUILDING_ID")"
+PTZ_HTTP_USER_X="$(xml_escape "$PTZ_HTTP_USER")"
+PTZ_HTTP_PASS_X="$(xml_escape "$PTZ_HTTP_PASS")"
 OBS_SOURCES_X="$(xml_escape "$OBS_SOURCES")"
 OBS_WS_URL_X="$(xml_escape "$OBS_WS_URL")"
 OBS_WS_PASSWORD_X="$(xml_escape "$OBS_WS_PASSWORD")"
@@ -293,6 +298,11 @@ cat > "$TMP_PLIST" <<PLIST
         <string>${KEY_X}</string>
         <key>BUILDING_ID</key>
         <string>${BID_X}</string>
+        <!-- camera web-UI admin login; lives only on this Mini -->
+        <key>PTZ_HTTP_USER</key>
+        <string>${PTZ_HTTP_USER_X}</string>
+        <key>PTZ_HTTP_PASS</key>
+        <string>${PTZ_HTTP_PASS_X}</string>
         <key>OBS_SOURCES</key>
         <string>${OBS_SOURCES_X}</string>
         <key>OBS_WS_URL</key>
