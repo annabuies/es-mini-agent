@@ -30,6 +30,10 @@ Core + optional env vars:
 
 Copy `.env.example` for local dev, or edit the `EnvironmentVariables` dict in `com.es.mini-agent.plist` for launchd.
 
+## Fleet heartbeat
+
+The normal authenticated command poll includes a non-blocking heartbeat at most once per minute. It reports the agent release and self-update commit plus bounded recording, upload, and master state; it uses the existing poll URL and needs no new Mini environment variable. A cloud endpoint that has not yet received the matching database migration ignores these query parameters, so staged rollout leaves command polling unchanged.
+
 ## Run locally (quick bench test)
 
 ```bash

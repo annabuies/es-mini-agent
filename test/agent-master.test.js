@@ -180,13 +180,15 @@ async function postAgent(port, op) {
 
 async function startAgent(t, options = {}) {
   const obsRequests = [];
+  const relayRequests = [];
   const obsServer = createFakeObs(obsRequests, options.obs || {});
   const obsPort = await listen(obsServer);
   t.after(() => close(obsServer));
 
   const relayServer = http.createServer((req, res) => {
+    relayRequests.push(new URL(req.url, 'http://127.0.0.1'));
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ command: null }));
+    res.end(JSON.stringify(options.relayResponse || { command: null }));
   });
   const relayPort = await listen(relayServer);
   t.after(() => close(relayServer));
@@ -217,8 +219,23 @@ async function startAgent(t, options = {}) {
   await waitFor(async () => {
     try { return (await fetch(`http://127.0.0.1:${agentPort}/health`)).ok; } catch (_) { return false; }
   });
-  return { agentPort, obsRequests, recordDir };
+  return { agentPort, obsRequests, relayRequests, recordDir };
 }
+
+test('heartbeat is sent on the first poll only once per minute and old poll responses still work', { timeout: 8000 }, async (t) => {
+  const agent = await startAgent(t);
+  await waitFor(() => agent.relayRequests.filter((url) => !url.searchParams.has('want_sources')).length >= 2);
+  const polls = agent.relayRequests.filter((url) => !url.searchParams.has('want_sources'));
+  const [first, second] = polls;
+
+  assert.equal(first.searchParams.get('hb'), '1');
+  assert.equal(first.searchParams.get('v'), '2026.09.07-2');
+  assert.equal(first.searchParams.get('c'), 'unknown');
+  assert.deepEqual(JSON.parse(Buffer.from(first.searchParams.get('state'), 'base64url').toString('utf8')), {
+    recording: false, paused: false, feeds_writing: 0, uploads: 0, master_active: false,
+  });
+  assert.equal(second.searchParams.has('hb'), false);
+});
 
 test('smoke: fake relay and OBS start the three camera recordings', { timeout: 8000 }, async (t) => {
   const obsRequests = [];

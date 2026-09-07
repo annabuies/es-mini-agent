@@ -20,7 +20,7 @@ const { executeLook, normalizeCameras, normalizeLooks } = require('./ptz');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.09.07-1';
+const AGENT_VERSION = '2026.09.07-2';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -1619,6 +1619,34 @@ server.on('clientError', (err, socket) => {
 let polling = false;
 let pollTimer = null;
 let sourcesTimer = null;
+let lastHeartbeatAt = 0;
+
+function heartbeatQuery(now = Date.now()) {
+  if (now - lastHeartbeatAt < 60000) return '';
+  try {
+    const version = getVersionBlock({ projectDir: __dirname, agentVersion: AGENT_VERSION });
+    const queue = uploadQueue ? uploadQueue.status() : null;
+    const heartbeatState = {
+      recording: !!state.recording,
+      paused: !!state.paused,
+      // A poll must never do I/O to sample file growth. The next status/diag
+      // remains the authoritative detailed value while this bounded signal
+      // conveys whether a recording is in progress.
+      feeds_writing: state.recording ? null : 0,
+      uploads: queue && Number.isFinite(queue.queued) ? queue.queued : 0,
+      master_active: !!state.masterActive,
+    };
+    lastHeartbeatAt = now;
+    return '&hb=1&v=' + encodeURIComponent(AGENT_VERSION)
+      + '&c=' + encodeURIComponent(version.commit || 'unknown')
+      + '&state=' + encodeURIComponent(Buffer.from(JSON.stringify(heartbeatState)).toString('base64url'));
+  } catch (e) {
+    // Heartbeat observability is strictly additive: a local encoding failure
+    // must never block or alter the command-poll path.
+    console.warn('[es-mini-agent] relay: heartbeat build failed:', e && (e.message || e));
+    return '';
+  }
+}
 
 async function refreshSources() {
   try {
@@ -1674,7 +1702,7 @@ async function pollOnce() {
   if (polling) return; // network calls are async — belt-and-suspenders reentry guard
   polling = true;
   try {
-    const url = `${RECORD_POLL_URL}/api/record?building_id=${encodeURIComponent(BUILDING_ID)}`;
+    const url = `${RECORD_POLL_URL}/api/record?building_id=${encodeURIComponent(BUILDING_ID)}${heartbeatQuery()}`;
     const getRes = await fetch(url, {
       method: 'GET',
       headers: { 'Authorization': 'Bearer ' + RECORD_CONTROL_KEY },
