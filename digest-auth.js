@@ -68,7 +68,7 @@ function buildAuthorization({ method, uri, username, password, challenge, nc, cn
   return `Digest ${fields.join(', ')}`;
 }
 
-function requestOnce(url, authorization, deadline) {
+function requestOnce(url, authorization, deadline, includeBody) {
   return new Promise((resolve) => {
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
@@ -89,8 +89,14 @@ function requestOnce(url, authorization, deadline) {
         headers: Object.assign({ Connection: 'close' }, authorization ? { Authorization: authorization } : {}),
       }, (response) => {
         const challenge = parseChallenge(response.headers['www-authenticate']);
-        response.resume();
-        response.once('end', () => finish({ statusCode: response.statusCode || null, challenge }));
+        if (!includeBody) {
+          response.resume();
+          response.once('end', () => finish({ statusCode: response.statusCode || null, challenge }));
+          return;
+        }
+        const chunks = [];
+        response.on('data', (chunk) => chunks.push(chunk));
+        response.once('end', () => finish({ statusCode: response.statusCode || null, challenge, body: Buffer.concat(chunks).toString('utf8') }));
       });
     } catch (_) {
       finish({ statusCode: null, error: true });
@@ -101,10 +107,10 @@ function requestOnce(url, authorization, deadline) {
   });
 }
 
-async function requestWithDigest({ url, username, password, timeoutMs }) {
+async function requestWithDigest({ url, username, password, timeoutMs, includeBody = false }) {
   const timeout = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0 ? Math.floor(Number(timeoutMs)) : 3000;
   const deadline = Date.now() + timeout;
-  const first = await requestOnce(url, null, deadline);
+  const first = await requestOnce(url, null, deadline, includeBody);
   const challenged = first.statusCode === 401 && !!first.challenge;
   if (!challenged || !username || !password) return Object.assign(first, { challenged, attempted: false });
   const target = new URL(url);
@@ -113,7 +119,7 @@ async function requestWithDigest({ url, username, password, timeoutMs }) {
     challenge: first.challenge, nc: '00000001',
   });
   if (!authorization) return Object.assign(first, { challenged, attempted: false });
-  const retry = await requestOnce(url, authorization, deadline);
+  const retry = await requestOnce(url, authorization, deadline, includeBody);
   return Object.assign(retry, { challenged: true, attempted: true });
 }
 

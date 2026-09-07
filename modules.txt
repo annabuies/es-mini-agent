@@ -13,3 +13,4 @@ fetch-docs.js
 evo-audio.js
 ptz.js
 digest-auth.js
+cam-settings.js
