@@ -140,7 +140,7 @@ OBS must be configured with its main recording enabled for tracks 1–4, hybrid 
 
 ## Audio split (mic files)
 
-After a master upload confirms, the agent probes its audio streams and stream-copies up to four standalone M4A files: `recordings/<building_id>/audio/<master-base>-mic1.m4a` through `mic4.m4a`. These upload as `kind: audio` and `source: mic<N>`; no audio is re-encoded and audio jobs do not create proxies. Set `AUDIO_SPLIT=0` and reload the agent to roll back only this split while preserving the master upload.
+After a master upload confirms, the agent probes its audio streams and stream-copies up to four standalone M4A files: `recordings/<building_id>/audio/<master-base>-mic1.m4a` through `mic4.m4a`. These upload as `kind: audio` and `source: mic<N>` with `audio/mp4` content type, so browser playback is available through the member link; no audio is re-encoded and audio jobs do not create proxies. Set `AUDIO_SPLIT=0` and reload the agent to roll back only this split while preserving the master upload.
 
 ## Contract (what the Vercel proxy expects back)
 

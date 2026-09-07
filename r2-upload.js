@@ -83,6 +83,10 @@ function contentTypeForKey(key) {
   const lower = String(key || '').toLowerCase();
   if (lower.endsWith('.mkv')) return 'video/x-matroska';
   if (lower.endsWith('.mp4')) return 'video/mp4';
+  if (lower.endsWith('.m4a')) return 'audio/mp4';
+  if (lower.endsWith('.aac')) return 'audio/aac';
+  if (lower.endsWith('.wav')) return 'audio/wav';
+  if (lower.endsWith('.mov')) return 'video/quicktime';
   return null;
 }
 
