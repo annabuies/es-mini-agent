@@ -136,8 +136,10 @@ test('demo-mode agent pulls PTZ config and executes a queued look', { timeout: 8
       cameras: { cam1: 'ok', cam2: 'ok', cam3: 'ok' },
     },
   });
-  assert.equal(cameraRequests.length, 3);
-  assert.equal(cameraRequests.every((url) => url.endsWith('?ptzcmd&poscall&1')), true);
+  const ptzRequests = () => cameraRequests.filter((url) => url.includes('?ptzcmd&poscall&'));
+  assert.equal(ptzRequests().length, 3);
+  assert.equal(ptzRequests().every((url) => url.endsWith('?ptzcmd&poscall&1')), true);
+  assert.equal(cameraRequests.filter((url) => url === '/').length, 3);
 
   assert.deepEqual(await postAgent(agentPort, 'start'), { ok: true, recording: true, feeds_writing: null });
   assert.deepEqual(await postAgent(agentPort, 'look', { look: '2' }), {
@@ -153,7 +155,7 @@ test('demo-mode agent pulls PTZ config and executes a queued look', { timeout: 8
     ok: true, recording: false, feeds_writing: null, preview: false,
     master_active: false, master_enabled: false,
   });
-  assert.equal(cameraRequests.length, 3);
+  assert.equal(ptzRequests().length, 3);
 
   await waitFor(() => /relay: claimed look/.test(childOutput), 1000);
   assert.match(childOutput, /relay: claimed look/);

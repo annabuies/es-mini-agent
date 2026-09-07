@@ -222,19 +222,55 @@ async function startAgent(t, options = {}) {
   return { agentPort, obsRequests, relayRequests, recordDir };
 }
 
-test('heartbeat is sent on the first poll only once per minute and old poll responses still work', { timeout: 8000 }, async (t) => {
+test('heartbeat is sent from cached state on the first poll only once per minute and old poll responses still work', { timeout: 8000 }, async (t) => {
   const agent = await startAgent(t);
   await waitFor(() => agent.relayRequests.filter((url) => !url.searchParams.has('want_sources')).length >= 2);
   const polls = agent.relayRequests.filter((url) => !url.searchParams.has('want_sources'));
   const [first, second] = polls;
 
   assert.equal(first.searchParams.get('hb'), '1');
-  assert.equal(first.searchParams.get('v'), '2026.09.07-2');
+  assert.equal(first.searchParams.get('v'), '2026.09.07-3');
   assert.equal(first.searchParams.get('c'), 'unknown');
-  assert.deepEqual(JSON.parse(Buffer.from(first.searchParams.get('state'), 'base64url').toString('utf8')), {
+  const heartbeatState = JSON.parse(Buffer.from(first.searchParams.get('state'), 'base64url').toString('utf8'));
+  assert.deepEqual(heartbeatState, {
     recording: false, paused: false, feeds_writing: 0, uploads: 0, master_active: false,
+    cameras_down: [], cameras_checked_at: null,
   });
+  assert.ok(Buffer.byteLength(JSON.stringify(heartbeatState)) < 1024);
   assert.equal(second.searchParams.has('hb'), false);
+});
+
+test('heartbeat reports cached camera reachability without probing from the poll path', { timeout: 8000 }, async (t) => {
+  const cameraRequests = [];
+  const cameraServer = http.createServer((req, res) => {
+    cameraRequests.push(req.url);
+    res.statusCode = 503; // Any HTTP response still proves the camera is reachable.
+    res.end();
+  });
+  const cameraPort = await listen(cameraServer);
+  t.after(() => close(cameraServer));
+
+  const closedServer = http.createServer();
+  const closedPort = await listen(closedServer);
+  await close(closedServer);
+  const agent = await startAgent(t, {
+    relayResponse: {
+      command: null,
+      cameras: [
+        { name: 'cam1', host: `127.0.0.1:${cameraPort}` },
+        { name: 'cam2', host: `127.0.0.1:${closedPort}` },
+      ],
+    },
+  });
+  await waitFor(() => cameraRequests.length === 1);
+  await waitFor(() => agent.relayRequests.filter((url) => !url.searchParams.has('want_sources')).length >= 2);
+  const first = agent.relayRequests.find((url) => !url.searchParams.has('want_sources'));
+  const heartbeatState = JSON.parse(Buffer.from(first.searchParams.get('state'), 'base64url').toString('utf8'));
+
+  assert.deepEqual(heartbeatState.cameras_down, ['cam2']);
+  assert.match(heartbeatState.cameras_checked_at, /^2026-/);
+  assert.ok(Buffer.byteLength(JSON.stringify(heartbeatState)) < 1024);
+  assert.equal(cameraRequests.length, 1);
 });
 
 test('smoke: fake relay and OBS start the three camera recordings', { timeout: 8000 }, async (t) => {

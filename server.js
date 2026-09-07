@@ -16,11 +16,12 @@ const { runSelfUpdate, getVersionBlock } = require('./self-update');
 const { fetchDocs } = require('./fetch-docs');
 const { runAudioEvo } = require('./evo-audio');
 const { executeLook, normalizeCameras, normalizeLooks } = require('./ptz');
+const { probeCameras } = require('./cam-reach');
 
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.09.07-2';
+const AGENT_VERSION = '2026.09.07-3';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -34,6 +35,7 @@ const BUILDING_ID = process.env.BUILDING_ID;
 const RECORD_POLL_URL = process.env.RECORD_POLL_URL || 'https://es-os-app.vercel.app';
 const POLL_INTERVAL_MS = 1000;
 const SOURCES_REFRESH_MS = 60000;
+const CAM_REACH_MS = 60000;
 const PREVIEW_INTERVAL_MS = 500;
 const PREVIEW_TTL_MS = 60000;
 const PREVIEW_WIDTH = 640;
@@ -786,6 +788,9 @@ function applyPtzConfig(data) {
       console.warn('[es-mini-agent] relay: ignoring invalid cameras config');
     } else {
       state.cameras = cameras;
+      refreshCameraReachability().catch((e) => {
+        console.warn('[es-mini-agent] camera reachability refresh failed:', e && (e.message || e));
+      });
     }
   }
 
@@ -1619,7 +1624,25 @@ server.on('clientError', (err, socket) => {
 let polling = false;
 let pollTimer = null;
 let sourcesTimer = null;
+let camReachTimer = null;
 let lastHeartbeatAt = 0;
+let cameraReachability = null;
+let cameraReachabilityBusy = false;
+
+async function refreshCameraReachability() {
+  if (cameraReachabilityBusy) return;
+  if (state.recording) {
+    cameraReachability = { ...(cameraReachability || {}), skipped: 'recording' };
+    return;
+  }
+  if (!Array.isArray(state.cameras) || state.cameras.length === 0) return;
+  cameraReachabilityBusy = true;
+  try {
+    cameraReachability = await probeCameras(state.cameras);
+  } finally {
+    cameraReachabilityBusy = false;
+  }
+}
 
 function heartbeatQuery(now = Date.now()) {
   if (now - lastHeartbeatAt < 60000) return '';
@@ -1635,6 +1658,11 @@ function heartbeatQuery(now = Date.now()) {
       feeds_writing: state.recording ? null : 0,
       uploads: queue && Number.isFinite(queue.queued) ? queue.queued : 0,
       master_active: !!state.masterActive,
+      // Camera reachability is sampled on its own timer: never add I/O here.
+      cameras_down: Array.isArray(cameraReachability && cameraReachability.down)
+        ? cameraReachability.down : [],
+      cameras_checked_at: typeof (cameraReachability && cameraReachability.checked_at) === 'string'
+        ? cameraReachability.checked_at : null,
     };
     lastHeartbeatAt = now;
     return '&hb=1&v=' + encodeURIComponent(AGENT_VERSION)
@@ -1749,7 +1777,11 @@ server.listen(PORT, () => {
   console.log('[es-mini-agent] sources (env): ' + activeSources.join(','));
   pollTimer = setInterval(pollOnce, POLL_INTERVAL_MS);
   sourcesTimer = setInterval(refreshSources, SOURCES_REFRESH_MS);
+  camReachTimer = setInterval(refreshCameraReachability, CAM_REACH_MS);
   refreshSources().catch(() => {});
+  refreshCameraReachability().catch((e) => {
+    console.warn('[es-mini-agent] camera reachability refresh failed:', e && (e.message || e));
+  });
   if (uploadQueue) {
     uploadQueue.sweep().catch((e) => {
       console.warn('[es-mini-agent] upload queue sweep failed:', e && (e.stack || e.message || e));
@@ -1766,6 +1798,10 @@ function shutdown(signal) {
   if (sourcesTimer) {
     clearInterval(sourcesTimer);
     sourcesTimer = null;
+  }
+  if (camReachTimer) {
+    clearInterval(camReachTimer);
+    camReachTimer = null;
   }
   if (previewTimer) {
     clearInterval(previewTimer);
