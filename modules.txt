@@ -3,6 +3,7 @@
 # A file missing from this list is a file the agent will not have after an
 # install or a self-update -- which is exactly how the agent once shipped
 # without aws-creds.js and crash-looped on someone else's machine.
+# 2026-09-09: cam-reach.js was required by server.js since 6d28b9d but never listed; the updater's boot test caught it.
 server.js
 obs-control.js
 r2-upload.js
@@ -12,5 +13,6 @@ self-update.js
 fetch-docs.js
 evo-audio.js
 ptz.js
+cam-reach.js
 digest-auth.js
 cam-settings.js
