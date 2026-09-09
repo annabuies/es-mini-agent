@@ -5,7 +5,7 @@ const fsp = require('fs/promises');
 const path = require('path');
 const { spawn } = require('child_process');
 
-const { runMultipartUpload, signR2Request } = require('./r2-upload');
+const { runMultipartUpload, signS3Request } = require('./storage-upload');
 
 const STABILITY_POLL_MS = 2000;
 const STABILITY_WARN_MS = 60000;
@@ -23,7 +23,7 @@ function toSafeFileName(value) {
     .replace(/[^A-Za-z0-9._-]/g, '_')
     .replace(/_+/g, '_')
     .replace(/^_+/, '')
-    .slice(0, 180) || 'r2_upload';
+    .slice(0, 180) || 'upload';
 }
 
 function truncateError(value) {
@@ -164,7 +164,7 @@ function createUploadQueue(opts) {
           sessionToken = creds.sessionToken || null;
         }
       }
-      const signed = signR2Request({
+      const signed = signS3Request({
         method: 'DELETE',
         key: String(stateData.key),
         query: { uploadId: String(stateData.uploadId) },

@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { contentTypeForKey } = require('../r2-upload');
+const { contentTypeForKey } = require('../storage-upload');
 
 test('contentTypeForKey identifies inline-playable audio and video uploads', () => {
   assert.equal(contentTypeForKey('recordings/bench-1/audio/take-mic1.m4a'), 'audio/mp4');

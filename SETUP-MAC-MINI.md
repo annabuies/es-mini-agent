@@ -128,7 +128,7 @@ The real proof is step 7 (a file appears when recording). This is just an early 
 
 ## Step 6 — Install / refresh the agent with OBS mode ON (you automate)
 
-Run the one-command installer with all the env vars. This downloads the current agent (including `obs-control.js` + `r2-upload.js`), writes a launchd service, and starts it:
+Run the one-command installer with all the env vars. This downloads the current agent (including `obs-control.js` + `storage-upload.js`), writes a launchd service, and starts it:
 
 ```bash
 BUILDING_ID="bench-1" \

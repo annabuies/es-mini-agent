@@ -131,7 +131,7 @@ The uploader automatically pauses whenever a real recording is active (`state.re
 When R2 credentials are configured (`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_ENDPOINT`), real OBS recordings are automatically enqueued for upload on every `stop` call.
 
 - Object key layout: `recordings/<building_id>/<source>/<filename>`
-- Uploads are resumable across agent restarts via `.r2-uploads/*.state.json`
+- Uploads are resumable across agent restarts via `.r2-uploads/*.state.json` (directory name kept for compatibility)
 - Upload part transfer pauses while a recording is active and resumes when recording stops
 - Recording files are never deleted from the Mac mini by this upload path
 - Failed uploads are logged in `agent.log` and surfaced again during boot sweep; failed states are left in place and are not auto-retried

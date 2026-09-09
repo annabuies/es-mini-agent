@@ -85,7 +85,7 @@ fi
 # disagreed, and it crash-looped on a machine nobody could SSH into.
 #
 # Only used if modules.txt is genuinely absent in local mode (a stale checkout).
-FALLBACK_MODULES=(server.js obs-control.js r2-upload.js upload-queue.js aws-creds.js self-update.js cam-reach.js)
+FALLBACK_MODULES=(server.js obs-control.js storage-upload.js upload-queue.js aws-creds.js self-update.js cam-reach.js)
 MODULES=()
 
 parse_manifest() {

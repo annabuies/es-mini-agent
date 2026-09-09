@@ -4,9 +4,10 @@
 # install or a self-update -- which is exactly how the agent once shipped
 # without aws-creds.js and crash-looped on someone else's machine.
 # 2026-09-09: cam-reach.js was required by server.js since 6d28b9d but never listed; the updater's boot test caught it.
+# 2026-09-08: r2-upload.js renamed storage-upload.js (the agent has used S3 since 2026-07-30); the updater leaves the old file in place as dead code.
 server.js
 obs-control.js
-r2-upload.js
+storage-upload.js
 upload-queue.js
 aws-creds.js
 self-update.js

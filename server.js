@@ -10,7 +10,7 @@ const { ObsClient, callVendor, getNewestFileSample, getSourceScreenshot, sampleF
 const crypto = require('crypto');
 const path = require('path');
 const { createUploadQueue, resolveFfmpegBin } = require('./upload-queue');
-const { runMultipartUploadTest, signR2Request } = require('./r2-upload');
+const { runMultipartUploadTest, signS3Request } = require('./storage-upload');
 const { createCredentialsProvider } = require('./aws-creds');
 const { runSelfUpdate, getVersionBlock } = require('./self-update');
 const { fetchDocs } = require('./fetch-docs');
@@ -22,7 +22,7 @@ const { readGolden, restoreCameras, snapshotCameras, writeGolden } = require('./
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.09.08-1';
+const AGENT_VERSION = '2026.09.08-2';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -321,7 +321,7 @@ async function pushPreviewFrames() {
       try {
         const key = `preview/${BUILDING_ID}/${source}.jpg`;
         const creds = await storageCredentialsProvider.getCredentials();
-        const signed = signR2Request({
+        const signed = signS3Request({
           method: 'PUT',
           key,
           query: {},

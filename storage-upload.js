@@ -22,7 +22,7 @@ function hmac(keyPart, data) {
 
 function normalizeEndpoint(endpoint) {
   const raw = String(endpoint || '').trim().replace(/\/+$/, '');
-  if (!raw) throw new Error('r2 endpoint is required');
+  if (!raw) throw new Error('storage endpoint is required');
   if (/^https?:\/\//i.test(raw)) return raw;
   return 'https://' + raw;
 }
@@ -196,7 +196,7 @@ function isAbortError(err) {
   return !!(err && err.code === 'aborted');
 }
 
-function signR2Request({
+function signS3Request({
   method,
   key,
   query,
@@ -349,7 +349,7 @@ async function runMultipartUpload(opts) {
 
   async function signedFetch(method, query, body, extraHeaders) {
     const creds = await resolveRequestCredentials();
-    const signed = signR2Request({
+    const signed = signS3Request({
       method,
       key,
       query,
@@ -508,7 +508,7 @@ async function runMultipartUpload(opts) {
       sizeBytes,
       confirmedAt: new Date().toISOString(),
     }, webhookExtra);
-    console.log('[r2-upload] upload_confirmed:', JSON.stringify(payload));
+    console.log('[upload] upload_confirmed:', JSON.stringify(payload));
     if (options.webhookUrl) {
       try {
         const webhookRes = await fetch(String(options.webhookUrl), {
@@ -518,13 +518,13 @@ async function runMultipartUpload(opts) {
         });
         if (!webhookRes.ok) {
           const detail = truncateDetail(await readResponseTextSafe(webhookRes));
-          console.warn('[r2-upload] upload_confirmed webhook failed status=' + webhookRes.status + ' detail=' + detail);
+          console.warn('[upload] upload_confirmed webhook failed status=' + webhookRes.status + ' detail=' + detail);
         }
       } catch (e) {
-        console.warn('[r2-upload] upload_confirmed webhook error:', e && (e.stack || e.message || e));
+        console.warn('[upload] upload_confirmed webhook error:', e && (e.stack || e.message || e));
       }
     } else {
-      console.log('[r2-upload] UPLOAD_CONFIRMED_WEBHOOK_URL not set - this is the exact hook point for the future Trigger.dev "master upload confirmed" task (see Clients/ES/app/15-camera-mac-mini-capture-handoff.md section 5.4)');
+      console.log('[upload] UPLOAD_CONFIRMED_WEBHOOK_URL not set - this is the exact hook point for the future Trigger.dev "master upload confirmed" task (see Clients/ES/app/15-camera-mac-mini-capture-handoff.md section 5.4)');
     }
 
     summary = {
@@ -555,10 +555,10 @@ async function runMultipartUpload(opts) {
         const abortRes = await signedFetch('DELETE', { uploadId }, null);
         if (!abortRes.ok) {
           const detail = truncateDetail(await readResponseTextSafe(abortRes));
-          console.warn('[r2-upload] AbortMultipartUpload failed status=' + abortRes.status + ' detail=' + detail);
+          console.warn('[upload] AbortMultipartUpload failed status=' + abortRes.status + ' detail=' + detail);
         }
       } catch (abortErr) {
-        console.warn('[r2-upload] AbortMultipartUpload error:', abortErr && (abortErr.stack || abortErr.message || abortErr));
+        console.warn('[upload] AbortMultipartUpload error:', abortErr && (abortErr.stack || abortErr.message || abortErr));
       }
     } else if (fatalError && multipartFinalized && abortOnFailure) {
       // Verify failed after completion: object may already exist and incur cost; best-effort delete.
@@ -613,7 +613,7 @@ async function runMultipartUploadTest(opts) {
 
 module.exports = {
   contentTypeForKey,
-  signR2Request,
+  signS3Request,
   runMultipartUpload,
   runMultipartUploadTest,
 };
