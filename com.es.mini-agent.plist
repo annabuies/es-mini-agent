@@ -81,6 +81,8 @@
         <string>REPLACE_ME_FFMPEG_BIN</string>
         <key>UPLOAD_CONFIRMED_WEBHOOK_URL</key>
         <string></string>
+        <key>RECORD_POLL_URL</key>
+        <string>https://api.evrybdystudios.com</string>
     </dict>
 
     <key>RunAtLoad</key>

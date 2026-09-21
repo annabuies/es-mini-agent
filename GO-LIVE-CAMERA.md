@@ -10,7 +10,7 @@
 
 ## What's already done (don't touch it)
 
-The cloud side is fully wired and is **not** the demo. On Vercel (`es-os-app`), `RECORD_CONTROL_KEY`, `ES_SUPABASE_URL`, `ES_SUPABASE_KEY`, and `RECORD_TARGET_BUILDING_ID=bench-1` are all set. The relay enqueues real commands to Supabase and the mini polls them outbound every second. **Nothing needs a tunnel or an inbound port on this Mac.**
+The cloud side is fully wired and is **not** the demo. On the Cloudflare Worker `es-os-app` (`api.evrybdystudios.com`), `RECORD_CONTROL_KEY`, `ES_SUPABASE_URL`, `ES_SUPABASE_KEY`, and `RECORD_TARGET_BUILDING_ID=bench-1` are all set. The relay enqueues real commands to Supabase and the mini polls them outbound every second. **Nothing needs a tunnel or an inbound port on this Mac.**
 
 **The demo is 100% on this mini:** the agent runs in demo mode whenever `OBS_SOURCES` is empty, and in demo mode every command returns `feeds_writing: null` and touches no camera. This runbook's whole point is to install the camera and reinstall the agent WITH `OBS_SOURCES=cam1`.
 
@@ -22,14 +22,14 @@ The cloud side is fully wired and is **not** the demo. On Vercel (`es-os-app`), 
 
 | Name | Value | Notes |
 |---|---|---|
-| `RECORD_CONTROL_KEY` | `<<GET FROM ANNA>>` | MUST match the value already set on Vercel for `es-os-app`. Anna reveals it in the Vercel dashboard. |
-| `BUILDING_ID` | `bench-1` | This mini's id. Leave as `bench-1` unless Anna says otherwise. It must match `RECORD_TARGET_BUILDING_ID` on Vercel. |
+| `RECORD_CONTROL_KEY` | `<<GET FROM ANNA>>` | MUST match the value already set on the Cloudflare Worker `es-os-app` (`api.evrybdystudios.com`). Anna reveals it in the Cloudflare Worker dashboard. |
+| `BUILDING_ID` | `bench-1` | This mini's id. Leave as `bench-1` unless Anna says otherwise. It must match `RECORD_TARGET_BUILDING_ID` on the Cloudflare Worker `es-os-app`. |
 | `OBS_SOURCES` | `cam1` | The OBS source name for the camera. One word, no spaces. **This is the setting that leaves demo mode.** |
 | `OBS_RECORD_DIR` | `$HOME/es-mini-recordings` | Where OBS writes per-camera folders. |
 | `OBS_WS_PASSWORD` | `<<SET IN STEP 6>>` | The obs-websocket password you set in Step 6. |
 | `OBS_WS_URL` | `ws://127.0.0.1:4455` | Default. Only change if you use a different port. |
 
-If `RECORD_CONTROL_KEY` is still the literal `<<GET FROM ANNA>>` placeholder, **STOP** and ask Anna for it. Nothing works without it, and it must match Vercel exactly.
+If `RECORD_CONTROL_KEY` is still the literal `<<GET FROM ANNA>>` placeholder, **STOP** and ask Anna for it. Nothing works without it, and it must match the Cloudflare Worker `es-os-app` exactly.
 
 ---
 
@@ -172,7 +172,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/annabuies/es-mini-agent/main
 The installer writes a launchd service, starts it, and ends by hitting `http://localhost:8787/health`. On FAILURE, read `~/Documents/es-mini-agent/agent.error.log`, fix the cause (usually a missing env var or OBS not running), and re-run the same command. Then confirm it's healthy and actually polling:
 ```bash
 curl -s http://localhost:8787/health
-tail -n 30 ~/Documents/es-mini-agent/agent.log     # should show: relay: polling https://es-os-app.vercel.app/api/record
+tail -n 30 ~/Documents/es-mini-agent/agent.log     # should show: relay: polling https://api.evrybdystudios.com/api/record
 ```
 
 ---
@@ -219,9 +219,9 @@ Once Step 8 passes:
 
 **Anna's end (from her laptop, no key needed, the relay handles auth):**
 ```bash
-curl -s -X POST https://es-os-app.vercel.app/api/record -H 'Content-Type: application/json' -d '{"op":"start"}'
-curl -s -X POST https://es-os-app.vercel.app/api/record -H 'Content-Type: application/json' -d '{"op":"status"}'
-curl -s -X POST https://es-os-app.vercel.app/api/record -H 'Content-Type: application/json' -d '{"op":"stop"}'
+curl -s -X POST https://api.evrybdystudios.com/api/record -H 'Content-Type: application/json' -d '{"op":"start"}'
+curl -s -X POST https://api.evrybdystudios.com/api/record -H 'Content-Type: application/json' -d '{"op":"status"}'
+curl -s -X POST https://api.evrybdystudios.com/api/record -H 'Content-Type: application/json' -d '{"op":"stop"}'
 ```
 She's looking for `"live": true` and `"feeds_writing": 1` (or higher). `null` = still demo. `"error":"timeout"` = mini asleep or not polling.
 
@@ -245,5 +245,5 @@ Short and honest:
 - **`feeds_writing: 0` while recording** → OBS mode is on but no file is growing. The Source Record filter **Path** doesn't match `<OBS_RECORD_DIR>/cam1/`, or the filter isn't on `cam1`. Re-check Step 5.
 - **Black/frozen preview** → camera light or the NDI/RTSP source, not the agent. Fix the picture in OBS first (Step 4).
 - **Agent won't boot** → `tail -n 50 ~/Documents/es-mini-agent/agent.error.log`. `Cannot find module './obs-control'` means the download was incomplete — re-run Step 7.
-- **Anna gets `"error":"timeout"`** → the mini isn't polling: mini asleep, agent not running (`curl localhost:8787/health`), or wrong `RECORD_CONTROL_KEY` (must match Vercel).
+- **Anna gets `"error":"timeout"`** → the mini isn't polling: mini asleep, agent not running (`curl localhost:8787/health`), or wrong `RECORD_CONTROL_KEY` (must match the Cloudflare Worker `es-os-app`).
 - **Deeper reference:** `SETUP-MAC-MINI.md` in this repo has the original bench walkthrough and the optional R2 upload test (Step 8 there). File transfer/R2 is a **separate, later** gate — do not let it block today's camera proof.

@@ -229,7 +229,7 @@ test('heartbeat is sent from cached state on the first poll only once per minute
   const [first, second] = polls;
 
   assert.equal(first.searchParams.get('hb'), '1');
-  assert.equal(first.searchParams.get('v'), '2026.09.08-2');
+  assert.equal(first.searchParams.get('v'), '2026.09.21-1');
   assert.equal(first.searchParams.get('c'), 'unknown');
   const heartbeatState = JSON.parse(Buffer.from(first.searchParams.get('state'), 'base64url').toString('utf8'));
   assert.deepEqual(heartbeatState, {
