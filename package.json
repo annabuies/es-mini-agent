@@ -2,7 +2,7 @@
   "name": "es-mini-agent",
   "version": "0.1.0",
   "private": true,
-  "description": "EVRYBDY Studios FLEET — Mini-side HTTP agent. Zero-dependency Node service that the Vercel proxy talks to, with optional OBS Source Record control and demo-mode fallback.",
+  "description": "EVRYBDY Studios FLEET — Mini-side HTTP agent. Zero-dependency Node service that the Cloudflare Worker (api.evrybdystudios.com) talks to, with optional OBS Source Record control and demo-mode fallback.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

@@ -12,7 +12,7 @@
 
 | Name | Value | Notes |
 |---|---|---|
-| `RECORD_CONTROL_KEY` | `<<RECORD_CONTROL_KEY>>` | MUST match what's set on Vercel for es-os-app. Secret. |
+| `RECORD_CONTROL_KEY` | `<<RECORD_CONTROL_KEY>>` | MUST match what's set on the Cloudflare Worker `es-os-app` (`api.evrybdystudios.com`). Secret. |
 | `BUILDING_ID` | `bench-1` | The bench mini's id. Leave as `bench-1` unless Anna says otherwise. |
 | `OBS_SOURCES` | `cam1` | The OBS source name for the first camera. One name, no spaces. |
 | `OBS_RECORD_DIR` | `$HOME/es-mini-recordings` | Where OBS writes per-source folders. |

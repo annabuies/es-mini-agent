@@ -13,6 +13,7 @@
 #
 # Optional:
 #   PORT=8787           # port the agent listens on
+#   RECORD_POLL_URL     # OS record poll host (default https://api.evrybdystudios.com)
 #   AUTO_TUNNEL=1       # also start a cloudflared quick tunnel at the end
 
 set -euo pipefail
@@ -29,6 +30,9 @@ err()  { printf '%s[error]%s %s\n' "$RED" "$RST" "$*" 1>&2; }
 : "${BUILDING_ID:=}"
 : "${RECORD_CONTROL_KEY:=}"
 PORT="${PORT:-8787}"
+# Outbound OS record poll. Persist this in the plist so a reinstall cannot
+# silently fall back to the retired Vercel host. Override only if Anna says so.
+RECORD_POLL_URL="${RECORD_POLL_URL:-https://api.evrybdystudios.com}"
 AUTO_TUNNEL="${AUTO_TUNNEL:-0}"
 # Optional OBS control (empty OBS_SOURCES => demo mode, unchanged behavior).
 OBS_SOURCES="${OBS_SOURCES:-}"
@@ -63,6 +67,7 @@ If you already cloned the repo, run it directly from inside the repo folder:
 
 Optional:
   PORT=8787           (defaults to 8787)
+  RECORD_POLL_URL     (defaults to https://api.evrybdystudios.com)
   AUTO_TUNNEL=1       (also start a cloudflared quick tunnel and print the public URL)
 
 EOF
@@ -268,6 +273,7 @@ S3_REGION_X="$(xml_escape "$S3_REGION")"
 AWS_ROLE_ARN_X="$(xml_escape "$AWS_ROLE_ARN")"
 FFMPEG_BIN_X="$(xml_escape "$FFMPEG_BIN")"
 UPLOAD_CONFIRMED_WEBHOOK_URL_X="$(xml_escape "$UPLOAD_CONFIRMED_WEBHOOK_URL")"
+RECORD_POLL_URL_X="$(xml_escape "$RECORD_POLL_URL")"
 
 # Write to a temp file first, then move + chmod, so we never leave a
 # world-readable plist containing the secret on disk mid-write.
@@ -327,6 +333,8 @@ cat > "$TMP_PLIST" <<PLIST
         <string>${FFMPEG_BIN_X}</string>
         <key>UPLOAD_CONFIRMED_WEBHOOK_URL</key>
         <string>${UPLOAD_CONFIRMED_WEBHOOK_URL_X}</string>
+        <key>RECORD_POLL_URL</key>
+        <string>${RECORD_POLL_URL_X}</string>
     </dict>
 
     <key>RunAtLoad</key>
@@ -445,7 +453,7 @@ ${CYA}${BOLD}===================================================================
   Tunnel PID    : ${TUNNEL_PID}
   Tunnel log    : ${TUNNEL_LOG}
 
-  Anna will set this as ${BOLD}RECORD_CONTROL_URL${RST} on Vercel.
+  Anna will set this as ${BOLD}RECORD_CONTROL_URL${RST} on the Cloudflare Worker ${BOLD}es-os-app${RST} (api.evrybdystudios.com).
   This is a QUICK tunnel — if this Mac reboots, the URL changes.
   For production, install a named cloudflared tunnel instead.
 
@@ -470,13 +478,16 @@ ${BOLD}What to tell Anna:${RST}
   1. Local agent health URL (on this Mac only):
        ${HEALTH_URL}
 $(if [[ -n "$TUNNEL_URL" ]]; then
-    printf '  2. Public tunnel URL to put in Vercel as RECORD_CONTROL_URL:\n       %s\n' "$TUNNEL_URL"
-    printf '  3. She also sets RECORD_CONTROL_KEY on Vercel to the same secret you used here.\n'
+    printf '  2. Public tunnel URL to put on the Cloudflare Worker es-os-app\n'
+    printf '     (api.evrybdystudios.com) as RECORD_CONTROL_URL:\n       %s\n' "$TUNNEL_URL"
+    printf '  3. She also sets RECORD_CONTROL_KEY on the Cloudflare Worker es-os-app\n'
+    printf '     (api.evrybdystudios.com) to the same secret you used here.\n'
   else
     printf '  2. Anna needs a public URL that reaches this Mac. Once she has one\n'
-    printf '     (e.g. a cloudflared tunnel URL), she sets it on Vercel as\n'
-    printf '     RECORD_CONTROL_URL, and sets RECORD_CONTROL_KEY on Vercel to the\n'
-    printf '     same secret you used here. That flips the app live.\n'
+    printf '     (e.g. a cloudflared tunnel URL), she sets it on the Cloudflare\n'
+    printf '     Worker es-os-app (api.evrybdystudios.com) as RECORD_CONTROL_URL,\n'
+    printf '     and sets RECORD_CONTROL_KEY there to the same secret you used\n'
+    printf '     here. That flips the app live.\n'
   fi)
 
 EOF

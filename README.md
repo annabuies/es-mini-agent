@@ -2,7 +2,7 @@
 
 **This agent proves the app-to-Mini connection is real. It now supports optional OBS Source Record control while keeping the existing in-memory demo mode as the default fallback.**
 
-Small zero-dependency Node HTTP service that runs on a FLEET Mac Mini (or a bench-test Mac standing in for one). The Vercel proxy at `es-os-app/api/record.js` forwards record and PTZ look commands here once `RECORD_CONTROL_KEY` is set. If OBS env vars are omitted, the legacy demo/mock recording path remains unchanged; PTZ look recall remains available from remotely supplied building config.
+Small zero-dependency Node HTTP service that runs on a FLEET Mac Mini (or a bench-test Mac standing in for one). The Cloudflare Worker at `api.evrybdystudios.com` (`es-os-app`) forwards record and PTZ look commands here once `RECORD_CONTROL_KEY` is set. If OBS env vars are omitted, the legacy demo/mock recording path remains unchanged; PTZ look recall remains available from remotely supplied building config.
 
 ## Requirements
 
@@ -19,8 +19,9 @@ Core + optional env vars:
 | var                  | required | example                       | notes |
 |----------------------|----------|-------------------------------|-------|
 | `PORT`               | no       | `8787`                        | default `8787` |
-| `RECORD_CONTROL_KEY` | **yes**  | long random string            | must match the value set on Vercel; agent refuses to start if unset |
+| `RECORD_CONTROL_KEY` | **yes**  | long random string            | must match the value set on the Cloudflare Worker `es-os-app` (`api.evrybdystudios.com`); agent refuses to start if unset |
 | `BUILDING_ID`        | **yes**  | `bench-1`                     | this Mini's identity; one Mini serves exactly one building |
+| `RECORD_POLL_URL`    | no       | `https://api.evrybdystudios.com` | outbound OS record poll host; persisted by `install.sh` so a reinstall cannot fall back to Vercel |
 | `OBS_WS_URL`         | no       | `ws://127.0.0.1:4455`         | optional — enables real OBS control; omit for demo mode |
 | `OBS_WS_PASSWORD`    | no       | `(empty)`                     | optional — enables real OBS control; omit for demo mode |
 | `OBS_SOURCES`        | no       | `cam1,cam2`                   | optional — enables real OBS control; omit for demo mode |
@@ -146,7 +147,7 @@ OBS must be configured with its main recording enabled for tracks 1–4, hybrid 
 
 After a master upload confirms, the agent probes its audio streams and stream-copies up to four standalone M4A files: `recordings/<building_id>/audio/<master-base>-mic1.m4a` through `mic4.m4a`. These upload as `kind: audio` and `source: mic<N>` with `audio/mp4` content type, so browser playback is available through the member link; no audio is re-encoded and audio jobs do not create proxies. Set `AUDIO_SPLIT=0` and reload the agent to roll back only this split while preserving the master upload.
 
-## Contract (what the Vercel proxy expects back)
+## Contract (what the Cloudflare Worker expects back)
 
 - `start`, `status`, `resume` → `{ ok, recording, feeds_writing }` (demo mode keeps `feeds_writing: null`; OBS mode reports a verified count when recording and `0` when idle)
 - `stop` → `{ ok, saved }`
@@ -170,7 +171,7 @@ PTZ look support was rebased onto `10fa9a8` on 2026-09-05.
 ## Install as a launchd LaunchAgent (auto-start + auto-restart)
 
 1. Edit `com.es.mini-agent.plist`:
-   - Replace `REPLACE_ME_WITH_REAL_SECRET` with the same secret you set on Vercel.
+   - Replace `REPLACE_ME_WITH_REAL_SECRET` with the same secret you set on the Cloudflare Worker `es-os-app` (`api.evrybdystudios.com`).
    - Replace `REPLACE_ME_e_g_bench-1` with this Mini's `BUILDING_ID`.
    - Confirm the `ProgramArguments` node path matches `which node` on this Mac. On Apple Silicon w/ Homebrew it is typically `/opt/homebrew/opt/node@24/bin/node`.
 
