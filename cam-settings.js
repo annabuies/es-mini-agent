@@ -36,12 +36,12 @@ function validValue(value, rule) { if (!['string','number'].includes(typeof valu
 function cameraUrl(camera, suffix) { return `http://${camera.host}${suffix}`; }
 function defaultRequest(url, o) { return requestWithDigest({ url, username: o.credentials && o.credentials.username, password: o.credentials && o.credentials.password, timeoutMs: o.timeoutMs, includeBody: true }); }
 function isOk(res) { return res.statusCode >= 200 && res.statusCode < 300; }
-async function readNamespace(camera, ns, o) { const res = await o.requestFn(cameraUrl(camera, ns === 'image' ? '/param.cgi?get_image_conf' : '/param.cgi?get_advance_image_conf'), o); return { res, values: isOk(res) ? parseConf(res.body) : {} }; }
+async function readNamespace(camera, ns, o) { const res = await o.requestFn(cameraUrl(camera, ns === 'image' ? '/cgi-bin/param.cgi?get_image_conf' : '/cgi-bin/param.cgi?get_advance_image_conf'), o); return { res, values: isOk(res) ? parseConf(res.body) : {} }; }
 async function snapshotCameras(cameras, { credentials, timeoutMs = 15000, requestFn = defaultRequest } = {}) {
   const entries = await Promise.all((normalizeCameras(cameras) || []).map(async (camera) => {
     const o = { credentials, timeoutMs, requestFn }, errors = [], image = await readNamespace(camera, 'image', o), advance = await readNamespace(camera, 'advance', o);
     if (!isOk(image.res)) errors.push(`image_${image.res.statusCode || 'error'}`); if (!isOk(advance.res)) errors.push(`advance_${advance.res.statusCode || 'error'}`);
-    const deviceRes = await requestFn(cameraUrl(camera, '/param.cgi?get_device_conf'), o), device = isOk(deviceRes) ? parseConf(deviceRes.body) : null;
+    const deviceRes = await requestFn(cameraUrl(camera, '/cgi-bin/param.cgi?get_device_conf'), o), device = isOk(deviceRes) ? parseConf(deviceRes.body) : null;
     if (!isOk(deviceRes)) errors.push(`device_${deviceRes.statusCode || 'error'}`);
     return [camera.name, { ok: errors.length === 0 || (errors.length === 1 && ['advance_404','device_404'].includes(errors[0])), image: image.values, advance: isOk(advance.res) ? advance.values : null, device, errors }];
   })); return { taken_at: new Date().toISOString(), cameras: Object.fromEntries(entries) };
@@ -58,7 +58,7 @@ async function restoreCameras(cameras, golden, { credentials, timeoutMs = 60000,
     const entries = Object.values(RESTORE_KEY_MAP).filter((e) => { const value = values[e.ns][e.key]; if ((filter && !filter.has(e.key) && !filter.has(e.ns + '.' + e.key)) || !validValue(value, e)) return false; if (e.requires && !e.requires.oneOf.includes(String(values[e.ns][e.requires.key]).toLowerCase())) { skipped.push({ key:e.ns + '.' + e.key, reason:'auto_mode' }); return false; } return true; }).sort((a,b) => Number(!['wb_mode','exposure_mode'].includes(a.key)) - Number(!['wb_mode','exposure_mode'].includes(b.key)));
     const o = { credentials, timeoutMs, requestFn }, before = { image:(await readNamespace(camera,'image',o)).values, advance:(await readNamespace(camera,'advance',o)).values };
     const changed = entries.filter((e) => String(before[e.ns][e.key]) !== String(values[e.ns][e.key])); let applied = 0; const failed = [];
-    for (const e of changed) { const res = await requestFn(cameraUrl(camera, `/ptzctrl.cgi?post_image_value&${encodeURIComponent(e.param)}&${encodeURIComponent(values[e.ns][e.key])}`), o); if (isOk(res)) applied++; else failed.push(e.ns + '.' + e.key); if (delayMs) await sleep(delayMs); }
+    for (const e of changed) { const res = await requestFn(cameraUrl(camera, `/cgi-bin/ptzctrl.cgi?post_image_value&${encodeURIComponent(e.param)}&${encodeURIComponent(values[e.ns][e.key])}`), o); if (isOk(res)) applied++; else failed.push(e.ns + '.' + e.key); if (delayMs) await sleep(delayMs); }
     const after = { image:(await readNamespace(camera,'image',o)).values, advance:(await readNamespace(camera,'advance',o)).values }; let verified = 0; for (const e of changed) if (String(after[e.ns][e.key]) === String(values[e.ns][e.key])) verified++;
     results[camera.name] = { ok: failed.length === 0 && verified === applied, applied, verified, failed, skipped, unmapped };
   } return { ok: Object.values(results).every((item) => item.ok), cameras:results };
