@@ -15,5 +15,6 @@ fetch-docs.js
 evo-audio.js
 ptz.js
 cam-reach.js
+disk-usage.js
 digest-auth.js
 cam-settings.js

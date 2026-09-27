@@ -229,15 +229,41 @@ test('heartbeat is sent from cached state on the first poll only once per minute
   const [first, second] = polls;
 
   assert.equal(first.searchParams.get('hb'), '1');
-  assert.equal(first.searchParams.get('v'), '2026.09.21-1');
+  assert.equal(first.searchParams.get('v'), '2026.09.27-1');
   assert.equal(first.searchParams.get('c'), 'unknown');
   const heartbeatState = JSON.parse(Buffer.from(first.searchParams.get('state'), 'base64url').toString('utf8'));
   assert.deepEqual(heartbeatState, {
     recording: false, paused: false, feeds_writing: 0, uploads: 0, master_active: false,
     cameras_down: [], cameras_checked_at: null,
+    disk_free_bytes: heartbeatState.disk_free_bytes,
+    disk_total_bytes: heartbeatState.disk_total_bytes,
+    disk_checked_at: heartbeatState.disk_checked_at,
   });
+  assert.equal(typeof heartbeatState.disk_free_bytes, 'number');
+  assert.equal(typeof heartbeatState.disk_total_bytes, 'number');
+  assert.match(heartbeatState.disk_checked_at, /^2026-/);
   assert.ok(Buffer.byteLength(JSON.stringify(heartbeatState)) < 1024);
   assert.equal(second.searchParams.has('hb'), false);
+});
+
+test('heartbeat reports cached disk usage without filesystem I/O from the poll path', { timeout: 8000 }, async (t) => {
+  const statfsLog = path.join(os.tmpdir(), `es-mini-statfs-${process.pid}-${Date.now()}.log`);
+  t.after(() => fs.promises.rm(statfsLog, { force: true }));
+  const agent = await startAgent(t, {
+    env: {
+      NODE_OPTIONS: `--require=${path.join(__dirname, 'statfs-count-hook.js')}`,
+      STATFS_COUNT_LOG: statfsLog,
+    },
+  });
+  await waitFor(() => agent.relayRequests.filter((url) => !url.searchParams.has('want_sources')).length >= 2);
+  const first = agent.relayRequests.find((url) => !url.searchParams.has('want_sources'));
+  const heartbeatState = JSON.parse(Buffer.from(first.searchParams.get('state'), 'base64url').toString('utf8'));
+
+  assert.equal(typeof heartbeatState.disk_free_bytes, 'number');
+  assert.equal(typeof heartbeatState.disk_total_bytes, 'number');
+  assert.match(heartbeatState.disk_checked_at, /^2026-/);
+  assert.ok(Buffer.byteLength(JSON.stringify(heartbeatState)) < 1024);
+  assert.equal((await fs.promises.readFile(statfsLog, 'utf8')).trim().split('\n').length, 1);
 });
 
 test('heartbeat reports cached camera reachability without probing from the poll path', { timeout: 8000 }, async (t) => {
