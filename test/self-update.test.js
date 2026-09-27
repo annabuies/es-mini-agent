@@ -66,11 +66,16 @@ test('self-update stages storage-upload, boots it, and leaves the old upload mod
     assert.equal(result.ok, true, result.detail);
     assert.equal(result.updated, true);
     assert.ok(result.modules.includes('storage-upload.js'));
+    assert.ok(result.modules.includes('disk-usage.js'));
     assert.equal(result.modules.includes(oldUploadModuleName), false);
     assert.equal(await fs.readFile(staleModule, 'utf8'), staleContents);
     assert.equal(
       await fs.readFile(path.join(projectDir, 'storage-upload.js'), 'utf8'),
       await fs.readFile(path.join(sourceDir, 'storage-upload.js'), 'utf8')
+    );
+    assert.equal(
+      await fs.readFile(path.join(projectDir, 'disk-usage.js'), 'utf8'),
+      await fs.readFile(path.join(sourceDir, 'disk-usage.js'), 'utf8')
     );
   } finally {
     global.fetch = originalFetch;

@@ -8,6 +8,7 @@ const http = require('http');
 const fs = require('fs');
 const { ObsClient, callVendor, getNewestFileSample, getSourceScreenshot, sampleFeedsWriting } = require('./obs-control');
 const crypto = require('crypto');
+const os = require('os');
 const path = require('path');
 const { createUploadQueue, resolveFfmpegBin } = require('./upload-queue');
 const { runMultipartUploadTest, signS3Request } = require('./storage-upload');
@@ -18,11 +19,12 @@ const { runAudioEvo } = require('./evo-audio');
 const { executeLook, normalizeCameras, normalizeLooks } = require('./ptz');
 const { probeCameras } = require('./cam-reach');
 const { readGolden, restoreCameras, snapshotCameras, writeGolden } = require('./cam-settings');
+const { sampleDiskUsage } = require('./disk-usage');
 
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.09.21-1';
+const AGENT_VERSION = '2026.09.27-1';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -40,6 +42,7 @@ const RECORD_POLL_URL = process.env.RECORD_POLL_URL || 'https://api.evrybdystudi
 const POLL_INTERVAL_MS = 1000;
 const SOURCES_REFRESH_MS = 60000;
 const CAM_REACH_MS = 60000;
+const DISK_USAGE_MS = 5 * 60 * 1000;
 const PREVIEW_INTERVAL_MS = 500;
 const PREVIEW_TTL_MS = 60000;
 const PREVIEW_WIDTH = 640;
@@ -1651,9 +1654,12 @@ let polling = false;
 let pollTimer = null;
 let sourcesTimer = null;
 let camReachTimer = null;
+let diskUsageTimer = null;
 let lastHeartbeatAt = 0;
 let cameraReachability = null;
 let cameraReachabilityBusy = false;
+let diskUsage = null;
+let diskUsageBusy = false;
 
 async function refreshCameraReachability() {
   if (cameraReachabilityBusy) return;
@@ -1667,6 +1673,23 @@ async function refreshCameraReachability() {
     cameraReachability = await probeCameras(state.cameras);
   } finally {
     cameraReachabilityBusy = false;
+  }
+}
+
+async function refreshDiskUsage() {
+  if (diskUsageBusy) return;
+  diskUsageBusy = true;
+  try {
+    const homeDir = os.homedir();
+    const dirs = [OBS_RECORD_DIR, homeDir && path.join(homeDir, 'es-mini-recordings'), homeDir]
+      .filter((dir, index, all) => dir && all.indexOf(dir) === index);
+    diskUsage = null;
+    for (const dir of dirs) {
+      diskUsage = await sampleDiskUsage(dir);
+      if (diskUsage) break;
+    }
+  } finally {
+    diskUsageBusy = false;
   }
 }
 
@@ -1689,6 +1712,13 @@ function heartbeatQuery(now = Date.now()) {
         ? cameraReachability.down : [],
       cameras_checked_at: typeof (cameraReachability && cameraReachability.checked_at) === 'string'
         ? cameraReachability.checked_at : null,
+      // Disk usage is sampled on its own timer: never add I/O here.
+      disk_free_bytes: Number.isFinite(diskUsage && diskUsage.free_bytes)
+        ? diskUsage.free_bytes : null,
+      disk_total_bytes: Number.isFinite(diskUsage && diskUsage.total_bytes)
+        ? diskUsage.total_bytes : null,
+      disk_checked_at: typeof (diskUsage && diskUsage.checked_at) === 'string'
+        ? diskUsage.checked_at : null,
     };
     lastHeartbeatAt = now;
     return '&hb=1&v=' + encodeURIComponent(AGENT_VERSION)
@@ -1804,9 +1834,14 @@ server.listen(PORT, () => {
   pollTimer = setInterval(pollOnce, POLL_INTERVAL_MS);
   sourcesTimer = setInterval(refreshSources, SOURCES_REFRESH_MS);
   camReachTimer = setInterval(refreshCameraReachability, CAM_REACH_MS);
+  diskUsageTimer = setInterval(refreshDiskUsage, DISK_USAGE_MS);
+  diskUsageTimer.unref();
   refreshSources().catch(() => {});
   refreshCameraReachability().catch((e) => {
     console.warn('[es-mini-agent] camera reachability refresh failed:', e && (e.message || e));
+  });
+  refreshDiskUsage().catch((e) => {
+    console.warn('[es-mini-agent] disk usage refresh failed:', e && (e.message || e));
   });
   if (uploadQueue) {
     uploadQueue.sweep().catch((e) => {
@@ -1828,6 +1863,10 @@ function shutdown(signal) {
   if (camReachTimer) {
     clearInterval(camReachTimer);
     camReachTimer = null;
+  }
+  if (diskUsageTimer) {
+    clearInterval(diskUsageTimer);
+    diskUsageTimer = null;
   }
   if (previewTimer) {
     clearInterval(previewTimer);
