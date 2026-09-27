@@ -6,6 +6,7 @@
 # 2026-09-09: cam-reach.js was required by server.js since 6d28b9d but never listed; the updater's boot test caught it.
 # 2026-09-08: r2-upload.js renamed storage-upload.js (the agent has used S3 since 2026-07-30); the updater leaves the old file in place as dead code.
 server.js
+log-timestamps.js
 obs-control.js
 storage-upload.js
 upload-queue.js

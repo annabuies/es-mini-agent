@@ -1,5 +1,8 @@
 'use strict';
 
+const { installConsoleTimestamps } = require('./log-timestamps');
+installConsoleTimestamps();
+
 // EVRYBDY Studios FLEET — Mini-side agent.
 // Proves the app -> Cloudflare Worker (api.evrybdystudios.com) -> Mini connection is real.
 // Optional OBS Source Record control; in-memory demo mode remains the fallback.
@@ -24,7 +27,7 @@ const { sampleDiskUsage } = require('./disk-usage');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.09.27-1';
+const AGENT_VERSION = '2026.09.27-2';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -117,10 +120,9 @@ let cloudflarePreviewOverlay = null;
 let pendingSources = null;
 
 function log(method, path, status, note) {
-  const ts = new Date().toISOString();
   const tag = status < 400 ? 'ok' : 'fail';
   const suffix = note ? ' ' + note : '';
-  console.log(`${ts} ${method} ${path} -> ${status} ${tag}${suffix}`);
+  console.log(`${method} ${path} -> ${status} ${tag}${suffix}`);
 }
 
 function sendJson(res, status, obj) {

@@ -12,6 +12,7 @@ ok()   { printf '%s[ok]%s %s\n' "$GRN" "$RST" "$*"; }
 warn() { printf '%s[warn]%s %s\n' "$YLW" "$RST" "$*"; }
 
 PLIST_PATH="$HOME/Library/LaunchAgents/com.es.mini-agent.plist"
+OBS_LAUNCHER_PLIST_PATH="$HOME/Library/LaunchAgents/com.es.obs-launcher.plist"
 
 # 1. Unload the launchd job (ignore errors — it may not be loaded).
 if [[ -f "$PLIST_PATH" ]]; then
@@ -28,6 +29,17 @@ if [[ -f "$PLIST_PATH" ]]; then
   ok "Removed $PLIST_PATH"
 else
   info "Plist already gone."
+fi
+
+# Remove the optional OBS launcher without stopping an OBS process that is
+# already running.
+if [[ -f "$OBS_LAUNCHER_PLIST_PATH" ]]; then
+  info "Unloading optional OBS launcher..."
+  launchctl unload "$OBS_LAUNCHER_PLIST_PATH" >/dev/null 2>&1 || true
+  rm -f "$OBS_LAUNCHER_PLIST_PATH"
+  ok "Removed $OBS_LAUNCHER_PLIST_PATH"
+else
+  info "Optional OBS launcher already gone."
 fi
 
 # 3. Kill any cloudflared quick tunnel pointed at a local agent.
