@@ -27,7 +27,7 @@ const { sampleDiskUsage } = require('./disk-usage');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.09.27-2';
+const AGENT_VERSION = '2026.09.28-1';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -524,6 +524,45 @@ async function selectCloudflarePreviewCamera(index) {
   }
 }
 
+// Cam1 stopgap, agent side (Robbie 2026-09-26/27): with the live-preview overlay on
+// Camera 1 at Start, cam1's Source Record writes a header-only file (~1.7 KB) while
+// cam2/cam3 record fine; NDI keep-alive did not help. Starting with the overlay on
+// another camera, then switching back, records cam1 normally (hardware-tested by hand).
+// Doing it here covers every start path (phone, kiosk, and any client of this agent).
+const CAM1_PARK_SETTLE_MS = Number(process.env.CAM1_PARK_SETTLE_MS || 500);
+const CAM1_PARK_RESTORE_MS = Number(process.env.CAM1_PARK_RESTORE_MS || 1500);
+
+function cam1PreviewIndex() {
+  const i = activeSources.indexOf('cam1');
+  return i >= 0 ? i : null;
+}
+
+/** Moves the preview overlay off Camera 1. Returns the index to restore, or null if nothing moved. */
+async function parkPreviewOffCam1() {
+  const cam1 = cam1PreviewIndex();
+  if (cam1 === null || !cloudflarePreviewOverlay || cloudflarePreviewCameraIndex !== cam1) return null;
+  const other = activeSources.findIndex((_, i) => i !== cam1);
+  if (other < 0) return null;
+  const moved = await selectCloudflarePreviewCamera(other);
+  if (!moved.ok) {
+    console.warn('[es-mini-agent] [preview] cam1 park failed before start: ' + (moved.reason || 'unknown'));
+    return null;
+  }
+  console.log('[es-mini-agent] [preview] cam1 park: preview moved to ' + activeSources[other] + ' for start');
+  await new Promise((resolve) => setTimeout(resolve, CAM1_PARK_SETTLE_MS));
+  return cam1;
+}
+
+function restorePreviewAfterPark(index, delayMs) {
+  if (index === null) return;
+  const timer = setTimeout(() => {
+    selectCloudflarePreviewCamera(index)
+      .then((r) => console.log('[es-mini-agent] [preview] cam1 park: preview restored to ' + activeSources[index] + (r && r.ok ? '' : ' (failed: ' + (r && r.reason) + ')')))
+      .catch(() => {});
+  }, delayMs);
+  if (timer.unref) timer.unref();
+}
+
 function validCloudflareInputUid(value) {
   return typeof value === 'string' && /^[a-f0-9]{32}$/i.test(value);
 }
@@ -983,12 +1022,14 @@ async function handleOp(op, body) {
       return { ok: false, reason: 'obs_start_failed', detail: truncateDetail(e && (e.message || e)) };
     }
 
+    const parkedPreview = await parkPreviewOffCam1();
     const startResults = await Promise.all(startingSources.map(async (source) => {
       const vendor = await callVendor(client, 'record_start', source);
       return { source, vendor };
     }));
     const failed = startResults.find((entry) => !entry.vendor.success);
     if (failed) {
+      restorePreviewAfterPark(parkedPreview, 0);
       const detail = failed.source + ': ' + (failed.vendor.error || 'unknown_error');
       return { ok: false, reason: 'obs_start_failed', detail: truncateDetail(detail) };
     }
@@ -1004,6 +1045,7 @@ async function handleOp(op, body) {
         if (startError) throw new Error(startError);
       } catch (e) {
         await stopStartedSources(client, startingSources);
+        restorePreviewAfterPark(parkedPreview, 0);
         const detail = 'master: ' + (e && (e.message || e) || 'start_record_failed');
         return { ok: false, reason: 'obs_start_failed', detail: truncateDetail(detail) };
       }
@@ -1017,6 +1059,7 @@ async function handleOp(op, body) {
     state.masterActive = MASTER_RECORD;
     state.sessionRef = sessionValue(body && body.session_ref);
     state.clientCode = sessionValue(body && body.client_code);
+    restorePreviewAfterPark(parkedPreview, CAM1_PARK_RESTORE_MS);
     return Object.assign({ ok: true, recording: true, feeds_writing: null }, startSessionResponse());
   }
   if (op === 'stop') {

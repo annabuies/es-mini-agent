@@ -35,9 +35,9 @@ test('installer removes the stale agent plist and supports the opt-in OBS launch
   assert.match(obsLauncher, /pgrep -x OBS/);
 });
 
-test('agent release version is 2026.09.27-2', () => {
+test('agent release version is 2026.09.28-1', () => {
   const server = fs.readFileSync(path.join(projectDir, 'server.js'), 'utf8');
-  assert.match(server, /const AGENT_VERSION = '2026\.09\.27-2';/);
+  assert.match(server, /const AGENT_VERSION = '2026\.09\.28-1';/);
 });
 
 test('modules.txt lists only .js runtime modules (deployed self-update rejects anything else)', () => {

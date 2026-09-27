@@ -156,7 +156,7 @@ After a master upload confirms, the agent probes its audio streams and stream-co
 
 `look` requests include `{ building_id, look }`. The agent refuses look changes while a take is recording or paused or while the upload queue is draining, recalls mapped cameras in parallel with a three-second timeout per camera, and never moves a camera omitted from the selected look. Auth: `Authorization: Bearer <RECORD_CONTROL_KEY>`.
 
-`PTZ_HTTP_USER` and `PTZ_HTTP_PASS` remain placeholders for a future authenticated-camera follow-up; current recall does not read them and returns `auth_required` on HTTP 401.
+`PTZ_HTTP_USER` and `PTZ_HTTP_PASS` are read (HTTP digest auth for preset recall and camera settings). They live in the env block of the **live** LaunchAgent plist, `~/Library/LaunchAgents/com.es.mini-agent.plist`. The copy that used to sit in `~/Documents/es-mini-agent/` was an env-less template, not the live file (the installer removes it since 2026.09.27-2). Camera HTTP paths are under `/cgi-bin/` (`/cgi-bin/param.cgi`, `/cgi-bin/ptzctrl.cgi`); the bare `/param.cgi` returns 404.
 
 PTZ look support was rebased onto `10fa9a8` on 2026-09-05.
 
