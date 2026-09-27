@@ -117,6 +117,7 @@ let cloudflarePreviewInputUid = null;
 let cloudflarePreviewPlaybackUrl = null;
 let cloudflarePreviewCameraIndex = 0;
 let cloudflarePreviewOverlay = null;
+let startInFlight = false;
 let pendingSources = null;
 
 function log(method, path, status, note) {
@@ -555,7 +556,12 @@ async function parkPreviewOffCam1() {
 
 function restorePreviewAfterPark(index, delayMs) {
   if (index === null) return;
+  const parkedAt = cloudflarePreviewCameraIndex;
+  const overlayAtPark = cloudflarePreviewOverlay;
   const timer = setTimeout(() => {
+    // Only undo our own move: if someone picked another camera or restarted the
+    // preview in the meantime, leave their choice alone.
+    if (cloudflarePreviewCameraIndex !== parkedAt || cloudflarePreviewOverlay !== overlayAtPark) return;
     selectCloudflarePreviewCamera(index)
       .then((r) => console.log('[es-mini-agent] [preview] cam1 park: preview restored to ' + activeSources[index] + (r && r.ok ? '' : ' (failed: ' + (r && r.reason) + ')')))
       .catch(() => {});
@@ -1010,6 +1016,13 @@ async function handleOp(op, body) {
     if (state.recording) {
       return { ok: true, recording: true, feeds_writing: null, already: true };
     }
+    // The HTTP route and the relay poll can both deliver a start; the cam1 park adds a
+    // settle delay, so refuse an overlapping start instead of racing it.
+    if (startInFlight) {
+      return { ok: false, reason: 'start_in_progress' };
+    }
+    startInFlight = true;
+    try {
     if (!OBS_RECORD_DIR) {
       return { ok: false, reason: 'obs_misconfigured' };
     }
@@ -1061,6 +1074,9 @@ async function handleOp(op, body) {
     state.clientCode = sessionValue(body && body.client_code);
     restorePreviewAfterPark(parkedPreview, CAM1_PARK_RESTORE_MS);
     return Object.assign({ ok: true, recording: true, feeds_writing: null }, startSessionResponse());
+    } finally {
+      startInFlight = false;
+    }
   }
   if (op === 'stop') {
     const sources = sessionSources();
