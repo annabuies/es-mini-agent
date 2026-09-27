@@ -91,19 +91,26 @@ async function executeLook(config, look, options) {
   const byName = new Map(cameras.map((camera) => [camera.name, camera]));
   const recallFn = options && typeof options.recallFn === 'function' ? options.recallFn : recall;
   const timeoutMs = options && options.timeoutMs;
+  const now = options && typeof options.now === 'function' ? options.now : Date.now;
   const entries = await Promise.all(Object.entries(looks[lookKey]).map(async ([cameraName, preset]) => {
+    const startedAt = now();
     const camera = byName.get(cameraName);
-    if (!camera) return [cameraName, 'error'];
+    if (!camera) return [cameraName, 'error', Math.max(0, now() - startedAt)];
     try {
-      return [cameraName, await recallFn(camera.host, preset, {
+      const outcome = await recallFn(camera.host, preset, {
         timeoutMs: timeoutMs || DEFAULT_TIMEOUT_MS,
         credentials: options && options.credentials,
-      })];
+      });
+      return [cameraName, outcome, Math.max(0, now() - startedAt)];
     } catch (_) {
-      return [cameraName, 'error'];
+      return [cameraName, 'error', Math.max(0, now() - startedAt)];
     }
   }));
-  const results = Object.fromEntries(entries);
+  const results = Object.fromEntries(entries.map(([cameraName, outcome]) => [cameraName, outcome]));
+
+  console.log(`[es-mini-agent] ptz: look ${lookKey} -> ${entries
+    .map(([cameraName, outcome, elapsedMs]) => `${cameraName} ${outcome} ${elapsedMs}ms`)
+    .join(', ')}`);
 
   return {
     ok: entries.every((entry) => entry[1] === 'ok'),

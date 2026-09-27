@@ -29,7 +29,7 @@ Core + optional env vars:
 | `MASTER_RECORD`      | no       | `1`                           | defaults to `1` when `OBS_SOURCES` is set; use `0` to disable the OBS main recording rollback |
 | `AUDIO_SPLIT`        | no       | `1` with master recording     | split confirmed master audio tracks; use `0` to keep the master but skip mic files |
 
-Copy `.env.example` for local dev, or edit the `EnvironmentVariables` dict in `com.es.mini-agent.plist` for launchd.
+Set these variables in your shell for local development. For launchd, pass them to `install.sh`; it generates the live plist at `~/Library/LaunchAgents/com.es.mini-agent.plist`.
 
 ## Fleet heartbeat
 
@@ -170,33 +170,29 @@ PTZ look support was rebased onto `10fa9a8` on 2026-09-05.
 
 ## Install as a launchd LaunchAgent (auto-start + auto-restart)
 
-1. Edit `com.es.mini-agent.plist`:
-   - Replace `REPLACE_ME_WITH_REAL_SECRET` with the same secret you set on the Cloudflare Worker `es-os-app` (`api.evrybdystudios.com`).
-   - Replace `REPLACE_ME_e_g_bench-1` with this Mini's `BUILDING_ID`.
-   - Confirm the `ProgramArguments` node path matches `which node` on this Mac. On Apple Silicon w/ Homebrew it is typically `/opt/homebrew/opt/node@24/bin/node`.
-
-2. Install and load:
+1. Run the installer with the required environment values. It resolves Node, generates the live plist with the full environment block, and loads it:
 
    ```bash
-   cp com.es.mini-agent.plist ~/Library/LaunchAgents/
-   launchctl load ~/Library/LaunchAgents/com.es.mini-agent.plist
+   BUILDING_ID=bench-1 RECORD_CONTROL_KEY='your-long-secret' ./install.sh
    ```
 
-3. Tail logs:
+   Re-run the installer to change launchd environment values. There is deliberately no `com.es.mini-agent.plist` template in the project folder; that stale copy was easy to mistake for the live plist.
+
+2. Tail logs:
 
    ```bash
    tail -f ~/Documents/es-mini-agent/agent.log \
            ~/Documents/es-mini-agent/agent.error.log
    ```
 
-4. Reload after edits:
+3. Reload the generated plist manually if needed:
 
    ```bash
    launchctl unload ~/Library/LaunchAgents/com.es.mini-agent.plist
    launchctl load   ~/Library/LaunchAgents/com.es.mini-agent.plist
    ```
 
-5. Stop for good:
+4. Stop for good, or run `./uninstall.sh` to remove both agent LaunchAgents:
 
    ```bash
    launchctl unload ~/Library/LaunchAgents/com.es.mini-agent.plist

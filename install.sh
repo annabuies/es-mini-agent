@@ -15,8 +15,17 @@
 #   PORT=8787           # port the agent listens on
 #   RECORD_POLL_URL     # OS record poll host (default https://api.evrybdystudios.com)
 #   AUTO_TUNNEL=1       # also start a cloudflared quick tunnel at the end
+#   --obs-launcher      # start OBS safely at login via a separate LaunchAgent
 
 set -euo pipefail
+
+INSTALL_OBS_LAUNCHER=0
+for arg in "$@"; do
+  case "$arg" in
+    --obs-launcher) INSTALL_OBS_LAUNCHER=1 ;;
+    *) printf '[error] Unknown option: %s\n' "$arg" >&2; exit 2 ;;
+  esac
+done
 
 # ---------- pretty output helpers ----------
 BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GRN=$'\033[32m'; YLW=$'\033[33m'; CYA=$'\033[36m'; RST=$'\033[0m'
@@ -69,6 +78,7 @@ Optional:
   PORT=8787           (defaults to 8787)
   RECORD_POLL_URL     (defaults to https://api.evrybdystudios.com)
   AUTO_TUNNEL=1       (also start a cloudflared quick tunnel and print the public URL)
+  --obs-launcher      (start OBS at login without the shutdown-check dialog)
 
 EOF
   exit 1
@@ -90,7 +100,11 @@ fi
 # disagreed, and it crash-looped on a machine nobody could SSH into.
 #
 # Only used if modules.txt is genuinely absent in local mode (a stale checkout).
-FALLBACK_MODULES=(server.js obs-control.js storage-upload.js upload-queue.js aws-creds.js self-update.js cam-reach.js)
+FALLBACK_MODULES=(server.js log-timestamps.js obs-control.js storage-upload.js upload-queue.js aws-creds.js self-update.js cam-reach.js)
+# The OBS launcher files are installer-only assets, NOT runtime modules: an already
+# deployed self-update.js accepts only *.js names in modules.txt and would reject the
+# whole update if they were listed there.
+OBS_LAUNCHER_ASSETS=(obs-launcher.sh com.es.obs-launcher.plist)
 MODULES=()
 
 parse_manifest() {
@@ -147,9 +161,11 @@ else
   for m in "${MODULES[@]}"; do
     download "$m"
   done
-  # Deliberately NOT in the manifest: it is a launchd template, not a runtime
-  # module, and self-update must never touch it.
-  download "com.es.mini-agent.plist"
+  if [[ "${INSTALL_OBS_LAUNCHER:-0}" == "1" ]]; then
+    for a in "${OBS_LAUNCHER_ASSETS[@]}"; do
+      download "$a"
+    done
+  fi
 fi
 
 cd "$PROJECT_DIR"
@@ -219,17 +235,13 @@ else
   fi
 fi
 
-# ---------- sanity: every manifest module and the launchd template exist ----------
+# ---------- sanity: every manifest file exists ----------
 for m in "${MODULES[@]}"; do
   if [[ ! -f "$PROJECT_DIR/$m" ]]; then
     err "$m not found in $PROJECT_DIR — cannot continue."
     exit 1
   fi
 done
-if [[ ! -f "$PROJECT_DIR/com.es.mini-agent.plist" ]]; then
-  err "com.es.mini-agent.plist not found in $PROJECT_DIR — cannot continue."
-  exit 1
-fi
 
 # ---------- build the launchd plist FROM scratch (heredoc, not sed) ----------
 # We build it ourselves so a RECORD_CONTROL_KEY containing / & or other sed
@@ -372,6 +384,43 @@ if ! launchctl load "$PLIST_PATH"; then
   exit 1
 fi
 ok "launchd loaded com.es.mini-agent"
+
+# Older installers left a misleading, env-free template beside server.js. The
+# live plist is the one above in ~/Library/LaunchAgents; never leave the stale
+# project-folder copy behind after a successful load.
+rm -f "$PROJECT_DIR/com.es.mini-agent.plist"
+
+# ---------- optional OBS login launcher ----------
+if [[ "$INSTALL_OBS_LAUNCHER" == "1" ]]; then
+  OBS_LAUNCHER_TEMPLATE="$PROJECT_DIR/com.es.obs-launcher.plist"
+  OBS_LAUNCHER_SCRIPT="$PROJECT_DIR/obs-launcher.sh"
+  OBS_LAUNCHER_PLIST="$LAUNCH_AGENTS_DIR/com.es.obs-launcher.plist"
+
+  if [[ ! -f "$OBS_LAUNCHER_TEMPLATE" || ! -f "$OBS_LAUNCHER_SCRIPT" ]]; then
+    err "OBS launcher files are missing from $PROJECT_DIR — cannot install --obs-launcher."
+    exit 1
+  fi
+
+  # Escape the already XML-safe project path for a sed replacement as well.
+  PROJECT_DIR_SED="${PROJECT_DIR_X//\\/\\\\}"
+  PROJECT_DIR_SED="${PROJECT_DIR_SED//&/\\&}"
+  PROJECT_DIR_SED="${PROJECT_DIR_SED//|/\\|}"
+  TMP_OBS_PLIST="$(mktemp -t es-obs-launcher.plist.XXXXXX)"
+  sed "s|__PROJECT_DIR__|${PROJECT_DIR_SED}|g" "$OBS_LAUNCHER_TEMPLATE" > "$TMP_OBS_PLIST"
+  chmod 644 "$TMP_OBS_PLIST"
+  mv "$TMP_OBS_PLIST" "$OBS_LAUNCHER_PLIST"
+  chmod 644 "$OBS_LAUNCHER_PLIST"
+
+  if launchctl list 2>/dev/null | grep -q 'com\.es\.obs-launcher'; then
+    launchctl unload "$OBS_LAUNCHER_PLIST" >/dev/null 2>&1 || true
+  fi
+  if ! launchctl load "$OBS_LAUNCHER_PLIST"; then
+    err "launchctl load failed for $OBS_LAUNCHER_PLIST"
+    exit 1
+  fi
+  ok "launchd loaded com.es.obs-launcher"
+  warn "Remove OBS from System Settings → General → Login Items to avoid duplicate launches."
+fi
 
 # ---------- verify ----------
 info "Waiting for the agent to come up..."

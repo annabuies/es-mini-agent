@@ -121,6 +121,44 @@ test('executeLook recalls only mapped cameras in parallel and reports each resul
   assert.equal(requests.some((url) => url.includes('omitted')), false);
 });
 
+test('executeLook logs each camera outcome and elapsed milliseconds without changing its result', async () => {
+  const lines = [];
+  const previousLog = console.log;
+  const times = [1000, 1000, 1000, 1212, 1198, 4000];
+  console.log = (...args) => { lines.push(args.join(' ')); };
+
+  try {
+    const result = await executeLook({
+      recording: false,
+      paused: false,
+      cameras: [
+        { name: 'cam1', host: 'camera-1' },
+        { name: 'cam2', host: 'camera-2' },
+        { name: 'cam3', host: 'camera-3' },
+      ],
+      looks: { '2': { cam1: 1, cam2: 2, cam3: 3 } },
+    }, '2', {
+      now: () => times.shift(),
+      recallFn: async (host) => ({
+        'camera-1': 'ok',
+        'camera-2': 'ok',
+        'camera-3': 'timeout',
+      })[host],
+    });
+
+    assert.deepEqual(result, {
+      ok: false,
+      look: '2',
+      cameras: { cam1: 'ok', cam2: 'ok', cam3: 'timeout' },
+    });
+    assert.deepEqual(lines, [
+      '[es-mini-agent] ptz: look 2 -> cam1 ok 212ms, cam2 ok 198ms, cam3 timeout 3000ms',
+    ]);
+  } finally {
+    console.log = previousLog;
+  }
+});
+
 test('executeLook returns honest busy, no-camera, and unknown-look reasons', async () => {
   const camera = { name: 'cam1', host: '127.0.0.1:1' };
   const looks = { '2': { cam1: 1 } };

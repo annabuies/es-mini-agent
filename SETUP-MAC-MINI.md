@@ -142,6 +142,16 @@ bash <(curl -fsSL https://raw.githubusercontent.com/annabuies/es-mini-agent/main
 
 The installer ends by hitting `http://localhost:8787/health` and printing SUCCESS or FAILURE. If it prints FAILURE, read the error log it points you to (`~/Documents/es-mini-agent/agent.error.log`) and fix the cause (usually a missing env var or OBS not running), then re-run the same command. Do not proceed on a FAILURE.
 
+### Optional: launch OBS safely after login
+
+To have launchd open OBS on a cold login without the “did not properly shut down” Safe Mode dialog, add `--obs-launcher` to the installer command (after the process substitution):
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/annabuies/es-mini-agent/main/install.sh) --obs-launcher
+```
+
+This installs `com.es.obs-launcher` with `RunAtLoad=true` and starts OBS with `--disable-shutdown-check`. It does nothing when OBS is already running. After enabling it, remove OBS manually from **System Settings → General → Login Items** so macOS does not launch it twice. The installer does not edit Login Items.
+
 Confirm OBS mode actually engaged (not demo mode) — the log should show it connecting to OBS, and health should be ok:
 ```bash
 curl -s http://localhost:8787/health
