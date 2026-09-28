@@ -23,11 +23,12 @@ const { executeLook, normalizeCameras, normalizeLooks } = require('./ptz');
 const { probeCameras } = require('./cam-reach');
 const { readGolden, restoreCameras, snapshotCameras, writeGolden } = require('./cam-settings');
 const { sampleDiskUsage } = require('./disk-usage');
+const { describePower, readPowerConfig, runPower } = require('./power');
 
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.09.28-1';
+const AGENT_VERSION = '2026.09.28-3';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -38,6 +39,9 @@ const BUILDING_ID = process.env.BUILDING_ID;
 const PTZ_HTTP_USER = process.env.PTZ_HTTP_USER || '';
 const PTZ_HTTP_PASS = process.env.PTZ_HTTP_PASS || '';
 const PTZ_CREDENTIALS = PTZ_HTTP_USER ? { username: PTZ_HTTP_USER, password: PTZ_HTTP_PASS } : null;
+// Studio power strip (POWER_STRIP_URL/USER/PASS, POWER_OUTLETS_SWITCHABLE).
+// Unset URL => the power op answers power_unconfigured.
+const POWER_CONFIG = readPowerConfig(process.env);
 // Optional: outbound poll target. Defaults to the Cloudflare Worker so
 // Robbie's existing install command (which only sets BUILDING_ID and
 // RECORD_CONTROL_KEY) keeps polling api.evrybdystudios.com after this update.
@@ -46,6 +50,8 @@ const POLL_INTERVAL_MS = 1000;
 const SOURCES_REFRESH_MS = 60000;
 const CAM_REACH_MS = 60000;
 const DISK_USAGE_MS = 5 * 60 * 1000;
+// Power strip health: one read-only GET of the relay states, only when POWER_STRIP_URL is set.
+const POWER_CHECK_MS = 5 * 60 * 1000;
 const PREVIEW_INTERVAL_MS = 500;
 const PREVIEW_TTL_MS = 60000;
 const PREVIEW_WIDTH = 640;
@@ -941,6 +947,11 @@ async function handleOp(op, body) {
     const uploading = !!(queueStatus && (queueStatus.queued > 0 || queueStatus.active));
     return await executeLook({ ...state, uploading }, body && body.look, { timeoutMs: 3000, credentials: PTZ_CREDENTIALS });
   }
+  if (op === 'power') {
+    const queueStatus = uploadQueue ? uploadQueue.status() : null;
+    const uploading = !!(queueStatus && (queueStatus.queued > 0 || queueStatus.active));
+    return await runPower(POWER_CONFIG, body, { recording: state.recording || state.paused, uploading });
+  }
 
   if (!OBS_MODE_ACTIVE) {
     if (op === 'start') {
@@ -993,6 +1004,7 @@ async function handleOp(op, body) {
         master_enabled: false,
         ptz_auth: PTZ_CREDENTIALS ? 'configured' : 'none',
         cam_golden: (() => { const golden = readGolden(__dirname); return golden ? { taken_at: golden.taken_at, cameras: Object.keys(golden.cameras || {}) } : null; })(),
+        power: { ...describePower(POWER_CONFIG), health: powerHealth },
         version: getVersionBlock({ projectDir: __dirname, agentVersion: AGENT_VERSION }),
       }, activeSessionResponse());
     }
@@ -1273,6 +1285,7 @@ async function handleOp(op, body) {
     out.ffmpeg = resolveFfmpegBin();
     out.ptz_auth = PTZ_CREDENTIALS ? 'configured' : 'none';
     { const golden = readGolden(__dirname); out.cam_golden = golden ? { taken_at: golden.taken_at, cameras: Object.keys(golden.cameras || {}) } : null; }
+    out.power = { ...describePower(POWER_CONFIG), health: powerHealth };
     // Sits alongside storage/ffmpeg deliberately: all three are assigned before
     // the OBS call below, so they still come back on a machine whose OBS is down.
     out.version = getVersionBlock({ projectDir: __dirname, agentVersion: AGENT_VERSION });
@@ -1469,7 +1482,7 @@ async function handleOp(op, body) {
   return null;
 }
 
-const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_bind', 'audio_lavalier', 'audio_evo', 'update', 'fetch_docs', 'look', 'cam_snapshot', 'cam_restore']);
+const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_bind', 'audio_lavalier', 'audio_evo', 'update', 'fetch_docs', 'look', 'cam_snapshot', 'cam_restore', 'power']);
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -1723,6 +1736,9 @@ let cameraReachability = null;
 let cameraReachabilityBusy = false;
 let diskUsage = null;
 let diskUsageBusy = false;
+let powerCheckTimer = null;
+let powerHealth = null;
+let powerHealthBusy = false;
 
 async function refreshCameraReachability() {
   if (cameraReachabilityBusy) return;
@@ -1756,6 +1772,26 @@ async function refreshDiskUsage() {
   }
 }
 
+// Read-only (status is a GET, never a write). fail_count counts consecutive
+// failures so the cloud can ignore a single blip.
+async function refreshPowerHealth() {
+  if (powerHealthBusy || !POWER_CONFIG.baseUrl) return;
+  powerHealthBusy = true;
+  try {
+    const res = await runPower(POWER_CONFIG, { action: 'status' }, {});
+    const lights = res && res.ok && res.outlets && res.outlets.lights;
+    powerHealth = {
+      ok: !!(res && res.ok),
+      reason: res && res.ok ? null : String((res && res.reason) || 'unknown'),
+      lights_on: lights && typeof lights.on === 'boolean' ? lights.on : null,
+      fail_count: res && res.ok ? 0 : ((powerHealth && powerHealth.fail_count) || 0) + 1,
+      checked_at: new Date().toISOString(),
+    };
+  } finally {
+    powerHealthBusy = false;
+  }
+}
+
 function heartbeatQuery(now = Date.now()) {
   if (now - lastHeartbeatAt < 60000) return '';
   try {
@@ -1782,6 +1818,8 @@ function heartbeatQuery(now = Date.now()) {
         ? diskUsage.total_bytes : null,
       disk_checked_at: typeof (diskUsage && diskUsage.checked_at) === 'string'
         ? diskUsage.checked_at : null,
+      // Power strip health is sampled on its own timer: never add I/O here. Null when unconfigured.
+      power: powerHealth ? { ...powerHealth } : null,
     };
     lastHeartbeatAt = now;
     return '&hb=1&v=' + encodeURIComponent(AGENT_VERSION)
@@ -1899,6 +1937,13 @@ server.listen(PORT, () => {
   camReachTimer = setInterval(refreshCameraReachability, CAM_REACH_MS);
   diskUsageTimer = setInterval(refreshDiskUsage, DISK_USAGE_MS);
   diskUsageTimer.unref();
+  if (POWER_CONFIG.baseUrl) {
+    powerCheckTimer = setInterval(() => {
+      refreshPowerHealth().catch((e) => console.warn('[es-mini-agent] power check failed:', e && (e.message || e)));
+    }, POWER_CHECK_MS);
+    powerCheckTimer.unref();
+    refreshPowerHealth().catch((e) => console.warn('[es-mini-agent] power check failed:', e && (e.message || e)));
+  }
   refreshSources().catch(() => {});
   refreshCameraReachability().catch((e) => {
     console.warn('[es-mini-agent] camera reachability refresh failed:', e && (e.message || e));
@@ -1930,6 +1975,10 @@ function shutdown(signal) {
   if (diskUsageTimer) {
     clearInterval(diskUsageTimer);
     diskUsageTimer = null;
+  }
+  if (powerCheckTimer) {
+    clearInterval(powerCheckTimer);
+    powerCheckTimer = null;
   }
   if (previewTimer) {
     clearInterval(previewTimer);

@@ -290,6 +290,40 @@ function createUploadQueue(opts) {
     }
   }
 
+  // A 0-byte file has nothing to upload (S3 multipart needs at least one byte, so
+  // it used to fail forever with "runMultipartUpload requires sizeBytes"). A camera
+  // file is reported through the normal upload_confirmed webhook with sizeBytes 0,
+  // which the cloud posts as "Camera N recording failed" (es-honeybook #18) and
+  // never links. Audio/master files are only logged. The entry is then dropped.
+  async function reportEmptyFile(job) {
+    console.warn('[upload-queue] empty file, nothing to upload key=' + job.key + ' file=' + job.filePath);
+    const camera = job.source !== MASTER_SOURCE && job.kind !== AUDIO_KIND && /^cam(?:era)?[-_ ]?\d+$/i.test(String(job.source || ''));
+    const url = typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl;
+    if (camera && url) {
+      try {
+        const res = await fetch(String(url), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            event: 'upload_confirmed',
+            key: job.key,
+            sizeBytes: 0,
+            confirmedAt: new Date().toISOString(),
+            kind: job.kind,
+            building_id: buildingId,
+            source: job.source,
+            session_ref: job.sessionRef,
+          }),
+        });
+        if (!res.ok) console.warn('[upload-queue] empty file webhook failed status=' + res.status + ' key=' + job.key);
+      } catch (e) {
+        console.warn('[upload-queue] empty file webhook error key=' + job.key + ':', e && (e.message || e));
+      }
+    }
+    await removeFileIfExists(job.stateFilePath);
+    completedFilePaths.add(job.filePath);
+  }
+
   async function runJob(job) {
     const stable = await waitForStableSize(job.filePath, job.key);
     if (!stable.ok) {
@@ -299,6 +333,11 @@ function createUploadQueue(opts) {
         error: stable.reason,
       });
       console.warn('[upload-queue] file missing before upload key=' + job.key + ' file=' + job.filePath);
+      return;
+    }
+
+    if (stable.sizeBytes === 0) {
+      await reportEmptyFile(job);
       return;
     }
 
@@ -533,6 +572,13 @@ function createUploadQueue(opts) {
           } catch (e) {
             console.warn('[upload-queue] failed deleting done state ' + stateFilePath + ':', e && (e.stack || e.message || e));
           }
+          continue;
+        }
+
+        if (status === 'error' && /requires sizeBytes/.test(String(stateData.error || ''))) {
+          // Left behind by 0-byte files before reportEmptyFile existed: nothing to upload, ever.
+          console.warn('[upload-queue] dropping empty-file upload state key=' + String(stateData.key || '?'));
+          await removeFileIfExists(stateFilePath);
           continue;
         }
 

@@ -35,9 +35,18 @@ test('installer removes the stale agent plist and supports the opt-in OBS launch
   assert.match(obsLauncher, /pgrep -x OBS/);
 });
 
-test('agent release version is 2026.09.28-1', () => {
+test('agent release version is 2026.09.28-3', () => {
   const server = fs.readFileSync(path.join(projectDir, 'server.js'), 'utf8');
-  assert.match(server, /const AGENT_VERSION = '2026\.09\.28-1';/);
+  assert.match(server, /const AGENT_VERSION = '2026\.09\.28-3';/);
+});
+
+test('installer persists the power strip env into the plist and modules.txt ships power.js', () => {
+  const install = fs.readFileSync(path.join(projectDir, 'install.sh'), 'utf8');
+  const manifest = fs.readFileSync(path.join(projectDir, 'modules.txt'), 'utf8');
+  for (const key of ['POWER_STRIP_URL', 'POWER_STRIP_USER', 'POWER_STRIP_PASS', 'POWER_OUTLETS_SWITCHABLE']) {
+    assert.match(install, new RegExp(`<key>${key}</key>\\s*<string>\\$\\{${key}_X\\}</string>`));
+  }
+  assert.match(manifest, /^power\.js$/m);
 });
 
 test('modules.txt lists only .js runtime modules (deployed self-update rejects anything else)', () => {
@@ -45,4 +54,29 @@ test('modules.txt lists only .js runtime modules (deployed self-update rejects a
     .split('\n').map((l) => l.replace(/#.*/, '').trim()).filter(Boolean);
   assert.ok(manifest.length > 0);
   assert.deepEqual(manifest.filter((m) => !/^[A-Za-z0-9._-]+\.js$/.test(m)), []);
+});
+
+test('installer reuses values from the live plist for anything left unset (bash 3.2 safe)', { skip: process.platform !== 'darwin' && 'needs /usr/libexec/PlistBuddy' }, () => {
+  const { execFileSync } = require('node:child_process');
+  const os = require('node:os');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-reuse-'));
+  try {
+    fs.mkdirSync(path.join(home, 'Library', 'LaunchAgents'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'Library', 'LaunchAgents', 'com.es.mini-agent.plist'), `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>EnvironmentVariables</key><dict>
+<key>BUILDING_ID</key><string>bench-1</string>
+<key>RECORD_CONTROL_KEY</key><string>k3y &amp; "q"</string>
+<key>OBS_SOURCES</key><string>cam1,cam2,cam3</string>
+<key>POWER_STRIP_URL</key><string>http://old</string>
+</dict></dict></plist>`);
+    const install = fs.readFileSync(path.join(projectDir, 'install.sh'), 'utf8');
+    const start = install.indexOf('# ---------- reuse an existing install ----------');
+    const end = install.indexOf('# ---------- read inputs ----------');
+    assert.ok(start > 0 && end > start);
+    const script = `set -euo pipefail\n${install.slice(start, end)}\nprintf '%s|%s|%s|%s' "$BUILDING_ID" "$RECORD_CONTROL_KEY" "$OBS_SOURCES" "$POWER_STRIP_URL"`;
+    const out = execFileSync('/bin/bash', ['-c', script], { env: { PATH: process.env.PATH, HOME: home, POWER_STRIP_URL: 'http://172.16.1.40' } }).toString();
+    assert.equal(out, 'bench-1|k3y & "q"|cam1,cam2,cam3|http://172.16.1.40');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });

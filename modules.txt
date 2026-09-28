@@ -19,3 +19,4 @@ cam-reach.js
 disk-usage.js
 digest-auth.js
 cam-settings.js
+power.js
