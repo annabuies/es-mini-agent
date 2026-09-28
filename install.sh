@@ -11,6 +11,10 @@
 # Usage (from inside a cloned repo):
 #   BUILDING_ID=bench-1 RECORD_CONTROL_KEY='your-long-secret' ./install.sh
 #
+# Re-install on a Mini that already has the agent: pass only what changes.
+# Every value left unset is reused from the live plist, e.g.
+#   POWER_STRIP_URL=http://172.16.1.40 POWER_STRIP_USER=... POWER_STRIP_PASS=... ./install.sh --obs-launcher
+#
 # Optional:
 #   PORT=8787           # port the agent listens on
 #   RECORD_POLL_URL     # OS record poll host (default https://api.evrybdystudios.com)
@@ -34,6 +38,29 @@ info() { printf '%s[es-mini-agent]%s %s\n' "$CYA" "$RST" "$*"; }
 ok()   { printf '%s[ok]%s %s\n'  "$GRN" "$RST" "$*"; }
 warn() { printf '%s[warn]%s %s\n' "$YLW" "$RST" "$*"; }
 err()  { printf '%s[error]%s %s\n' "$RED" "$RST" "$*" 1>&2; }
+
+# ---------- reuse an existing install ----------
+# A re-run used to wipe every value not passed on the command line (OBS_SOURCES
+# empty => demo mode, no upload creds, no webhook). Now any value left unset is
+# taken from the live plist, so a re-install only needs the NEW values. Pass a
+# value explicitly to change it. R2_* are the pre-S3 names of the upload creds.
+EXISTING_PLIST="$HOME/Library/LaunchAgents/com.es.mini-agent.plist"
+REUSED_KEYS=()
+if [[ -f "$EXISTING_PLIST" && -x /usr/libexec/PlistBuddy ]]; then
+  for key in BUILDING_ID RECORD_CONTROL_KEY PORT RECORD_POLL_URL \
+             OBS_SOURCES OBS_WS_URL OBS_WS_PASSWORD OBS_RECORD_DIR \
+             S3_ACCESS_KEY_ID S3_SECRET_ACCESS_KEY S3_BUCKET S3_ENDPOINT S3_REGION AWS_ROLE_ARN \
+             R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET R2_ENDPOINT \
+             UPLOAD_CONFIRMED_WEBHOOK_URL PTZ_HTTP_USER PTZ_HTTP_PASS \
+             POWER_STRIP_URL POWER_STRIP_USER POWER_STRIP_PASS POWER_OUTLETS_SWITCHABLE; do
+    [[ -n "${!key:-}" ]] && continue
+    if value="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$key" "$EXISTING_PLIST" 2>/dev/null)" && [[ -n "$value" ]]; then
+      printf -v "$key" '%s' "$value"
+      export "$key"
+      REUSED_KEYS+=("$key")
+    fi
+  done
+fi
 
 # ---------- read inputs ----------
 : "${BUILDING_ID:=}"
@@ -66,6 +93,10 @@ POWER_STRIP_USER="${POWER_STRIP_USER:-}"
 POWER_STRIP_PASS="${POWER_STRIP_PASS:-}"
 POWER_OUTLETS_SWITCHABLE="${POWER_OUTLETS_SWITCHABLE:-}"
 REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/annabuies/es-mini-agent/main}"
+
+if (( ${#REUSED_KEYS[@]} )); then
+  ok "Reusing ${#REUSED_KEYS[@]} value(s) from the existing install: ${REUSED_KEYS[*]}"
+fi
 
 if [[ -z "$BUILDING_ID" || -z "$RECORD_CONTROL_KEY" ]]; then
   err "BUILDING_ID and RECORD_CONTROL_KEY are required."
