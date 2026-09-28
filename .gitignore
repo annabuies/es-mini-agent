@@ -14,3 +14,5 @@ update-state.json
 # Clients/ES/scripts/robbie-filled-runbook.sh; this is belt-and-braces in case
 # one ever gets written in here instead.
 *-FILLED.md
+__pycache__/
+.pytest_cache/
