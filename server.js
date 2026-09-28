@@ -23,11 +23,12 @@ const { executeLook, normalizeCameras, normalizeLooks } = require('./ptz');
 const { probeCameras } = require('./cam-reach');
 const { readGolden, restoreCameras, snapshotCameras, writeGolden } = require('./cam-settings');
 const { sampleDiskUsage } = require('./disk-usage');
+const { describePower, readPowerConfig, runPower } = require('./power');
 
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.09.28-1';
+const AGENT_VERSION = '2026.09.28-2';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -38,6 +39,9 @@ const BUILDING_ID = process.env.BUILDING_ID;
 const PTZ_HTTP_USER = process.env.PTZ_HTTP_USER || '';
 const PTZ_HTTP_PASS = process.env.PTZ_HTTP_PASS || '';
 const PTZ_CREDENTIALS = PTZ_HTTP_USER ? { username: PTZ_HTTP_USER, password: PTZ_HTTP_PASS } : null;
+// Studio power strip (POWER_STRIP_URL/USER/PASS, POWER_OUTLETS_SWITCHABLE).
+// Unset URL => the power op answers power_unconfigured.
+const POWER_CONFIG = readPowerConfig(process.env);
 // Optional: outbound poll target. Defaults to the Cloudflare Worker so
 // Robbie's existing install command (which only sets BUILDING_ID and
 // RECORD_CONTROL_KEY) keeps polling api.evrybdystudios.com after this update.
@@ -941,6 +945,11 @@ async function handleOp(op, body) {
     const uploading = !!(queueStatus && (queueStatus.queued > 0 || queueStatus.active));
     return await executeLook({ ...state, uploading }, body && body.look, { timeoutMs: 3000, credentials: PTZ_CREDENTIALS });
   }
+  if (op === 'power') {
+    const queueStatus = uploadQueue ? uploadQueue.status() : null;
+    const uploading = !!(queueStatus && (queueStatus.queued > 0 || queueStatus.active));
+    return await runPower(POWER_CONFIG, body, { recording: state.recording || state.paused, uploading });
+  }
 
   if (!OBS_MODE_ACTIVE) {
     if (op === 'start') {
@@ -993,6 +1002,7 @@ async function handleOp(op, body) {
         master_enabled: false,
         ptz_auth: PTZ_CREDENTIALS ? 'configured' : 'none',
         cam_golden: (() => { const golden = readGolden(__dirname); return golden ? { taken_at: golden.taken_at, cameras: Object.keys(golden.cameras || {}) } : null; })(),
+        power: describePower(POWER_CONFIG),
         version: getVersionBlock({ projectDir: __dirname, agentVersion: AGENT_VERSION }),
       }, activeSessionResponse());
     }
@@ -1273,6 +1283,7 @@ async function handleOp(op, body) {
     out.ffmpeg = resolveFfmpegBin();
     out.ptz_auth = PTZ_CREDENTIALS ? 'configured' : 'none';
     { const golden = readGolden(__dirname); out.cam_golden = golden ? { taken_at: golden.taken_at, cameras: Object.keys(golden.cameras || {}) } : null; }
+    out.power = describePower(POWER_CONFIG);
     // Sits alongside storage/ffmpeg deliberately: all three are assigned before
     // the OBS call below, so they still come back on a machine whose OBS is down.
     out.version = getVersionBlock({ projectDir: __dirname, agentVersion: AGENT_VERSION });
@@ -1469,7 +1480,7 @@ async function handleOp(op, body) {
   return null;
 }
 
-const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_bind', 'audio_lavalier', 'audio_evo', 'update', 'fetch_docs', 'look', 'cam_snapshot', 'cam_restore']);
+const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_bind', 'audio_lavalier', 'audio_evo', 'update', 'fetch_docs', 'look', 'cam_snapshot', 'cam_restore', 'power']);
 
 const server = http.createServer(async (req, res) => {
   try {

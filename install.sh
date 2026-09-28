@@ -59,6 +59,12 @@ UPLOAD_CONFIRMED_WEBHOOK_URL="${UPLOAD_CONFIRMED_WEBHOOK_URL:-}"
 # Optional camera web-UI admin login; lives only on this Mini.
 PTZ_HTTP_USER="${PTZ_HTTP_USER:-}"
 PTZ_HTTP_PASS="${PTZ_HTTP_PASS:-}"
+# Optional studio power strip (Digital Loggers Pro 10); login lives only on this Mini.
+# Empty POWER_OUTLETS_SWITCHABLE => lights only. Router/PoE/Mini/NAS are refused in code.
+POWER_STRIP_URL="${POWER_STRIP_URL:-}"
+POWER_STRIP_USER="${POWER_STRIP_USER:-}"
+POWER_STRIP_PASS="${POWER_STRIP_PASS:-}"
+POWER_OUTLETS_SWITCHABLE="${POWER_OUTLETS_SWITCHABLE:-}"
 REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/annabuies/es-mini-agent/main}"
 
 if [[ -z "$BUILDING_ID" || -z "$RECORD_CONTROL_KEY" ]]; then
@@ -273,6 +279,10 @@ KEY_X="$(xml_escape "$RECORD_CONTROL_KEY")"
 BID_X="$(xml_escape "$BUILDING_ID")"
 PTZ_HTTP_USER_X="$(xml_escape "$PTZ_HTTP_USER")"
 PTZ_HTTP_PASS_X="$(xml_escape "$PTZ_HTTP_PASS")"
+POWER_STRIP_URL_X="$(xml_escape "$POWER_STRIP_URL")"
+POWER_STRIP_USER_X="$(xml_escape "$POWER_STRIP_USER")"
+POWER_STRIP_PASS_X="$(xml_escape "$POWER_STRIP_PASS")"
+POWER_OUTLETS_SWITCHABLE_X="$(xml_escape "$POWER_OUTLETS_SWITCHABLE")"
 OBS_SOURCES_X="$(xml_escape "$OBS_SOURCES")"
 OBS_WS_URL_X="$(xml_escape "$OBS_WS_URL")"
 OBS_WS_PASSWORD_X="$(xml_escape "$OBS_WS_PASSWORD")"
@@ -321,6 +331,15 @@ cat > "$TMP_PLIST" <<PLIST
         <string>${PTZ_HTTP_USER_X}</string>
         <key>PTZ_HTTP_PASS</key>
         <string>${PTZ_HTTP_PASS_X}</string>
+        <!-- studio power strip login; lives only on this Mini -->
+        <key>POWER_STRIP_URL</key>
+        <string>${POWER_STRIP_URL_X}</string>
+        <key>POWER_STRIP_USER</key>
+        <string>${POWER_STRIP_USER_X}</string>
+        <key>POWER_STRIP_PASS</key>
+        <string>${POWER_STRIP_PASS_X}</string>
+        <key>POWER_OUTLETS_SWITCHABLE</key>
+        <string>${POWER_OUTLETS_SWITCHABLE_X}</string>
         <key>OBS_SOURCES</key>
         <string>${OBS_SOURCES_X}</string>
         <key>OBS_WS_URL</key>

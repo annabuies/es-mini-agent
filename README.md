@@ -28,6 +28,9 @@ Core + optional env vars:
 | `OBS_RECORD_DIR`     | no       | `~/es-mini-obs-recordings`    | optional in demo mode; required when `OBS_SOURCES` is set |
 | `MASTER_RECORD`      | no       | `1`                           | defaults to `1` when `OBS_SOURCES` is set; use `0` to disable the OBS main recording rollback |
 | `AUDIO_SPLIT`        | no       | `1` with master recording     | split confirmed master audio tracks; use `0` to keep the master but skip mic files |
+| `POWER_STRIP_URL`    | no       | `http://172.16.1.40`          | Digital Loggers Pro 10 (`studio-power`); unset → `power` op answers `power_unconfigured` |
+| `POWER_STRIP_USER` / `POWER_STRIP_PASS` | no | `(empty)`             | strip digest login; lives only in the live plist on this Mini, never in git |
+| `POWER_OUTLETS_SWITCHABLE` | no | `lights`                       | comma-separated; only `lights` / `evo` accepted, `router` / `poe` / `mini` / `nas` refused in code |
 
 Set these variables in your shell for local development. For launchd, pass them to `install.sh`; it generates the live plist at `~/Library/LaunchAgents/com.es.mini-agent.plist`.
 
@@ -159,6 +162,10 @@ After a master upload confirms, the agent probes its audio streams and stream-co
 `PTZ_HTTP_USER` and `PTZ_HTTP_PASS` are read (HTTP digest auth for preset recall and camera settings). They live in the env block of the **live** LaunchAgent plist, `~/Library/LaunchAgents/com.es.mini-agent.plist`. The copy that used to sit in `~/Documents/es-mini-agent/` was an env-less template, not the live file (the installer removes it since 2026.09.27-2). Camera HTTP paths are under `/cgi-bin/` (`/cgi-bin/param.cgi`, `/cgi-bin/ptzctrl.cgi`); the bare `/param.cgi` returns 404.
 
 PTZ look support was rebased onto `10fa9a8` on 2026-09-05.
+
+- `power` → `{ ok, action, outlets: { lights: { outlet, on, label?, result? } }, reason? }`
+
+`power` requests carry `{ action: 'status'|'on'|'off', outlets?: string[] | 'all' }`. `status` defaults to every switchable outlet and may also read (never write) `router`, `poe` and `mini`; `on`/`off` require an explicit list or `'all'` (= every switchable outlet). Outlet map on the strip: 1 Router, 2 PoE, 3 Mini, 4 Lights, 5–8 spare; `evo` and `nas` are known names with no outlet. Router, PoE, Mini and NAS (plus aliases and outlets 1–3 by number) are refused with `outlet_denied` no matter what the env says; `off` is refused while recording/paused (`busy_recording`) or uploading (`busy_uploading`). Writes use the DLI REST `transient_state` so the strip's own power-loss restore (all on) always wins after a reboot. `diag.power` reports `{ configured, auth, outlets, switchable, rejected }` without touching the strip.
 
 ## OBS control (optional)
 

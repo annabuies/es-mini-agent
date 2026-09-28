@@ -35,9 +35,18 @@ test('installer removes the stale agent plist and supports the opt-in OBS launch
   assert.match(obsLauncher, /pgrep -x OBS/);
 });
 
-test('agent release version is 2026.09.28-1', () => {
+test('agent release version is 2026.09.28-2', () => {
   const server = fs.readFileSync(path.join(projectDir, 'server.js'), 'utf8');
-  assert.match(server, /const AGENT_VERSION = '2026\.09\.28-1';/);
+  assert.match(server, /const AGENT_VERSION = '2026\.09\.28-2';/);
+});
+
+test('installer persists the power strip env into the plist and modules.txt ships power.js', () => {
+  const install = fs.readFileSync(path.join(projectDir, 'install.sh'), 'utf8');
+  const manifest = fs.readFileSync(path.join(projectDir, 'modules.txt'), 'utf8');
+  for (const key of ['POWER_STRIP_URL', 'POWER_STRIP_USER', 'POWER_STRIP_PASS', 'POWER_OUTLETS_SWITCHABLE']) {
+    assert.match(install, new RegExp(`<key>${key}</key>\\s*<string>\\$\\{${key}_X\\}</string>`));
+  }
+  assert.match(manifest, /^power\.js$/m);
 });
 
 test('modules.txt lists only .js runtime modules (deployed self-update rejects anything else)', () => {
