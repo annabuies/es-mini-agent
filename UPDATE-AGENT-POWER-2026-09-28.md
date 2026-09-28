@@ -94,3 +94,22 @@ Anna then checks remotely that the Mini reports agent `2026.09.28-3` and a healt
 - Lights didn't react in Step 4 but `status` worked: send Anna the output of the `off` line. The switch may need the user's outlet access enabled on the Pro 10's External APIs page.
 - Anything else: `tail -n 50 ~/Documents/es-mini-agent/agent.log` and send it to Anna.
 - To switch the lights by hand at any time, use the Pro 10 web page. The automation won't fight a manual change during a session.
+
+## Follow-up: OBS launcher fix (after the Sep 28 update)
+
+The first run of the launcher failed with exit code 126 and this line in `obs-launcher.error.log`: `/bin/bash: .../Documents/es-mini-agent/obs-launcher.sh: Operation not permitted`. macOS folder privacy stops launchd-started bash from reading anything in Documents. The installer now copies the launcher to `~/Library/Application Support/es-mini-agent/` and points the LaunchAgent there. Nothing needs moving by hand.
+
+Leave OBS open and run the same installer command again. You don't need the power strip values this time because they are reused:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/annabuies/es-mini-agent/main/install.sh) --obs-launcher
+```
+
+Look for `[ok] launchd loaded com.es.obs-launcher (script in .../Application Support/es-mini-agent)` and the green SUCCESS banner. Then check:
+
+```bash
+launchctl list | grep obs-launcher
+cat ~/Library/"Application Support"/es-mini-agent/obs-launcher.error.log
+```
+
+The middle number should be `0`, not `126`, and the error log should be empty. OBS is already open, so the launcher leaves it alone. Then do Step 5 (restart once) to confirm OBS opens on its own without the Safe Mode dialog.

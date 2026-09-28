@@ -451,12 +451,21 @@ if [[ "$INSTALL_OBS_LAUNCHER" == "1" ]]; then
     exit 1
   fi
 
-  # Escape the already XML-safe project path for a sed replacement as well.
-  PROJECT_DIR_SED="${PROJECT_DIR_X//\\/\\\\}"
-  PROJECT_DIR_SED="${PROJECT_DIR_SED//&/\\&}"
-  PROJECT_DIR_SED="${PROJECT_DIR_SED//|/\\|}"
+  # launchd starts the launcher with /bin/bash, and macOS folder privacy blocks
+  # bash (unlike node) from reading anything under ~/Documents: the job exits 126
+  # with "Operation not permitted". Run a copy from Application Support instead,
+  # which is not a protected folder, and keep its logs there too.
+  OBS_LAUNCHER_DIR="$HOME/Library/Application Support/es-mini-agent"
+  mkdir -p "$OBS_LAUNCHER_DIR"
+  install -m 755 "$OBS_LAUNCHER_SCRIPT" "$OBS_LAUNCHER_DIR/obs-launcher.sh"
+
+  # Escape the XML-safe launcher path for a sed replacement as well.
+  OBS_LAUNCHER_DIR_X="$(xml_escape "$OBS_LAUNCHER_DIR")"
+  OBS_LAUNCHER_DIR_SED="${OBS_LAUNCHER_DIR_X//\\/\\\\}"
+  OBS_LAUNCHER_DIR_SED="${OBS_LAUNCHER_DIR_SED//&/\\&}"
+  OBS_LAUNCHER_DIR_SED="${OBS_LAUNCHER_DIR_SED//|/\\|}"
   TMP_OBS_PLIST="$(mktemp -t es-obs-launcher.plist.XXXXXX)"
-  sed "s|__PROJECT_DIR__|${PROJECT_DIR_SED}|g" "$OBS_LAUNCHER_TEMPLATE" > "$TMP_OBS_PLIST"
+  sed "s|__LAUNCHER_DIR__|${OBS_LAUNCHER_DIR_SED}|g" "$OBS_LAUNCHER_TEMPLATE" > "$TMP_OBS_PLIST"
   chmod 644 "$TMP_OBS_PLIST"
   mv "$TMP_OBS_PLIST" "$OBS_LAUNCHER_PLIST"
   chmod 644 "$OBS_LAUNCHER_PLIST"
@@ -468,7 +477,7 @@ if [[ "$INSTALL_OBS_LAUNCHER" == "1" ]]; then
     err "launchctl load failed for $OBS_LAUNCHER_PLIST"
     exit 1
   fi
-  ok "launchd loaded com.es.obs-launcher"
+  ok "launchd loaded com.es.obs-launcher (script in $OBS_LAUNCHER_DIR)"
   warn "Remove OBS from System Settings → General → Login Items to avoid duplicate launches."
 fi
 

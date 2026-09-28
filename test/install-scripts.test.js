@@ -30,7 +30,8 @@ test('installer removes the stale agent plist and supports the opt-in OBS launch
   assert.match(uninstall, /com\.es\.obs-launcher\.plist/);
   assert.match(obsPlist, /<key>RunAtLoad<\/key>\s*<true\/>/);
   assert.match(obsPlist, /<key>KeepAlive<\/key>\s*<false\/>/);
-  assert.match(obsPlist, /obs-launcher\.sh/);
+  assert.match(obsPlist, /__LAUNCHER_DIR__\/obs-launcher\.sh/);
+  assert.doesNotMatch(obsPlist, /__PROJECT_DIR__/);
   assert.match(obsLauncher, /open -a OBS --args --disable-shutdown-check/);
   assert.match(obsLauncher, /pgrep -x OBS/);
 });
@@ -78,5 +79,37 @@ test('installer reuses values from the live plist for anything left unset (bash 
     assert.equal(out, 'bench-1|k3y & "q"|cam1,cam2,cam3|http://172.16.1.40');
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('OBS launcher runs from Application Support, never ~/Documents (launchd bash gets EPERM there)', () => {
+  const os = require('node:os');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-obs-'));
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-bin-'));
+  try {
+    fs.mkdirSync(path.join(home, 'Library', 'LaunchAgents'), { recursive: true });
+    fs.writeFileSync(path.join(bin, 'launchctl'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const install = fs.readFileSync(path.join(projectDir, 'install.sh'), 'utf8');
+    const helpers = install.slice(install.indexOf('xml_escape() {'), install.indexOf('LAUNCH_AGENTS_DIR='));
+    const start = install.indexOf('# ---------- optional OBS login launcher ----------');
+    const end = install.indexOf('# ---------- verify ----------');
+    assert.ok(start > 0 && end > start);
+    const script = `set -euo pipefail
+ok() { :; }; warn() { :; }; err() { echo "$*" >&2; }
+${helpers}
+INSTALL_OBS_LAUNCHER=1
+PROJECT_DIR=${JSON.stringify(projectDir)}
+LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
+${install.slice(start, end)}`;
+    execFileSync('/bin/bash', ['-c', script], { env: { PATH: `${bin}:${process.env.PATH}`, HOME: home } });
+    const plist = fs.readFileSync(path.join(home, 'Library', 'LaunchAgents', 'com.es.obs-launcher.plist'), 'utf8');
+    const dir = path.join(home, 'Library', 'Application Support', 'es-mini-agent');
+    assert.ok(plist.includes(`<string>${dir}/obs-launcher.sh</string>`));
+    assert.ok(plist.includes(`<string>${dir}/obs-launcher.error.log</string>`));
+    assert.doesNotMatch(plist, /Documents|__LAUNCHER_DIR__/);
+    assert.ok(fs.statSync(path.join(dir, 'obs-launcher.sh')).mode & 0o100);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(bin, { recursive: true, force: true });
   }
 });
