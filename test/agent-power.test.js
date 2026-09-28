@@ -85,8 +85,42 @@ test('agent without POWER_STRIP_URL answers power_unconfigured and still starts'
   assert.deepEqual((await postAgent(port, 'diag')).power, {
     configured: false, auth: 'none',
     outlets: { router: 1, poe: 2, mini: 3, lights: 4, evo: null, nas: null },
-    switchable: ['lights'], rejected: [],
+    switchable: ['lights'], rejected: [], health: null,
   });
+});
+
+test('agent samples strip health read-only and reports it in diag and the heartbeat', { timeout: 10000 }, async (t) => {
+  const dli = createFakeDli();
+  const dliPort = await listen(dli.server);
+  t.after(() => close(dli.server));
+  const { port } = await startAgent(t, {
+    POWER_STRIP_URL: `http://127.0.0.1:${dliPort}`,
+    POWER_STRIP_USER: dli.username,
+    POWER_STRIP_PASS: dli.password,
+  });
+  let health = null;
+  const deadline = Date.now() + 5000;
+  while (!health && Date.now() < deadline) {
+    health = (await postAgent(port, 'diag')).power.health;
+    if (!health) await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.deepEqual({ ...health, checked_at: typeof health.checked_at }, { ok: true, reason: null, lights_on: true, fail_count: 0, checked_at: 'string' });
+  assert.deepEqual(dli.strip.writes, []);
+  assert.ok(dli.strip.requests.every((r) => r.method === 'GET'));
+});
+
+test('strip health counts consecutive failures when the strip is unreachable', { timeout: 10000 }, async (t) => {
+  const port0 = await freePort();
+  const { port } = await startAgent(t, { POWER_STRIP_URL: `http://127.0.0.1:${port0}`, POWER_STRIP_USER: 'u', POWER_STRIP_PASS: 'p' });
+  let health = null;
+  const deadline = Date.now() + 5000;
+  while (!health && Date.now() < deadline) {
+    health = (await postAgent(port, 'diag')).power.health;
+    if (!health) await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(health.ok, false);
+  assert.equal(health.fail_count, 1);
+  assert.equal(health.lights_on, null);
 });
 
 test('agent power op: lights only, mini refused even when listed, no off while recording', { timeout: 10000 }, async (t) => {
