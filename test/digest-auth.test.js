@@ -67,6 +67,40 @@ test('requestWithDigest closes both requests, retries after 401, and returns suc
   assert.equal(calls, 2);
 });
 
+test('requestWithDigest sends a PUT body and extra headers on both attempts and signs the PUT method', async (t) => {
+  const challengeHeader = 'Digest realm="fake-strip", nonce="nonce-put", qop="auth", algorithm=MD5';
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      seen.push({ method: req.method, csrf: req.headers['x-csrf'], body: Buffer.concat(chunks).toString('utf8') });
+      const expected = buildAuthorization({
+        method: 'PUT', uri: req.url, username: 'fake-user', password: 'fake-password',
+        challenge: parseChallenge(challengeHeader), nc: '00000001', cnonce: req.headers.authorization && /cnonce="([^"]+)"/.exec(req.headers.authorization)?.[1],
+      });
+      if (req.headers.authorization !== expected) {
+        res.writeHead(401, { 'WWW-Authenticate': challengeHeader, Connection: 'close' });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json', Connection: 'close' });
+      res.end('true');
+    });
+  });
+  const port = await listen(server);
+  t.after(() => close(server));
+  const result = await requestWithDigest({
+    url: `http://127.0.0.1:${port}/restapi/relay/outlets/3/transient_state/`, method: 'put', username: 'fake-user', password: 'fake-password',
+    headers: { 'X-CSRF': 'x', 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'value=true', includeBody: true, timeoutMs: 500,
+  });
+  assert.deepEqual(result, { statusCode: 200, challenge: null, body: 'true', challenged: true, attempted: true });
+  assert.deepEqual(seen, [
+    { method: 'PUT', csrf: 'x', body: 'value=true' },
+    { method: 'PUT', csrf: 'x', body: 'value=true' },
+  ]);
+});
+
 test('requestWithDigest preserves a failed authentication and honours the whole timeout', async (t) => {
   const challengeHeader = 'Digest realm="fake-camera", nonce="nonce-2", qop="auth", algorithm=MD5';
   const unauthorized = http.createServer((req, res) => {

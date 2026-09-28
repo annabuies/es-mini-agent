@@ -68,7 +68,7 @@ function buildAuthorization({ method, uri, username, password, challenge, nc, cn
   return `Digest ${fields.join(', ')}`;
 }
 
-function requestOnce(url, authorization, deadline, includeBody) {
+function requestOnce(url, authorization, deadline, includeBody, method, extraHeaders, payload) {
   return new Promise((resolve) => {
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
@@ -84,9 +84,12 @@ function requestOnce(url, authorization, deadline, includeBody) {
     let request;
     try {
       const target = new URL(url);
-      request = http.get(target, {
+      const headers = Object.assign({}, extraHeaders, { Connection: 'close' }, authorization ? { Authorization: authorization } : {});
+      if (payload !== null) headers['Content-Length'] = Buffer.byteLength(payload);
+      request = http.request(target, {
+        method,
         agent: false,
-        headers: Object.assign({ Connection: 'close' }, authorization ? { Authorization: authorization } : {}),
+        headers,
       }, (response) => {
         const challenge = parseChallenge(response.headers['www-authenticate']);
         if (!includeBody) {
@@ -104,22 +107,30 @@ function requestOnce(url, authorization, deadline, includeBody) {
     }
     request.setTimeout(remaining, () => request.destroy(Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' })));
     request.once('error', (error) => finish({ statusCode: null, timedOut: !!(error && error.code === 'ETIMEDOUT'), error: true }));
+    request.end(payload === null ? undefined : payload);
   });
 }
 
-async function requestWithDigest({ url, username, password, timeoutMs, includeBody = false }) {
+// `method`, `headers` and `body` default to a bare GET, which is all the camera
+// callers use. A write (e.g. the power strip's PUT) resends its body with the
+// Authorization header after the 401, so the unauthenticated first attempt
+// never takes effect on a server that requires auth.
+async function requestWithDigest({ url, username, password, timeoutMs, includeBody = false, method = 'GET', headers = null, body = null }) {
   const timeout = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0 ? Math.floor(Number(timeoutMs)) : 3000;
   const deadline = Date.now() + timeout;
-  const first = await requestOnce(url, null, deadline, includeBody);
+  const requestMethod = typeof method === 'string' && method ? method.toUpperCase() : 'GET';
+  const extraHeaders = headers && typeof headers === 'object' ? headers : {};
+  const payload = typeof body === 'string' ? body : null;
+  const first = await requestOnce(url, null, deadline, includeBody, requestMethod, extraHeaders, payload);
   const challenged = first.statusCode === 401 && !!first.challenge;
   if (!challenged || !username || !password) return Object.assign(first, { challenged, attempted: false });
   const target = new URL(url);
   const authorization = buildAuthorization({
-    method: 'GET', uri: `${target.pathname}${target.search}`, username, password,
+    method: requestMethod, uri: `${target.pathname}${target.search}`, username, password,
     challenge: first.challenge, nc: '00000001',
   });
   if (!authorization) return Object.assign(first, { challenged, attempted: false });
-  const retry = await requestOnce(url, authorization, deadline, includeBody);
+  const retry = await requestOnce(url, authorization, deadline, includeBody, requestMethod, extraHeaders, payload);
   return Object.assign(retry, { challenged: true, attempted: true });
 }
 
