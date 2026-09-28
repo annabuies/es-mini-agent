@@ -37,6 +37,7 @@ if [[ -f "$OBS_LAUNCHER_PLIST_PATH" ]]; then
   info "Unloading optional OBS launcher..."
   launchctl unload "$OBS_LAUNCHER_PLIST_PATH" >/dev/null 2>&1 || true
   rm -f "$OBS_LAUNCHER_PLIST_PATH"
+  rm -f "$HOME/Library/Application Support/es-mini-agent/obs-launcher.sh"
   ok "Removed $OBS_LAUNCHER_PLIST_PATH"
 else
   info "Optional OBS launcher already gone."
