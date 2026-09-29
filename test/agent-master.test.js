@@ -234,7 +234,7 @@ test('heartbeat is sent from cached state on the first poll only once per minute
   const [first, second] = polls;
 
   assert.equal(first.searchParams.get('hb'), '1');
-  assert.equal(first.searchParams.get('v'), '2026.09.29-1');
+  assert.equal(first.searchParams.get('v'), '2026.09.29-2');
   assert.equal(first.searchParams.get('c'), 'unknown');
   const heartbeatState = JSON.parse(Buffer.from(first.searchParams.get('state'), 'base64url').toString('utf8'));
   assert.deepEqual(heartbeatState, {
@@ -626,4 +626,119 @@ test('a two-stream master uploads two audio jobs and logs a warning', { timeout:
     'recordings/bench-1/master/master-two-stream.mp4',
   ]);
   assert.match(warnings.join('\n'), /master has 2 audio streams/);
+});
+
+const FAKE_RTSP_FFMPEG = path.join(__dirname, 'fake-rtsp-ffmpeg.js');
+const vendorCalls = (requests) => requests.filter((request) => request.type === 'CallVendorRequest')
+  .map((request) => request.data.requestType + ':' + request.data.requestData.source);
+
+test('RTSP cam1: stream-copy capture replaces its Source Record through start, pause, stop and upload', { timeout: 30000 }, async (t) => {
+  const recordDir = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-rtsp-agent-'));
+  t.after(() => fs.rmSync(recordDir, { recursive: true, force: true }));
+  const masterPath = path.join(recordDir, 'master', 'master.mp4');
+  for (const source of ['cam2', 'cam3', 'master']) {
+    fs.mkdirSync(path.join(recordDir, source), { recursive: true });
+    fs.writeFileSync(path.join(recordDir, source, source === 'master' ? 'master.mp4' : source + '.mp4'), 'recording');
+  }
+  const uploads = [];
+  const r2Server = createFakeR2(uploads);
+  const r2Port = await listen(r2Server);
+  t.after(() => close(r2Server));
+  const webhookBodies = [];
+  const webhookServer = createFakeWebhook(webhookBodies);
+  const webhookPort = await listen(webhookServer);
+  t.after(() => close(webhookServer));
+  const agent = await startAgent(t, {
+    recordDir,
+    obs: { masterOutputPath: masterPath },
+    env: {
+      AUDIO_SPLIT: '0', S3_ACCESS_KEY_ID: 'fake-access-key', S3_SECRET_ACCESS_KEY: 'fake-secret-key',
+      S3_BUCKET: 'fake-bucket', S3_ENDPOINT: `http://127.0.0.1:${r2Port}`,
+      UPLOAD_CONFIRMED_WEBHOOK_URL: `http://127.0.0.1:${webhookPort}`,
+      RTSP_CAPTURE_SOURCES: 'cam1', RTSP_URL_CAM1: 'rtsp://admin:hunter2@cam1.invalid:554/ok',
+      RTSP_FFMPEG_BIN: FAKE_RTSP_FFMPEG,
+    },
+  });
+
+  const started = await postAgent(agent.agentPort, 'start', { session_ref: 'session_rtsp' });
+  assert.deepEqual(started, { ok: true, recording: true, feeds_writing: null, rtsp_sources: ['cam1'], session_ref: 'session_rtsp' });
+  assert.deepEqual(vendorCalls(agent.obsRequests), ['record_start:cam2', 'record_start:cam3']);
+  assert.deepEqual(agent.obsRequests.slice(-2).map((request) => request.type), ['GetRecordStatus', 'StartRecord']);
+  const rtspFiles = fs.readdirSync(path.join(recordDir, 'cam1'));
+  assert.equal(rtspFiles.length, 1);
+  assert.match(rtspFiles[0], /^\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2}\.mp4$/);
+
+  const status = await postAgent(agent.agentPort, 'status');
+  assert.equal(status.rtsp.cam1.running, true);
+  assert.equal(status.rtsp.cam1.died, false);
+  const diag = await postAgent(agent.agentPort, 'diag');
+  assert.equal(diag.rtsp.enabled, true);
+  assert.doesNotMatch(JSON.stringify(diag), /hunter2|rtsp:\/\//);
+
+  assert.deepEqual(await postAgent(agent.agentPort, 'pause'), { ok: true, paused: true, rtsp_records_through_pause: ['cam1'] });
+  await postAgent(agent.agentPort, 'resume');
+  assert.deepEqual(vendorCalls(agent.obsRequests).slice(2), [
+    'record_pause:cam2', 'record_pause:cam3', 'record_unpause:cam2', 'record_unpause:cam3',
+  ]);
+
+  const stopped = await postAgent(agent.agentPort, 'stop');
+  assert.equal(stopped.saved, true);
+  assert.equal(stopped.upload_queued, 4);
+  assert.equal(stopped.rtsp.length, 1);
+  assert.equal(stopped.rtsp[0].source, 'cam1');
+  assert.equal(stopped.rtsp[0].ok, true);
+  assert.ok(stopped.rtsp[0].size_bytes > 0);
+  assert.equal(stopped.rtsp[0].paused_spans_s.length, 1);
+  assert.deepEqual(vendorCalls(agent.obsRequests).slice(-2).sort(), ['record_stop:cam2', 'record_stop:cam3']);
+  assert.match(fs.readFileSync(path.join(recordDir, 'cam1', rtspFiles[0]), 'utf8'), /mfra-trailer$/);
+
+  const recordingKeys = () => uploads.filter((request) => request.method === 'POST' && request.query.has('uploads'))
+    .map((request) => request.path).filter((p) => p.includes('/recordings/')).sort();
+  await waitFor(() => recordingKeys().length === 4, 20000);
+  assert.deepEqual(recordingKeys(), [
+    `/fake-bucket/recordings/bench-1/cam1/${encodeURIComponent(rtspFiles[0])}`,
+    '/fake-bucket/recordings/bench-1/cam2/cam2.mp4',
+    '/fake-bucket/recordings/bench-1/cam3/cam3.mp4',
+    '/fake-bucket/recordings/bench-1/master/master.mp4',
+  ].sort());
+  await waitFor(() => webhookBodies.some((body) => body.source === 'cam1'), 8000);
+  const cam1Hook = webhookBodies.find((body) => body.source === 'cam1');
+  assert.ok(cam1Hook.sizeBytes > 0);
+  assert.equal(cam1Hook.session_ref, 'session_rtsp');
+});
+
+test('RTSP enabled without a camera URL refuses the start before touching OBS', { timeout: 8000 }, async (t) => {
+  const agent = await startAgent(t, { env: { RTSP_CAPTURE_SOURCES: 'cam1', RTSP_FFMPEG_BIN: FAKE_RTSP_FFMPEG } });
+  assert.deepEqual(await postAgent(agent.agentPort, 'start'), {
+    ok: false, reason: 'rtsp_misconfigured', detail: 'cam1: RTSP_URL_CAM1 not set',
+  });
+  assert.deepEqual(vendorCalls(agent.obsRequests), []);
+  assert.equal((await postAgent(agent.agentPort, 'status')).recording, false);
+});
+
+test('a refused RTSP camera rolls back the OBS cameras and master and leaks no login', { timeout: 12000 }, async (t) => {
+  const agent = await startAgent(t, {
+    env: {
+      RTSP_CAPTURE_SOURCES: 'cam1', RTSP_URL_CAM1: 'rtsp://admin:hunter2@cam1.invalid:554/refuse',
+      RTSP_FFMPEG_BIN: FAKE_RTSP_FFMPEG,
+    },
+  });
+  const result = await postAgent(agent.agentPort, 'start');
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'rtsp_start_failed');
+  assert.match(result.detail, /^cam1: ffmpeg exited before writing/);
+  assert.doesNotMatch(result.detail, /hunter2/);
+  await waitFor(() => agent.obsRequests.some((request) => request.type === 'StopRecord'));
+  assert.deepEqual(vendorCalls(agent.obsRequests).sort(), ['record_start:cam2', 'record_start:cam3', 'record_stop:cam2', 'record_stop:cam3']);
+  assert.equal((await postAgent(agent.agentPort, 'status')).recording, false);
+});
+
+test('without RTSP env every camera stays on Source Record and diag says RTSP is off', { timeout: 8000 }, async (t) => {
+  const agent = await startAgent(t, { masterRecord: false });
+  assert.deepEqual(await postAgent(agent.agentPort, 'start'), { ok: true, recording: true, feeds_writing: null });
+  assert.deepEqual(vendorCalls(agent.obsRequests), ['record_start:cam1', 'record_start:cam2', 'record_start:cam3']);
+  const diag = await postAgent(agent.agentPort, 'diag');
+  assert.equal(diag.rtsp.enabled, false);
+  assert.deepEqual(diag.rtsp.sources, []);
+  await postAgent(agent.agentPort, 'cancel');
 });

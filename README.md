@@ -31,6 +31,18 @@ Core + optional env vars:
 | `POWER_STRIP_URL`    | no       | `http://172.16.1.40`          | Digital Loggers Pro 10 (`studio-power`); unset → `power` op answers `power_unconfigured` |
 | `POWER_STRIP_USER` / `POWER_STRIP_PASS` | no | `(empty)`             | strip digest login; lives only in the live plist on this Mini, never in git |
 | `POWER_OUTLETS_SWITCHABLE` | no | `lights`                       | comma-separated; only `lights` / `evo` accepted, `router` / `poe` / `mini` / `nas` refused in code |
+| `RTSP_CAPTURE_SOURCES` | no     | `cam1`                        | cameras recorded by `ffmpeg -c copy` from their RTSP stream instead of Source Record. Unset or `off` → Source Record for every camera (default). Master/audio stay on OBS |
+| `RTSP_URL_CAM1` / `_CAM2` / `_CAM3` | with the above | `rtsp://user:pass@<camera-ip>:554/1` | one per listed camera (`RTSP_URL_<SOURCE>`); carries the camera login, lives only in the live plist; never logged |
+| `RTSP_TRANSPORT`     | no       | `tcp`                         | `tcp` (default) or `udp` |
+| `RTSP_AUDIO`         | no       | `0`                           | `copy` keeps the camera's own audio track; default video only (studio mics are in master + `audio/micN`) |
+| `RTSP_VIDEO_TAG`     | no       | `hvc1`                        | set `hvc1` for H.265 cameras so QuickTime plays the ISO file; leave empty for H.264 |
+| `RECORDING_PROBE_GATE` | no     | `1`                           | `0` turns off the zero-stream upload gate (rollback only) |
+
+### RTSP stream-copy camera capture (opt-in)
+
+For each camera in `RTSP_CAPTURE_SOURCES` the agent skips that camera's Source Record calls and runs one `ffmpeg -rtsp_transport tcp -i <url> -map 0:v:0 -c copy` per take, writing fragmented MP4 to `<OBS_RECORD_DIR>/<cam>/<YYYY-MM-DD hh-mm-ss>.mp4` (the OBS naming, so uploads and `feeds_writing` are unchanged). Nothing is encoded on the Mini. Start fails with `rtsp_start_failed` (and rolls the OBS cameras and master back) if a camera does not deliver data within 10 s. Limits: stream copy cannot pause, so an RTSP file keeps recording through a pause and the stop result lists the paused spans (`rtsp[].paused_spans_s`) for the edit; the file starts at the camera's first keyframe, so it is not frame-aligned with master.
+
+Before upload every camera and master recording is probed with `ffprobe`. A file with zero streams (or one ffprobe cannot read that is under 64 KiB) is not uploaded: it moves to `<cam>/quarantine/` and a camera is reported with the existing `sizeBytes: 0` "recording failed" webhook plus `invalid`, `file_size_bytes`, `streams`.
 
 Set these variables in your shell for local development. For launchd, pass them to `install.sh`; it generates the live plist at `~/Library/LaunchAgents/com.es.mini-agent.plist`.
 

@@ -52,7 +52,9 @@ if [[ -f "$EXISTING_PLIST" && -x /usr/libexec/PlistBuddy ]]; then
              S3_ACCESS_KEY_ID S3_SECRET_ACCESS_KEY S3_BUCKET S3_ENDPOINT S3_REGION AWS_ROLE_ARN \
              R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET R2_ENDPOINT \
              UPLOAD_CONFIRMED_WEBHOOK_URL PTZ_HTTP_USER PTZ_HTTP_PASS \
-             POWER_STRIP_URL POWER_STRIP_USER POWER_STRIP_PASS POWER_OUTLETS_SWITCHABLE; do
+             POWER_STRIP_URL POWER_STRIP_USER POWER_STRIP_PASS POWER_OUTLETS_SWITCHABLE \
+             RTSP_CAPTURE_SOURCES RTSP_URL_CAM1 RTSP_URL_CAM2 RTSP_URL_CAM3 \
+             RTSP_TRANSPORT RTSP_AUDIO RTSP_VIDEO_TAG; do
     [[ -n "${!key:-}" ]] && continue
     if value="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$key" "$EXISTING_PLIST" 2>/dev/null)" && [[ -n "$value" ]]; then
       printf -v "$key" '%s' "$value"
@@ -92,6 +94,16 @@ POWER_STRIP_URL="${POWER_STRIP_URL:-}"
 POWER_STRIP_USER="${POWER_STRIP_USER:-}"
 POWER_STRIP_PASS="${POWER_STRIP_PASS:-}"
 POWER_OUTLETS_SWITCHABLE="${POWER_OUTLETS_SWITCHABLE:-}"
+# Optional RTSP stream-copy capture instead of Source Record, per camera. Empty =>
+# Source Record for every camera. A blank value is reused from the plist, so turn
+# it off with RTSP_CAPTURE_SOURCES=off. The URLs carry the camera login.
+RTSP_CAPTURE_SOURCES="${RTSP_CAPTURE_SOURCES:-}"
+RTSP_URL_CAM1="${RTSP_URL_CAM1:-}"
+RTSP_URL_CAM2="${RTSP_URL_CAM2:-}"
+RTSP_URL_CAM3="${RTSP_URL_CAM3:-}"
+RTSP_TRANSPORT="${RTSP_TRANSPORT:-}"
+RTSP_AUDIO="${RTSP_AUDIO:-}"
+RTSP_VIDEO_TAG="${RTSP_VIDEO_TAG:-}"
 REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/annabuies/es-mini-agent/main}"
 
 if (( ${#REUSED_KEYS[@]} )); then
@@ -327,6 +339,13 @@ AWS_ROLE_ARN_X="$(xml_escape "$AWS_ROLE_ARN")"
 FFMPEG_BIN_X="$(xml_escape "$FFMPEG_BIN")"
 UPLOAD_CONFIRMED_WEBHOOK_URL_X="$(xml_escape "$UPLOAD_CONFIRMED_WEBHOOK_URL")"
 RECORD_POLL_URL_X="$(xml_escape "$RECORD_POLL_URL")"
+RTSP_CAPTURE_SOURCES_X="$(xml_escape "$RTSP_CAPTURE_SOURCES")"
+RTSP_URL_CAM1_X="$(xml_escape "$RTSP_URL_CAM1")"
+RTSP_URL_CAM2_X="$(xml_escape "$RTSP_URL_CAM2")"
+RTSP_URL_CAM3_X="$(xml_escape "$RTSP_URL_CAM3")"
+RTSP_TRANSPORT_X="$(xml_escape "$RTSP_TRANSPORT")"
+RTSP_AUDIO_X="$(xml_escape "$RTSP_AUDIO")"
+RTSP_VIDEO_TAG_X="$(xml_escape "$RTSP_VIDEO_TAG")"
 
 # Write to a temp file first, then move + chmod, so we never leave a
 # world-readable plist containing the secret on disk mid-write.
@@ -397,6 +416,21 @@ cat > "$TMP_PLIST" <<PLIST
         <string>${UPLOAD_CONFIRMED_WEBHOOK_URL_X}</string>
         <key>RECORD_POLL_URL</key>
         <string>${RECORD_POLL_URL_X}</string>
+        <!-- RTSP stream-copy camera capture; URLs carry the camera login, only on this Mini -->
+        <key>RTSP_CAPTURE_SOURCES</key>
+        <string>${RTSP_CAPTURE_SOURCES_X}</string>
+        <key>RTSP_URL_CAM1</key>
+        <string>${RTSP_URL_CAM1_X}</string>
+        <key>RTSP_URL_CAM2</key>
+        <string>${RTSP_URL_CAM2_X}</string>
+        <key>RTSP_URL_CAM3</key>
+        <string>${RTSP_URL_CAM3_X}</string>
+        <key>RTSP_TRANSPORT</key>
+        <string>${RTSP_TRANSPORT_X}</string>
+        <key>RTSP_AUDIO</key>
+        <string>${RTSP_AUDIO_X}</string>
+        <key>RTSP_VIDEO_TAG</key>
+        <string>${RTSP_VIDEO_TAG_X}</string>
     </dict>
 
     <key>RunAtLoad</key>

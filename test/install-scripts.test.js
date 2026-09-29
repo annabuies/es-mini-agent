@@ -36,9 +36,20 @@ test('installer removes the stale agent plist and supports the opt-in OBS launch
   assert.match(obsLauncher, /pgrep -x OBS/);
 });
 
-test('agent release version is 2026.09.29-1', () => {
+test('agent release version is 2026.09.29-2', () => {
   const server = fs.readFileSync(path.join(projectDir, 'server.js'), 'utf8');
-  assert.match(server, /const AGENT_VERSION = '2026\.09\.29-1';/);
+  assert.match(server, /const AGENT_VERSION = '2026\.09\.29-2';/);
+});
+
+test('installer persists the RTSP capture env into the plist and modules.txt ships rtsp-capture.js', () => {
+  const install = fs.readFileSync(path.join(projectDir, 'install.sh'), 'utf8');
+  const manifest = fs.readFileSync(path.join(projectDir, 'modules.txt'), 'utf8');
+  const reuse = install.slice(install.indexOf('# ---------- reuse an existing install ----------'), install.indexOf('# ---------- read inputs ----------'));
+  for (const key of ['RTSP_CAPTURE_SOURCES', 'RTSP_URL_CAM1', 'RTSP_URL_CAM2', 'RTSP_URL_CAM3', 'RTSP_TRANSPORT', 'RTSP_AUDIO', 'RTSP_VIDEO_TAG']) {
+    assert.match(install, new RegExp(`<key>${key}</key>\\s*<string>\\$\\{${key}_X\\}</string>`));
+    assert.match(reuse, new RegExp(`\\b${key}\\b`), key + ' must be reused from the live plist');
+  }
+  assert.match(manifest, /^rtsp-capture\.js$/m);
 });
 
 test('installer persists the power strip env into the plist and modules.txt ships power.js', () => {

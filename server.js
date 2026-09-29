@@ -24,11 +24,12 @@ const { probeCameras } = require('./cam-reach');
 const { readGolden, restoreCameras, snapshotCameras, writeGolden } = require('./cam-settings');
 const { sampleDiskUsage } = require('./disk-usage');
 const { describePower, readPowerConfig, runPower } = require('./power');
+const { createRtspCapture } = require('./rtsp-capture');
 
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.09.29-1';
+const AGENT_VERSION = '2026.09.29-2';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -241,8 +242,19 @@ const uploadQueue = isStorageConfigured()
     webhookUrl: () => activeWebhookUrl,
     buildingId: BUILDING_ID,
     audioSplit: AUDIO_SPLIT,
+    // RECORDING_PROBE_GATE=0 is the rollback: upload every non-empty file as before.
+    probeGate: process.env.RECORDING_PROBE_GATE !== '0',
+    minRecordingBytes: process.env.UPLOAD_MIN_RECORDING_BYTES ? Number(process.env.UPLOAD_MIN_RECORDING_BYTES) : undefined,
   })
   : null;
+
+// Opt-in per camera (RTSP_CAPTURE_SOURCES=cam1, RTSP_URL_CAM1=...). Unset => every
+// camera stays on OBS Source Record exactly as before. Master/audio stay on OBS.
+const rtspCapture = createRtspCapture({
+  env: process.env,
+  recordDir: OBS_RECORD_DIR,
+  ffmpegBin: () => String(process.env.RTSP_FFMPEG_BIN || '').trim() || resolveFfmpegBin().bin,
+});
 
 function parseSizeBytesOrDefault(value) {
   if (value == null || value === '') return R2_DEFAULT_TEST_SIZE_BYTES;
@@ -549,6 +561,8 @@ function cam1PreviewIndex() {
 /** Moves the preview overlay off Camera 1. Returns { restore, parkedTo }, or null if nothing moved. */
 async function parkPreviewOffCam1() {
   const cam1 = cam1PreviewIndex();
+  // The park only exists to dodge a Source Record fault; an RTSP cam1 has no Source Record.
+  if (rtspCapture.handles('cam1')) return null;
   if (cam1 === null || !cloudflarePreviewOverlay || cloudflarePreviewCameraIndex !== cam1) return null;
   const other = activeSources.findIndex((_, i) => i !== cam1);
   if (other < 0) return null;
@@ -1040,6 +1054,12 @@ async function handleOp(op, body) {
       return { ok: false, reason: 'obs_misconfigured' };
     }
     const startingSources = activeSources.slice();
+    const rtspSources = startingSources.filter((source) => rtspCapture.handles(source));
+    const obsCameraSources = startingSources.filter((source) => !rtspCapture.handles(source));
+    if (rtspSources.length) {
+      const problem = rtspCapture.configProblem(rtspSources);
+      if (problem) return { ok: false, reason: 'rtsp_misconfigured', detail: truncateDetail(problem) };
+    }
 
     let client;
     try {
@@ -1049,17 +1069,25 @@ async function handleOp(op, body) {
     }
 
     const parkedPreview = await parkPreviewOffCam1();
-    const startResults = await Promise.all(startingSources.map(async (source) => {
+    // RTSP connects in parallel so the OBS cameras and master start exactly as early as before.
+    const rtspStarting = rtspCapture.start(rtspSources, Date.now());
+    const abandonRtsp = async () => {
+      const r = await rtspStarting;
+      if (r.ok) await rtspCapture.stop();
+    };
+    const startResults = await Promise.all(obsCameraSources.map(async (source) => {
       const vendor = await callVendor(client, 'record_start', source);
       return { source, vendor };
     }));
     const failed = startResults.find((entry) => !entry.vendor.success);
     if (failed) {
+      await abandonRtsp();
       restorePreviewAfterPark(parkedPreview, 0);
       const detail = failed.source + ': ' + (failed.vendor.error || 'unknown_error');
       return { ok: false, reason: 'obs_start_failed', detail: truncateDetail(detail) };
     }
 
+    let masterStarted = false;
     if (MASTER_RECORD) {
       try {
         const recordStatus = await getMasterRecordStatus(client);
@@ -1069,12 +1097,23 @@ async function handleOp(op, body) {
         const started = await client.request('StartRecord');
         const startError = masterResponseError(started, 'start_record_failed');
         if (startError) throw new Error(startError);
+        masterStarted = true;
       } catch (e) {
-        await stopStartedSources(client, startingSources);
+        await Promise.all([stopStartedSources(client, obsCameraSources), abandonRtsp()]);
         restorePreviewAfterPark(parkedPreview, 0);
         const detail = 'master: ' + (e && (e.message || e) || 'start_record_failed');
         return { ok: false, reason: 'obs_start_failed', detail: truncateDetail(detail) };
       }
+    }
+
+    const rtspStart = await rtspStarting;
+    if (!rtspStart.ok) {
+      await stopStartedSources(client, obsCameraSources);
+      if (masterStarted) {
+        try { await client.request('StopRecord'); } catch (_) { /* the RTSP error is the useful detail */ }
+      }
+      restorePreviewAfterPark(parkedPreview, 0);
+      return { ok: false, reason: 'rtsp_start_failed', detail: truncateDetail(rtspStart.error) };
     }
 
     feedsPrevSamples = new Map();
@@ -1086,7 +1125,8 @@ async function handleOp(op, body) {
     state.sessionRef = sessionValue(body && body.session_ref);
     state.clientCode = sessionValue(body && body.client_code);
     restorePreviewAfterPark(parkedPreview, CAM1_PARK_RESTORE_MS);
-    return Object.assign({ ok: true, recording: true, feeds_writing: null }, startSessionResponse());
+    const rtspInfo = rtspStart.sources.length ? { rtsp_sources: rtspStart.sources } : {};
+    return Object.assign({ ok: true, recording: true, feeds_writing: null }, rtspInfo, startSessionResponse());
     })();
     try {
       return await startInFlight;
@@ -1094,16 +1134,25 @@ async function handleOp(op, body) {
       startInFlight = null;
     }
   }
+  if (op === 'stop' || op === 'cancel') {
+    // An RTSP start can wait seconds for the camera; let it settle so a stop can't slip underneath it.
+    if (startInFlight) {
+      try { await startInFlight; } catch (_) { /* the start reports its own failure */ }
+    }
+  }
   if (op === 'stop') {
     const sources = sessionSources();
+    const rtspActive = rtspCapture.activeSources();
+    const obsCameraSources = sources.filter((source) => !rtspActive.includes(source));
     const masterWasActive = state.masterActive;
     let response = { ok: true, saved: false };
     try {
+      const rtspStopping = rtspCapture.stop();
       let stopResults;
       let masterStop = { success: !masterWasActive, outputPath: null };
       try {
         const client = await getObsClient();
-        const cameraStops = sources.map(async (source) => {
+        const cameraStops = obsCameraSources.map(async (source) => {
           const vendor = await callVendor(client, 'record_stop', source);
           return { source, vendor };
         });
@@ -1115,12 +1164,13 @@ async function handleOp(op, body) {
           : Promise.resolve(masterStop);
         [stopResults, masterStop] = await Promise.all([Promise.all(cameraStops), masterStopCall]);
       } catch (e) {
-        stopResults = sources.map((source) => ({
+        stopResults = obsCameraSources.map((source) => ({
           source,
           vendor: { success: false, error: e && (e.message || String(e)) || 'obs_stop_error' },
         }));
         masterStop = { success: !masterWasActive, outputPath: null, error: e && (e.message || String(e)) || 'obs_stop_error' };
       }
+      const rtspResults = await rtspStopping;
 
       let filesStable = false;
       if (OBS_RECORD_DIR) {
@@ -1145,7 +1195,8 @@ async function handleOp(op, body) {
         await sleep(1200);
       }
 
-      const allStopsSucceeded = stopResults.every((entry) => entry.vendor.success);
+      const allStopsSucceeded = stopResults.every((entry) => entry.vendor.success)
+        && rtspResults.every((entry) => entry.ok);
       const saved = allStopsSucceeded && masterStop.success && filesStable;
       const recordingStartedAt = state.recordingStartedAt;
       const sessionRef = state.sessionRef;
@@ -1155,16 +1206,31 @@ async function handleOp(op, body) {
         if (!recordingStartedAt) {
           console.warn('[es-mini-agent] upload skipped: unknown recording start');
         } else {
-          for (const source of sources) {
+          const enqueueCamera = (source, filePath, skipReason) => {
+            if (skipReason) {
+              console.warn('[es-mini-agent] WARN: camera upload skipped source=' + source + ' reason=' + skipReason);
+              return;
+            }
+            const out = uploadQueue.enqueue({ filePath, source, sessionRef });
+            if (out && out.queued) uploadQueued += 1;
+            else console.warn('[es-mini-agent] WARN: camera upload not queued source=' + source + ' reason=' + (out && out.reason) + ' file=' + path.basename(filePath));
+          };
+          for (const source of obsCameraSources) {
             try {
               const sourceDir = path.join(OBS_RECORD_DIR, source);
               const newest = getNewestFileSample(sourceDir);
-              if (!newest || !newest.absPath) continue;
-              if (newest.mtimeMs < (recordingStartedAt - 60000)) continue;
-              const out = uploadQueue.enqueue({ filePath: newest.absPath, source, sessionRef });
-              if (out && out.queued) uploadQueued += 1;
+              if (!newest || !newest.absPath) enqueueCamera(source, null, 'no_recording_file');
+              else if (newest.mtimeMs < (recordingStartedAt - 60000)) enqueueCamera(source, null, 'newest_file_predates_take:' + newest.name);
+              else enqueueCamera(source, newest.absPath, null);
             } catch (e) {
               console.warn('[es-mini-agent] upload enqueue failed source=' + source + ':', e && (e.stack || e.message || e));
+            }
+          }
+          for (const result of rtspResults) {
+            try {
+              enqueueCamera(result.source, result.filePath, result.filePath ? null : 'rtsp_no_file');
+            } catch (e) {
+              console.warn('[es-mini-agent] upload enqueue failed source=' + result.source + ':', e && (e.stack || e.message || e));
             }
           }
           if (masterWasActive && masterStop.success && masterStop.outputPath) {
@@ -1180,6 +1246,9 @@ async function handleOp(op, body) {
 
       response = { ok: true, saved };
       if (uploadQueue) response.upload_queued = uploadQueued;
+      if (rtspResults.length) {
+        response.rtsp = rtspResults.map((r) => ({ source: r.source, ok: r.ok, size_bytes: r.sizeBytes, error: r.error, paused_spans_s: r.paused_spans_s }));
+      }
     } finally {
       state.recording = false;
       state.paused = false;
@@ -1196,13 +1265,16 @@ async function handleOp(op, body) {
   }
   if (op === 'cancel') {
     const sources = sessionSources();
+    const rtspActive = rtspCapture.activeSources();
+    const obsCameraSources = sources.filter((source) => !rtspActive.includes(source));
     const masterWasActive = state.masterActive;
     try {
+      const rtspStopping = rtspCapture.stop();
       let stopResults;
       let masterStop = { success: !masterWasActive, outputPath: null };
       try {
         const client = await getObsClient();
-        const cameraStops = sources.map(async (source) => {
+        const cameraStops = obsCameraSources.map(async (source) => {
           const vendor = await callVendor(client, 'record_stop', source);
           return { source, vendor };
         });
@@ -1214,12 +1286,13 @@ async function handleOp(op, body) {
           : Promise.resolve(masterStop);
         [stopResults, masterStop] = await Promise.all([Promise.all(cameraStops), masterStopCall]);
       } catch (e) {
-        stopResults = sources.map((source) => ({
+        stopResults = obsCameraSources.map((source) => ({
           source,
           vendor: { success: false, error: e && (e.message || String(e)) || 'obs_stop_error' },
         }));
         masterStop = { success: !masterWasActive, outputPath: null };
       }
+      await rtspStopping;
 
       if (OBS_RECORD_DIR) {
         let prevSample = sampleFeedsWriting(sources, OBS_RECORD_DIR, new Map()).samples;
@@ -1274,10 +1347,12 @@ async function handleOp(op, body) {
     feedsPrevSamples = sampled.samples;
     const out = Object.assign({ ok: true, recording: true, feeds_writing: sampled.count, preview: previewActive(), sources: sources.slice(), master_active: masterActive, master_enabled: MASTER_RECORD }, activeSessionResponse());
     if (uploadQueue) out.uploads = uploadQueue.status();
+    if (rtspCapture.activeSources().length) out.rtsp = rtspCapture.status();
     return out;
   }
   if (op === 'diag') {
     const out = Object.assign({ ok: true, demo: false, recording: state.recording, stats: null, filters: null, master_active: false, master_enabled: MASTER_RECORD }, activeSessionResponse());
+    out.rtsp = rtspCapture.describe();
     out.storage = {
       bucket: STORAGE_BUCKET,
       region: STORAGE_REGION,
@@ -1388,9 +1463,12 @@ async function handleOp(op, body) {
       console.warn(`[es-mini-agent] WARN: pause called while not recording (demo-safe: returning ok).`);
     }
 
+    const rtspActive = rtspCapture.activeSources();
+    rtspCapture.pause();
     try {
       const client = await getObsClient();
-      const pauseResults = await Promise.all(sessionSources().map((source) => callVendor(client, 'record_pause', source)));
+      const obsCameraSources = sessionSources().filter((source) => !rtspActive.includes(source));
+      const pauseResults = await Promise.all(obsCameraSources.map((source) => callVendor(client, 'record_pause', source)));
       const failed = pauseResults.find((result) => !result.success);
       if (failed) {
         console.warn('[es-mini-agent] WARN: OBS pause vendor call failed:', failed.error || 'vendor_error');
@@ -1405,12 +1483,16 @@ async function handleOp(op, body) {
     }
 
     state.paused = true;
-    return { ok: true, paused: true };
+    // Stream copy cannot pause; say so rather than let the client assume every file paused.
+    return Object.assign({ ok: true, paused: true }, rtspActive.length ? { rtsp_records_through_pause: rtspActive } : {});
   }
   if (op === 'resume') {
+    rtspCapture.resume();
     try {
       const client = await getObsClient();
-      const resumeResults = await Promise.all(sessionSources().map((source) => callVendor(client, 'record_unpause', source)));
+      const rtspActive = rtspCapture.activeSources();
+      const obsCameraSources = sessionSources().filter((source) => !rtspActive.includes(source));
+      const resumeResults = await Promise.all(obsCameraSources.map((source) => callVendor(client, 'record_unpause', source)));
       const failed = resumeResults.find((result) => !result.success);
       if (failed) {
         console.warn('[es-mini-agent] WARN: OBS resume vendor call failed:', failed.error || 'vendor_error');
@@ -1935,6 +2017,13 @@ server.listen(PORT, () => {
   console.log(`[es-mini-agent] listening on :${PORT} building_id=${BUILDING_ID}`);
   console.log(`[es-mini-agent] relay: polling ${RECORD_POLL_URL}/api/record every ${POLL_INTERVAL_MS}ms`);
   console.log('[es-mini-agent] sources (env): ' + activeSources.join(','));
+  const rtspDesc = rtspCapture.describe();
+  if (rtspDesc.enabled) {
+    const missing = rtspCapture.configProblem(rtspDesc.sources);
+    console.log('[es-mini-agent] camera capture: RTSP stream copy for ' + rtspDesc.sources.join(',')
+      + ' (transport=' + rtspDesc.transport + ', audio=' + (rtspDesc.audio ? 'copy' : 'off') + '); Source Record for the rest'
+      + (missing ? ' -- WARN: ' + missing + '; start will be refused' : ''));
+  }
   pollTimer = setInterval(pollOnce, POLL_INTERVAL_MS);
   sourcesTimer = setInterval(refreshSources, SOURCES_REFRESH_MS);
   camReachTimer = setInterval(refreshCameraReachability, CAM_REACH_MS);
@@ -1987,15 +2076,19 @@ function shutdown(signal) {
     clearInterval(previewTimer);
     previewTimer = null;
   }
+  // A running RTSP ffmpeg would outlive the agent and keep writing; finish its file first.
+  const rtspStopping = rtspCapture.activeSources().length ? rtspCapture.stop() : Promise.resolve();
   server.close(() => {
-    console.log('[es-mini-agent] server closed. bye.');
-    process.exit(0);
+    rtspStopping.catch(() => {}).finally(() => {
+      console.log('[es-mini-agent] server closed. bye.');
+      process.exit(0);
+    });
   });
-  // Failsafe: if close hangs, exit after 5s.
+  // Failsafe: if close hangs, exit after 9s (covers the RTSP stop's 'q' + SIGINT window).
   setTimeout(() => {
     console.warn('[es-mini-agent] force-exit after shutdown timeout.');
     process.exit(0);
-  }, 5000).unref();
+  }, 9000).unref();
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
