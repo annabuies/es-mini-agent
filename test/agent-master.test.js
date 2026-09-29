@@ -11,6 +11,9 @@ const { spawn } = require('node:child_process');
 const test = require('node:test');
 const { createUploadQueue } = require('../upload-queue');
 
+// Camera files under 64 KiB are treated as failed recordings (no video), so fixtures are bigger.
+const CAMERA_FILE_BYTES = Buffer.alloc(80 * 1024, 1);
+
 function listen(server) {
   return new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -229,7 +232,7 @@ test('heartbeat is sent from cached state on the first poll only once per minute
   const [first, second] = polls;
 
   assert.equal(first.searchParams.get('hb'), '1');
-  assert.equal(first.searchParams.get('v'), '2026.09.29-1');
+  assert.equal(first.searchParams.get('v'), '2026.09.29-2');
   assert.equal(first.searchParams.get('c'), 'unknown');
   const heartbeatState = JSON.parse(Buffer.from(first.searchParams.get('state'), 'base64url').toString('utf8'));
   assert.deepEqual(heartbeatState, {
@@ -397,7 +400,7 @@ test('stop enqueues three camera files plus the returned master output path', { 
   const masterPath = path.join(recordDir, 'master', 'master.mp4');
   for (const source of ['cam1', 'cam2', 'cam3', 'master']) {
     fs.mkdirSync(path.join(recordDir, source), { recursive: true });
-    fs.writeFileSync(path.join(recordDir, source, source === 'master' ? 'master.mp4' : source + '.mp4'), 'recording');
+    fs.writeFileSync(path.join(recordDir, source, source === 'master' ? 'master.mp4' : source + '.mp4'), CAMERA_FILE_BYTES);
   }
   const uploads = [];
   const r2Server = createFakeR2(uploads);
@@ -477,7 +480,7 @@ test('session_ref is reported while recording and echoed to every stop upload', 
   const masterPath = path.join(recordDir, 'master', 'master.mp4');
   for (const source of ['cam1', 'cam2', 'cam3', 'master']) {
     fs.mkdirSync(path.join(recordDir, source), { recursive: true });
-    fs.writeFileSync(path.join(recordDir, source, source === 'master' ? 'master.mp4' : source + '.mp4'), 'recording');
+    fs.writeFileSync(path.join(recordDir, source, source === 'master' ? 'master.mp4' : source + '.mp4'), CAMERA_FILE_BYTES);
   }
   const uploads = [];
   const r2Server = createFakeR2(uploads);
@@ -621,4 +624,92 @@ test('a two-stream master uploads two audio jobs and logs a warning', { timeout:
     'recordings/bench-1/master/master-two-stream.mp4',
   ]);
   assert.match(warnings.join('\n'), /master has 2 audio streams/);
+});
+
+const FAKE_RTSP_FFMPEG = path.join(__dirname, 'fake-ffmpeg-rtsp.js');
+const TAKE = '2026-09-29 08-13-05';
+
+async function startRtspAgent(t, extraEnv) {
+  const recordDir = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-rtsp-agent-'));
+  for (const source of ['cam1', 'cam2', 'cam3', 'master']) fs.mkdirSync(path.join(recordDir, source), { recursive: true });
+  // What OBS would have written for the Source Record cameras and the master.
+  for (const source of ['cam2', 'cam3', 'master']) fs.writeFileSync(path.join(recordDir, source, TAKE + '.mp4'), CAMERA_FILE_BYTES);
+  const uploads = [];
+  const r2Server = createFakeR2(uploads);
+  const r2Port = await listen(r2Server);
+  t.after(() => close(r2Server));
+  const agent = await startAgent(t, {
+    recordDir,
+    obs: { masterOutputPath: path.join(recordDir, 'master', TAKE + '.mp4') },
+    relayResponse: {
+      command: null,
+      cameras: [
+        { name: 'cam1', host: '127.0.0.1', capture: 'rtsp' },
+        { name: 'cam2', host: '127.0.0.2' },
+        { name: 'cam3', host: '127.0.0.3' },
+      ],
+    },
+    env: {
+      FFMPEG_BIN: FAKE_RTSP_FFMPEG, AUDIO_SPLIT: '0',
+      S3_ACCESS_KEY_ID: 'fake-access-key', S3_SECRET_ACCESS_KEY: 'fake-secret-key',
+      S3_BUCKET: 'fake-bucket', S3_ENDPOINT: `http://127.0.0.1:${r2Port}`,
+      ...(extraEnv || {}),
+    },
+  });
+  // Registered after startAgent so it runs once the agent (and its proxy ffmpeg) has stopped.
+  t.after(() => fs.rmSync(recordDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
+  await waitFor(() => agent.relayRequests.some((url) => url.searchParams.has('want_sources')));
+  await new Promise((resolve) => setTimeout(resolve, 200)); // camera config applied
+  return Object.assign(agent, { uploads, recordDir });
+}
+
+const vendorCalls = (agent, requestType) => agent.obsRequests
+  .filter((r) => r.type === 'CallVendorRequest' && r.data.requestType === requestType)
+  .map((r) => r.data.requestData && r.data.requestData.source || r.data.requestData);
+
+test('an RTSP camera skips Source Record and its file is named after the master and uploaded', { timeout: 30000 }, async (t) => {
+  const agent = await startRtspAgent(t);
+  assert.deepEqual(await postAgent(agent.agentPort, 'start'), { ok: true, recording: true, feeds_writing: null });
+  assert.equal(vendorCalls(agent, 'record_start').length, 2, 'Source Record started for cam2 and cam3 only');
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const status = await postAgent(agent.agentPort, 'status');
+  assert.equal(status.rtsp.cam1.writing, true);
+  const result = await postAgent(agent.agentPort, 'stop');
+  assert.deepEqual(result, { ok: true, saved: true, upload_queued: 4 });
+  assert.equal(vendorCalls(agent, 'record_stop').length, 2);
+  assert.deepEqual(fs.readdirSync(path.join(agent.recordDir, 'cam1')).filter((f) => f.endsWith('.mp4')), [TAKE + '.mp4']);
+  await waitFor(() => agent.uploads.filter((r) => r.method === 'POST' && r.query.has('uploads') && r.path.includes('/recordings/')).length === 4, 28000);
+  assert.deepEqual(agent.uploads.filter((r) => r.method === 'POST' && r.query.has('uploads') && r.path.includes('/recordings/')).map((r) => r.path).sort(), [
+    `/fake-bucket/recordings/bench-1/cam1/${TAKE}.mp4`,
+    `/fake-bucket/recordings/bench-1/cam2/${TAKE}.mp4`,
+    `/fake-bucket/recordings/bench-1/cam3/${TAKE}.mp4`,
+    `/fake-bucket/recordings/bench-1/master/${TAKE}.mp4`,
+  ].map((p) => p.replace(/ /g, '%20')).sort());
+});
+
+test('an RTSP camera that cannot connect falls back to Source Record for that take', { timeout: 15000 }, async (t) => {
+  const agent = await startRtspAgent(t, { FAKE_RTSP_FAIL: '1' });
+  assert.deepEqual(await postAgent(agent.agentPort, 'start'), { ok: true, recording: true, feeds_writing: null });
+  assert.equal(vendorCalls(agent, 'record_start').length, 3, 'cam1 recorded by Source Record after RTSP failed');
+  const status = await postAgent(agent.agentPort, 'status');
+  assert.equal(status.rtsp, undefined);
+  await postAgent(agent.agentPort, 'stop');
+  assert.equal(vendorCalls(agent, 'record_stop').length, 3);
+});
+
+test('pause and resume on an RTSP take pause ffmpeg, not Source Record, for that camera', { timeout: 15000 }, async (t) => {
+  const agent = await startRtspAgent(t);
+  await postAgent(agent.agentPort, 'start');
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  await postAgent(agent.agentPort, 'pause');
+  assert.equal(vendorCalls(agent, 'record_pause').length, 2);
+  assert.equal((await postAgent(agent.agentPort, 'status')).rtsp.cam1.paused, true);
+  await postAgent(agent.agentPort, 'resume');
+  assert.equal(vendorCalls(agent, 'record_unpause').length, 2);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const status = await postAgent(agent.agentPort, 'status');
+  assert.equal(status.rtsp.cam1.paused, false);
+  assert.equal(status.rtsp.cam1.segments, 2);
+  await postAgent(agent.agentPort, 'stop');
+  assert.deepEqual(fs.readdirSync(path.join(agent.recordDir, 'cam1')).filter((f) => f.endsWith('.mp4')), [TAKE + '.mp4']);
 });

@@ -313,8 +313,18 @@ function getNewestFileSample(sourceDir) {
   for (const entry of entries) {
     if (!entry.isFile()) continue;
 
+    // Not takes: the upload queue's proxy temp (deleted when done, so it can
+    // vanish between readdir and stat) and RTSP capture's in-progress parts.
+    // Likely cause of take 07-53-36 losing its cam2/cam3 files on Sep 29
+    // (es-mini-agent #10, third defect): take 1's proxy was still being written.
+    if (entry.name.endsWith('.proxy.mp4') || / rtsp-part\d+\.mp4$/.test(entry.name) || entry.name.endsWith(' rtsp-parts.txt')) continue;
     const absPath = path.join(sourceDir, entry.name);
-    const stat = fs.statSync(absPath);
+    let stat;
+    try {
+      stat = fs.statSync(absPath);
+    } catch (_) {
+      continue;
+    }
     if (!stat.isFile()) continue;
 
     if (!newest || stat.mtimeMs > newest.mtimeMs) {

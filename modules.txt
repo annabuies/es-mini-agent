@@ -20,3 +20,4 @@ disk-usage.js
 digest-auth.js
 cam-settings.js
 power.js
+rtsp-capture.js

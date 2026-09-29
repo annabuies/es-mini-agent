@@ -19,7 +19,14 @@ function normalizeCameras(value) {
     const host = typeof item.host === 'string' ? item.host.trim() : '';
     if (!name || !host || names.has(name)) return null;
     names.add(name);
-    cameras.push({ name, host });
+    const camera = { name, host };
+    // Optional capture fields (rtsp-capture.js). Absent => Source Record, as before.
+    if (typeof item.capture === 'string' && item.capture.trim()) camera.capture = item.capture.trim().toLowerCase();
+    if (typeof item.rtsp_url === 'string' && item.rtsp_url.trim()) camera.rtsp_url = item.rtsp_url.trim();
+    if (typeof item.rtsp_path === 'string' && item.rtsp_path.trim()) camera.rtsp_path = item.rtsp_path.trim();
+    if (Number.isInteger(item.rtsp_port)) camera.rtsp_port = item.rtsp_port;
+    if (item.rtsp_audio === true) camera.rtsp_audio = true;
+    cameras.push(camera);
   }
   return cameras;
 }
