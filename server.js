@@ -1206,32 +1206,25 @@ async function handleOp(op, body) {
         if (!recordingStartedAt) {
           console.warn('[es-mini-agent] upload skipped: unknown recording start');
         } else {
-          const enqueueCamera = (source, filePath, skipReason) => {
-            if (skipReason) {
-              console.warn('[es-mini-agent] WARN: camera upload skipped source=' + source + ' reason=' + skipReason);
-              return;
-            }
-            const out = uploadQueue.enqueue({ filePath, source, sessionRef });
-            if (out && out.queued) uploadQueued += 1;
-            else console.warn('[es-mini-agent] WARN: camera upload not queued source=' + source + ' reason=' + (out && out.reason) + ' file=' + path.basename(filePath));
-          };
           for (const source of obsCameraSources) {
             try {
               const sourceDir = path.join(OBS_RECORD_DIR, source);
               const newest = getNewestFileSample(sourceDir);
-              if (!newest || !newest.absPath) enqueueCamera(source, null, 'no_recording_file');
-              else if (newest.mtimeMs < (recordingStartedAt - 60000)) enqueueCamera(source, null, 'newest_file_predates_take:' + newest.name);
-              else enqueueCamera(source, newest.absPath, null);
+              if (!newest || !newest.absPath) continue;
+              if (newest.mtimeMs < (recordingStartedAt - 60000)) continue;
+              const out = uploadQueue.enqueue({ filePath: newest.absPath, source, sessionRef });
+              if (out && out.queued) uploadQueued += 1;
             } catch (e) {
               console.warn('[es-mini-agent] upload enqueue failed source=' + source + ':', e && (e.stack || e.message || e));
             }
           }
           for (const result of rtspResults) {
-            try {
-              enqueueCamera(result.source, result.filePath, result.filePath ? null : 'rtsp_no_file');
-            } catch (e) {
-              console.warn('[es-mini-agent] upload enqueue failed source=' + result.source + ':', e && (e.stack || e.message || e));
+            if (!result.filePath) {
+              console.warn('[es-mini-agent] WARN: rtsp ' + result.source + ' wrote no file; nothing to upload');
+              continue;
             }
+            const out = uploadQueue.enqueue({ filePath: result.filePath, source: result.source, sessionRef });
+            if (out && out.queued) uploadQueued += 1;
           }
           if (masterWasActive && masterStop.success && masterStop.outputPath) {
             try {

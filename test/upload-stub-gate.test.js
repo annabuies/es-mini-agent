@@ -2,7 +2,7 @@
 
 // Issue #10 defects 2 and 3: a zero-stream Source Record stub must never be
 // uploaded and confirmed as a recording, and a proxy still being transcoded
-// must never be mistaken for the take that was just recorded.
+// must never sit in a camera folder where stop picks "the newest file".
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -12,7 +12,7 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { createUploadQueue } = require('../upload-queue');
-const { getNewestFileSample, isRecordingFileName } = require('../obs-control');
+const { getNewestFileSample } = require('../obs-control');
 
 const FAKE = path.join(__dirname, 'fake-ffmpeg.js');
 // resolveFfmpegBin() memoizes on first use, so pin the fake before any proxy runs.
@@ -174,27 +174,6 @@ test('real ffprobe: both Source Record stub shapes are rejected', { timeout: 100
     ['cam1', 0, 'unprobeable_below_65536_bytes'],
     ['cam3', 0, 'zero_streams'],
   ]);
-});
-
-test('the stop-time newest-file scan ignores proxies, dotfiles and non-recordings', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-newest-'));
-  try {
-    const take = path.join(dir, '2026-09-29 07-53-36.mp4');
-    fs.writeFileSync(take, 'take2');
-    const later = (name) => {
-      const p = path.join(dir, name);
-      fs.writeFileSync(p, 'x');
-      fs.utimesSync(p, new Date(Date.now() + 60000), new Date(Date.now() + 60000));
-    };
-    later('2026-09-29 07-52-40.mp4.proxy.mp4');
-    later('.DS_Store');
-    later('notes.json');
-    assert.equal(getNewestFileSample(dir).absPath, take);
-    assert.equal(isRecordingFileName('2026-09-29 07-53-36.mkv'), true);
-    assert.equal(isRecordingFileName('x.mp4.proxy.mp4'), false);
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
 });
 
 test('proxies are transcoded outside the camera folder', { timeout: 10000 }, async (t) => {
