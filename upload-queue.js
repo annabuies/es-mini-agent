@@ -12,6 +12,11 @@ const STABILITY_WARN_MS = 60000;
 const MAX_ERROR_LEN = 300;
 const MASTER_SOURCE = 'master';
 const AUDIO_KIND = 'audio';
+const EMPTY_CAMERA_FILE_BYTES = 64 * 1024;
+
+function isCameraRecording(job) {
+  return !!job && job.source !== MASTER_SOURCE && job.kind !== AUDIO_KIND && /^cam(?:era)?[-_ ]?\d+$/i.test(String(job.source || ''));
+}
 let ffmpegBinMemo = null;
 
 function sleep(ms) {
@@ -295,9 +300,9 @@ function createUploadQueue(opts) {
   // file is reported through the normal upload_confirmed webhook with sizeBytes 0,
   // which the cloud posts as "Camera N recording failed" (es-honeybook #18) and
   // never links. Audio/master files are only logged. The entry is then dropped.
-  async function reportEmptyFile(job) {
-    console.warn('[upload-queue] empty file, nothing to upload key=' + job.key + ' file=' + job.filePath);
-    const camera = job.source !== MASTER_SOURCE && job.kind !== AUDIO_KIND && /^cam(?:era)?[-_ ]?\d+$/i.test(String(job.source || ''));
+  async function reportEmptyFile(job, sizeBytes) {
+    console.warn('[upload-queue] empty file, nothing to upload key=' + job.key + ' bytes=' + (sizeBytes || 0) + ' file=' + job.filePath);
+    const camera = isCameraRecording(job);
     const url = typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl;
     if (camera && url) {
       try {
@@ -336,8 +341,12 @@ function createUploadQueue(opts) {
       return;
     }
 
-    if (stable.sizeBytes === 0) {
-      await reportEmptyFile(job);
+    // A camera "recording" under 64 KiB has no video in it: Source Record's silent
+    // cam1 failure leaves a 1,737-byte file with zero streams (es-mini-agent #10),
+    // which used to be uploaded and confirmed as a real take. One second of any
+    // camera here is megabytes. Report it as failed, like a 0-byte file.
+    if (stable.sizeBytes === 0 || (isCameraRecording(job) && stable.sizeBytes < EMPTY_CAMERA_FILE_BYTES)) {
+      await reportEmptyFile(job, stable.sizeBytes);
       return;
     }
 

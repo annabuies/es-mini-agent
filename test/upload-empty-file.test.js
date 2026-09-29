@@ -79,3 +79,36 @@ test('sweep drops upload states left behind by the old "requires sizeBytes" fail
   await queue.sweep();
   assert.deepEqual(fs.readdirSync(stateDir), ['other.state.json']);
 });
+
+test('a 1,737-byte camera stub (Source Record zero-stream file) is reported as failed, not uploaded', { timeout: 8000 }, async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-stub-cam-'));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const hook = await webhookServer(t);
+  const filePath = path.join(tempDir, '2026-09-29 08-03-48.mp4');
+  fs.writeFileSync(filePath, Buffer.alloc(1737, 1));
+  const uploads = [];
+  const queue = createUploadQueue({
+    stateDir: path.join(tempDir, 'state'), buildingId: 'bench-1', stabilityPollMs: 5, webhookUrl: hook.url,
+    uploader: async (input) => { uploads.push(input); return { key: input.key, sizeBytes: input.sizeBytes }; },
+  });
+  queue.enqueue({ filePath, source: 'cam1', sessionRef: 'sess-1' });
+  await waitFor(() => hook.posts.length === 1 && queue.status().active === null && queue.status().queued === 0, 6000);
+  assert.equal(uploads.length, 0);
+  assert.equal(hook.posts[0].sizeBytes, 0);
+  assert.equal(hook.posts[0].source, 'cam1');
+});
+
+test('a small master or audio file is still uploaded (the stub floor is cameras only)', { timeout: 8000 }, async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-stub-master-'));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const filePath = path.join(tempDir, 'master-take.mp4');
+  fs.writeFileSync(filePath, Buffer.alloc(1737, 1));
+  const uploads = [];
+  const queue = createUploadQueue({
+    stateDir: path.join(tempDir, 'state'), buildingId: 'bench-1', stabilityPollMs: 5,
+    uploader: async (input) => { uploads.push(input); return { key: input.key, sizeBytes: input.sizeBytes }; },
+  });
+  queue.enqueue({ filePath, source: 'master', sessionRef: null });
+  await waitFor(() => uploads.length === 1, 6000);
+  assert.equal(uploads[0].sizeBytes, 1737);
+});

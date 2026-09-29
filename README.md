@@ -169,6 +169,19 @@ PTZ look support was rebased onto `10fa9a8` on 2026-09-05.
 
 A 0-byte recording file is never uploaded (S3 multipart needs at least one byte). A camera file is reported through the normal `upload_confirmed` webhook with `sizeBytes: 0`, which the cloud posts as a failed recording; audio/master files are only logged. Upload states left by the old `runMultipartUpload requires sizeBytes` failure are dropped on the next sweep.
 
+## RTSP camera capture (stream copy)
+
+A camera whose entry in `studios.fleet_buildings.cameras` has `"capture": "rtsp"` is recorded by ffmpeg straight from its own RTSP stream instead of OBS Source Record (added 2026.09.29-2, after Source Record's silent cam1 failures in issue #10). The video is copied as the camera sends it (H.264, no encode); camera audio, if any, is re-encoded to AAC. OBS still records the master and mic tracks and still drives the live preview.
+
+- URL: `rtsp://<host>:554/1` by default. Optional per-camera keys: `rtsp_path` (e.g. `"/2"`), `rtsp_port`, or a full `rtsp_url`. Never put a password in `rtsp_url`; the table is readable by the app backend.
+- Files: the camera's file is named after the take's master file (`cam1/<same name as master>.mp4`), so a take's files still match. A pause ends a segment and resume starts the next; a dropped connection is retried every 2 s as a new segment (up to 20 per take). Segments (`<stamp> rtsp-partN.mp4`, fragmented MP4) are joined at stop, then deleted.
+- Safety: if a camera's RTSP stream does not come up within 2.5 s at Start, that camera is recorded by Source Record for that take and the log says `falling back to Source Record`.
+- Switching is a data change, picked up within 60 s (next take); no install, no restart. `RTSP_CAPTURE=0` in the plist turns it off on one Mini regardless of the table.
+- `status` (while recording) and `diag` include an `rtsp` block: which cameras are on RTSP and, per recording camera, `writing`, `bytes`, `segments`, `restarts`, `paused`.
+- Size: three cameras at the Sep 24 measured 32 Mbps are about 43 GB per recorded hour, versus about 24 GB per hour with Source Record (cam1 HEVC ~30 Mbps, cam2/3 ~12 Mbps).
+
+Also since 2026.09.29-2: a camera file under 64 KiB is treated like a 0-byte file (reported as a failed recording with `sizeBytes: 0`, not uploaded). That catches Source Record's 1,737-byte zero-stream stub. The stop path no longer mistakes the upload queue's `*.proxy.mp4` temp file for a take's newest camera file.
+
 ## OBS control (optional)
 
 - Requires OBS Studio 28+ (obs-websocket v5 is built in). Enable/configure it in **Tools -> obs-websocket Settings** (port/password must match env vars here).
