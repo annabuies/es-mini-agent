@@ -7,9 +7,11 @@
 // camera whose relay config says `"capture": "rtsp"`, the agent records the
 // camera's own H.264 RTSP stream with ffmpeg instead, so the failing recorder
 // is not in the path. The video is copied bit-for-bit (no encode, ~13% CPU for
-// three 4K cameras in the Sep 24 test); only camera audio, if any, is re-encoded
-// to AAC so any camera audio codec fits in MP4. OBS keeps the master mix, the
-// live preview and the mic tracks.
+// three 4K cameras in the Sep 24 test). Camera audio is left out by default:
+// the bench-1 cameras send an empty AAC track, and an audio stream with no
+// packets makes ffmpeg hold every video packet in memory until stop (tested
+// with ffmpeg 8.1, 2026-09-29). `"rtsp_audio": true` on a camera copies its
+// audio once it carries sound. OBS keeps the master mix, the preview and the mics.
 //
 // One take = one or more segments: a pause ends the current segment and resume
 // starts the next; a dropped camera connection is retried as a new segment.
@@ -34,6 +36,9 @@ const MAX_RESTARTS = 20;
 const STDERR_TAIL_LINES = 12;
 // A part with only the MP4 header (~1 KB, camera never sent a frame) is not footage.
 const MIN_PART_BYTES = 16 * 1024;
+// Start counts as up once video is on disk, not just a header: a stalled mux
+// writes a 28-byte ftyp and then nothing. One second of a camera here is ~4 MB.
+const START_MIN_BYTES = 4 * 1024;
 const SAFE_HOST_RE = /^[A-Za-z0-9.-]+$/;
 
 function isRtspCamera(camera) {
@@ -64,7 +69,8 @@ function takeStamp(date) {
   return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + '-' + p(d.getMinutes()) + '-' + p(d.getSeconds());
 }
 
-function recordArgs(url, outPath) {
+function recordArgs(url, outPath, options) {
+  const audio = !!(options && options.audio);
   const input = /^rtsps?:\/\//i.test(url)
     // TCP: no UDP packet loss on a busy LAN. -timeout (µs) makes a dead camera
     // end the process instead of hanging it, which triggers a new segment.
@@ -73,8 +79,9 @@ function recordArgs(url, outPath) {
   return [
     '-hide_banner', '-loglevel', 'warning', '-y',
     ...input,
-    '-map', '0:v:0', '-map', '0:a:0?',
-    '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+    '-map', '0:v:0',
+    ...(audio ? ['-map', '0:a:0?', '-c:a', 'copy'] : ['-an']),
+    '-c:v', 'copy',
     '-f', 'mp4', '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
     outPath,
   ];
@@ -104,7 +111,7 @@ function createRtspCapture(options) {
   function spawnSegment(take) {
     take.segmentIndex += 1;
     const partPath = path.join(take.dir, take.stamp + ' rtsp-part' + take.segmentIndex + '.mp4');
-    const args = recordArgs(take.url, partPath);
+    const args = recordArgs(take.url, partPath, { audio: take.audio });
     let child;
     try {
       child = spawnImpl(ffmpegBin(), args, { stdio: ['pipe', 'ignore', 'pipe'] });
@@ -165,12 +172,12 @@ function createRtspCapture(options) {
     const deadline = Date.now() + startProbeMs;
     while (Date.now() < deadline) {
       if (seg.exited) return false;
-      if (fileSize(seg.partPath) > 0) return true;
+      if (fileSize(seg.partPath) >= START_MIN_BYTES) return true;
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     // Alive but silent (a camera that accepts the connection and sends nothing)
     // counts as a failed start, so the caller falls back to Source Record.
-    return !seg.exited && fileSize(seg.partPath) > 0;
+    return !seg.exited && fileSize(seg.partPath) >= START_MIN_BYTES;
   }
 
   async function quitSegment(seg, force) {
@@ -206,7 +213,7 @@ function createRtspCapture(options) {
     if (takes.has(source)) return { ok: false, reason: 'rtsp_already_recording' };
     try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
     const take = {
-      source, url, dir,
+      source, url, dir, audio: !!(input && input.audio),
       stamp: takeStamp(input.startedAt || Date.now()),
       segments: [], segmentIndex: 0, restarts: 0,
       paused: false, stopping: false, starting: true, restartTimer: null,
@@ -223,7 +230,7 @@ function createRtspCapture(options) {
       take.stopping = true;
       takes.delete(source);
       await quitSegment(out.seg, true);
-      const detail = redactUrl(out.seg.stderr.slice(-3).join(' | ')) || (out.seg.code === null || out.seg.signal ? 'no data from the camera within ' + (startProbeMs / 1000) + ' s' : 'ffmpeg exit ' + out.seg.code);
+      const detail = redactUrl(out.seg.stderr.slice(-3).join(' | ')) || (out.seg.code === null || out.seg.signal ? 'no video from the camera within ' + (startProbeMs / 1000) + ' s' : 'ffmpeg exit ' + out.seg.code);
       await fsp.rm(out.seg.partPath, { force: true }).catch(() => {});
       warn(source + ' could not start ' + redactUrl(url) + ': ' + detail);
       return { ok: false, reason: 'rtsp_start_failed', detail };

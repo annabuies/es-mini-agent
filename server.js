@@ -1089,7 +1089,8 @@ async function handleOp(op, body) {
     const startResults = await Promise.all(startingSources.map(async (source) => {
       const url = rtspUrlForSource(source);
       if (url) {
-        const rtsp = await rtspCapture.start({ source, url, dir: path.join(OBS_RECORD_DIR, source), startedAt });
+        const camera = (state.cameras || []).find((c) => c.name === source);
+        const rtsp = await rtspCapture.start({ source, url, dir: path.join(OBS_RECORD_DIR, source), startedAt, audio: !!(camera && camera.rtsp_audio) });
         if (rtsp.ok) {
           rtspStarted.push(source);
           return { source, vendor: { success: true } };

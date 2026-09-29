@@ -115,16 +115,24 @@ test('a dropped camera reconnects as a new segment and the take keeps both halve
   assert.ok(fs.existsSync(path.join(dir, 'take.mp4')));
 });
 
-test('a camera that never sends a frame gives no file, not a stub', { timeout: 10000 }, async (t) => {
+test('a camera that writes only a header (stalled mux, no video) fails the start', { timeout: 10000 }, async (t) => {
   const dir = tempDir(t);
   withEnv(t, { FAKE_RTSP_NO_FRAMES: '1' });
-  const cap = capture();
-  assert.equal((await cap.start({ source: 'cam1', url: 'rtsp://10.0.0.5:554/1', dir })).ok, true);
-  await sleep(200);
-  const out = await cap.stop('cam1', { finalBase: 'take' });
+  const cap = capture({ startProbeMs: 400 });
+  const out = await cap.start({ source: 'cam1', url: 'rtsp://10.0.0.5:554/1', dir });
   assert.equal(out.ok, false);
-  assert.equal(out.reason, 'rtsp_no_data');
-  assert.equal(out.filePath, null);
+  assert.equal(out.reason, 'rtsp_start_failed');
+  assert.equal(cap.active('cam1'), false);
+});
+
+test('camera audio is left out unless the camera opts in, and is then copied, never encoded', () => {
+  const { recordArgs } = require('../rtsp-capture');
+  const off = recordArgs('rtsp://10.0.0.5:554/1', '/x/out.mp4');
+  assert.ok(off.includes('-an'));
+  assert.ok(!off.includes('0:a:0?'));
+  const on = recordArgs('rtsp://10.0.0.5:554/1', '/x/out.mp4', { audio: true });
+  assert.deepEqual(on.slice(on.indexOf('0:a:0?') - 1, on.indexOf('0:a:0?') + 3), ['-map', '0:a:0?', '-c:a', 'copy']);
+  assert.ok(!on.includes('aac'));
 });
 
 test('newest-file lookup skips proxy temps and RTSP parts', (t) => {
@@ -177,7 +185,7 @@ test('a camera that connects but sends nothing fails the start within the probe 
   const out = await cap.start({ source: 'cam1', url: 'rtsp://10.0.0.5:554/1', dir });
   assert.equal(out.ok, false);
   assert.equal(out.reason, 'rtsp_start_failed');
-  assert.match(out.detail, /no data from the camera/);
+  assert.match(out.detail, /no video from the camera/);
   assert.ok(Date.now() - began < 2000, 'no 6 s wait on a q that is never read');
   assert.equal(cap.active('cam1'), false);
 });

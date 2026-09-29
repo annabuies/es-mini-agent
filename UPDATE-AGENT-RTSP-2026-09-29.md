@@ -39,7 +39,7 @@ For each take, check:
   ```
   ffprobe -v error -show_entries stream=codec_type,codec_name,width,height:format=duration -of compact "<file>"
   ```
-  Expect `h264` video (not `hevc` as before), duration within about 1 s of the master, and one file per camera, not parts.
+  Expect one `h264` video stream (not `hevc` as before) and **no audio stream** (the cameras' empty AAC track is left out on purpose). The duration should be within about 1 s of the master, and there should be one file per camera, not parts.
 - **Agent log:** each camera has one line of the form `[rtsp] camN saved <name>.mp4 bytes=… segments=1 reconnects=0`. Take 6 shows `segments=2`.
 - **Log problems:** any `falling back to Source Record`, `ffmpeg exited mid-take` or `concat failed` line is a finding. Paste it into issue #10 (IPs redacted).
 - **Slack:** the session thread lists all three cameras plus the master, and no "recording failed".
