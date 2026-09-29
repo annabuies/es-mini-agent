@@ -160,5 +160,9 @@ test('agent power op: lights only, mini refused even when listed, no off while r
   assert.deepEqual(dli.strip.states.slice(0, 3), [true, true, true]);
   assert.match(output.text, /power: POWER_OUTLETS_SWITCHABLE ignored mini,router/);
   assert.match(output.text, /power: off lights\(4\) -> ok physical=off/);
+  // Refusals come back as HTTP 200 with ok:false, and the request log says so (issue #8).
+  assert.match(output.text, /POST \/record\/power -> 200 refused power outlet_denied/);
+  assert.match(output.text, /POST \/record\/power -> 200 refused power busy_recording/);
+  assert.match(output.text, /POST \/record\/power -> 200 ok power/);
   assert.doesNotMatch(output.text, new RegExp(dli.password));
 });

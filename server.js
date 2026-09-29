@@ -28,7 +28,7 @@ const { describePower, readPowerConfig, runPower } = require('./power');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.09.28-3';
+const AGENT_VERSION = '2026.09.29-1';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -126,8 +126,10 @@ let cloudflarePreviewOverlay = null;
 let startInFlight = null;
 let pendingSources = null;
 
-function log(method, path, status, note) {
-  const tag = status < 400 ? 'ok' : 'fail';
+function log(method, path, status, note, refused) {
+  // A 200 whose body says ok:false (refusal, busy, unconfigured) is logged as
+  // `refused` so the log never reads "ok" for something that did not happen.
+  const tag = status >= 400 ? 'fail' : (refused ? 'refused' : 'ok');
   const suffix = note ? ' ' + note : '';
   console.log(`${method} ${path} -> ${status} ${tag}${suffix}`);
 }
@@ -1701,7 +1703,8 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       sendJson(res, 200, out);
-      log(method, url, 200, op);
+      const refused = out && out.ok === false;
+      log(method, url, 200, refused && out.reason ? `${op} ${out.reason}` : op, refused);
       return;
     }
 
