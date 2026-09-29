@@ -24,7 +24,9 @@ const { spawn, execFileSync } = require('child_process');
 
 const DEFAULT_RTSP_PORT = 554;
 const DEFAULT_RTSP_PATH = '/1';
-const START_PROBE_MS = 2500;
+// ffmpeg writes the MP4 header as soon as it has the stream parameters, which
+// RTSP gives at connect; no bytes by then means no stream (PR #11 review).
+const START_PROBE_MS = 4000;
 const STOP_QUIT_MS = 6000;
 const STOP_TERM_MS = 3000;
 const RESTART_DELAY_MS = 2000;
@@ -166,12 +168,20 @@ function createRtspCapture(options) {
       if (fileSize(seg.partPath) > 0) return true;
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    return !seg.exited; // still connecting (waiting for a keyframe) is fine
+    // Alive but silent (a camera that accepts the connection and sends nothing)
+    // counts as a failed start, so the caller falls back to Source Record.
+    return !seg.exited && fileSize(seg.partPath) > 0;
   }
 
-  async function quitSegment(seg) {
+  async function quitSegment(seg, force) {
     if (!seg || seg.exited) return;
     seg.quitRequested = true;
+    if (force) {
+      // Nothing worth finalizing, and 'q' is ignored while ffmpeg is still connecting.
+      try { seg.child.kill('SIGKILL'); } catch (_) {}
+      await seg.done;
+      return;
+    }
     try { seg.child.stdin.write('q'); seg.child.stdin.end(); } catch (_) {}
     const waitFor = (ms) => Promise.race([seg.done, new Promise((resolve) => { const t = setTimeout(resolve, ms); if (t.unref) t.unref(); })]);
     await waitFor(stopQuitMs);
@@ -212,8 +222,8 @@ function createRtspCapture(options) {
     if (!alive || out.seg.exited) {
       take.stopping = true;
       takes.delete(source);
-      await quitSegment(out.seg);
-      const detail = redactUrl(out.seg.stderr.slice(-3).join(' | ')) || ('ffmpeg exit ' + out.seg.code);
+      await quitSegment(out.seg, true);
+      const detail = redactUrl(out.seg.stderr.slice(-3).join(' | ')) || (out.seg.code === null || out.seg.signal ? 'no data from the camera within ' + (startProbeMs / 1000) + ' s' : 'ffmpeg exit ' + out.seg.code);
       await fsp.rm(out.seg.partPath, { force: true }).catch(() => {});
       warn(source + ' could not start ' + redactUrl(url) + ': ' + detail);
       return { ok: false, reason: 'rtsp_start_failed', detail };

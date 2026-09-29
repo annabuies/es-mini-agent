@@ -4,7 +4,7 @@
 // Stands in for ffmpeg in the RTSP capture tests.
 // - rtsp:// input: writes an MP4-header-sized first chunk, then 32 KiB every 50 ms
 //   until 'q' arrives on stdin. FAKE_RTSP_FAIL=1: refuses the connection.
-//   FAKE_RTSP_NO_FRAMES=1: header only. FAKE_RTSP_DROP_ONCE=<marker file>: the
+//   FAKE_RTSP_NO_FRAMES=1: header only. FAKE_RTSP_SILENT=1: connects, writes nothing. FAKE_RTSP_DROP_ONCE=<marker file>: the
 //   first process to run drops the connection after 150 ms.
 // - concat: joins the listed files byte for byte.
 // - anything else (proxies, audio split): writes a small output file.
@@ -34,6 +34,11 @@ if (!/^rtsps?:\/\//.test(input)) {
 if (process.env.FAKE_RTSP_FAIL === '1') {
   process.stderr.write('[in#0 @ 0x1] Error opening input: Connection refused\n');
   process.exit(1);
+}
+
+if (process.env.FAKE_RTSP_SILENT === '1') {
+  setInterval(() => {}, 1000); // hangs like ffmpeg stuck in connect: ignores 'q'
+  return;
 }
 
 setTimeout(() => {

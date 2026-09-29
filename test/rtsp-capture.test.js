@@ -168,3 +168,16 @@ test('boot cleanup kills a capture left by a dead agent under this record dir on
   assert.equal(bystander.exitCode, null, 'a capture under another record dir is left alone');
   assert.equal(killOrphanedCaptures(mine), false, 'nothing left to kill');
 });
+
+test('a camera that connects but sends nothing fails the start within the probe window, and ffmpeg is killed', { timeout: 10000 }, async (t) => {
+  const dir = tempDir(t);
+  withEnv(t, { FAKE_RTSP_SILENT: '1' });
+  const cap = capture({ startProbeMs: 400 });
+  const began = Date.now();
+  const out = await cap.start({ source: 'cam1', url: 'rtsp://10.0.0.5:554/1', dir });
+  assert.equal(out.ok, false);
+  assert.equal(out.reason, 'rtsp_start_failed');
+  assert.match(out.detail, /no data from the camera/);
+  assert.ok(Date.now() - began < 2000, 'no 6 s wait on a q that is never read');
+  assert.equal(cap.active('cam1'), false);
+});

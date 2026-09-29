@@ -75,5 +75,5 @@ where building_id = 'bench-1';
 
 - **Bigger files.** Three cameras at 32 Mbps are about 43 GB per recorded hour, versus about 24 GB/h before. Watch free disk in the heartbeat and upload time.
 - **cam2/cam3 resolution.** They are now whatever the camera streams. If that's 4K, they're bigger than the old 2560×1440 Source Record files.
-- **Start latency.** Each RTSP camera needs up to 2.5 s to connect at Start. If one doesn't connect, that camera falls back to Source Record for that take, so a take is never missing a camera because of RTSP.
+- **Start latency.** Each RTSP camera normally connects in about 1 s at Start (4 s at most). If one doesn't connect, that camera falls back to Source Record for that take, so a take is never missing a camera because of RTSP.
 - **Unchanged:** the master, the mic split, the preview and the kiosk.
