@@ -52,9 +52,9 @@ if [[ -f "$EXISTING_PLIST" && -x /usr/libexec/PlistBuddy ]]; then
              S3_ACCESS_KEY_ID S3_SECRET_ACCESS_KEY S3_BUCKET S3_ENDPOINT S3_REGION AWS_ROLE_ARN \
              R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET R2_ENDPOINT \
              UPLOAD_CONFIRMED_WEBHOOK_URL PTZ_HTTP_USER PTZ_HTTP_PASS \
-             POWER_STRIP_URL POWER_STRIP_USER POWER_STRIP_PASS POWER_OUTLETS_SWITCHABLE \
              RTSP_CAPTURE_SOURCES RTSP_URL_CAM1 RTSP_URL_CAM2 RTSP_URL_CAM3 \
-             RTSP_TRANSPORT RTSP_AUDIO RTSP_VIDEO_TAG; do
+             RTSP_TRANSPORT RTSP_AUDIO RTSP_VIDEO_TAG \
+             POWER_STRIP_URL POWER_STRIP_USER POWER_STRIP_PASS POWER_OUTLETS_SWITCHABLE; do
     [[ -n "${!key:-}" ]] && continue
     if value="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$key" "$EXISTING_PLIST" 2>/dev/null)" && [[ -n "$value" ]]; then
       printf -v "$key" '%s' "$value"
