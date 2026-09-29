@@ -12,6 +12,10 @@ const STABILITY_WARN_MS = 60000;
 const MAX_ERROR_LEN = 300;
 const MASTER_SOURCE = 'master';
 const AUDIO_KIND = 'audio';
+// Below this a recording is only trusted if ffprobe finds a stream in it. The
+// Source Record zero-stream stub is 1,737 bytes; one second of any camera is MBs.
+const DEFAULT_MIN_RECORDING_BYTES = 64 * 1024;
+const QUARANTINE_DIR = 'quarantine';
 let ffmpegBinMemo = null;
 
 function sleep(ms) {
@@ -97,6 +101,10 @@ function createUploadQueue(opts) {
   const stabilityPollMs = Number.isFinite(options.stabilityPollMs) && options.stabilityPollMs >= 0
     ? options.stabilityPollMs
     : STABILITY_POLL_MS;
+  const minRecordingBytes = Number.isFinite(options.minRecordingBytes) && options.minRecordingBytes >= 0
+    ? options.minRecordingBytes
+    : DEFAULT_MIN_RECORDING_BYTES;
+  const probeGate = options.probeGate !== false;
 
   const queue = [];
   const pendingProxyJobs = [];
@@ -295,8 +303,10 @@ function createUploadQueue(opts) {
   // file is reported through the normal upload_confirmed webhook with sizeBytes 0,
   // which the cloud posts as "Camera N recording failed" (es-honeybook #18) and
   // never links. Audio/master files are only logged. The entry is then dropped.
-  async function reportEmptyFile(job) {
-    console.warn('[upload-queue] empty file, nothing to upload key=' + job.key + ' file=' + job.filePath);
+  // A zero-stream stub takes the same path: sizeBytes 0 is the only failure signal
+  // the cloud understands today, and nothing is uploaded, so nothing gets linked.
+  async function reportEmptyFile(job, invalid) {
+    if (!invalid) console.warn('[upload-queue] empty file, nothing to upload key=' + job.key + ' file=' + job.filePath);
     const camera = job.source !== MASTER_SOURCE && job.kind !== AUDIO_KIND && /^cam(?:era)?[-_ ]?\d+$/i.test(String(job.source || ''));
     const url = typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl;
     if (camera && url) {
@@ -304,7 +314,7 @@ function createUploadQueue(opts) {
         const res = await fetch(String(url), {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
+          body: JSON.stringify(Object.assign({
             event: 'upload_confirmed',
             key: job.key,
             sizeBytes: 0,
@@ -313,7 +323,7 @@ function createUploadQueue(opts) {
             building_id: buildingId,
             source: job.source,
             session_ref: job.sessionRef,
-          }),
+          }, invalid ? { invalid: invalid.reason, file_size_bytes: invalid.sizeBytes, streams: invalid.streams } : {})),
         });
         if (!res.ok) console.warn('[upload-queue] empty file webhook failed status=' + res.status + ' key=' + job.key);
       } catch (e) {
@@ -322,6 +332,45 @@ function createUploadQueue(opts) {
     }
     await removeFileIfExists(job.stateFilePath);
     completedFilePaths.add(job.filePath);
+  }
+
+  /**
+   * null when the recording is worth uploading, else { reason, sizeBytes, streams }.
+   * ffprobe is authoritative; the size floor only decides when ffprobe cannot answer.
+   */
+  async function checkRecordingPlayable(job, sizeBytes) {
+    if (!probeGate || job.kind === AUDIO_KIND) return null;
+    let streams = null;
+    let probeError = null;
+    try {
+      const output = await runFfprobe(['-v', 'error', '-show_entries', 'stream=index,codec_type', '-of', 'json', job.filePath]);
+      const parsed = JSON.parse(output || '{}');
+      streams = Array.isArray(parsed.streams) ? parsed.streams.length : 0;
+    } catch (e) {
+      probeError = truncateError(e && (e.message || e));
+    }
+    if (streams === 0) return { reason: 'zero_streams', sizeBytes, streams: 0 };
+    if (streams === null && sizeBytes < minRecordingBytes) {
+      return { reason: 'unprobeable_below_' + minRecordingBytes + '_bytes', sizeBytes, streams: null, probeError };
+    }
+    if (streams === null) {
+      console.warn('[upload-queue] WARN: ffprobe failed, uploading anyway (above size floor) key=' + job.key + ' error=' + probeError);
+    }
+    return null;
+  }
+
+  // Kept (not deleted) for forensics, in a subfolder the stop-time "newest file" scan never looks into.
+  async function quarantineRecording(job) {
+    const dir = path.join(path.dirname(job.filePath), QUARANTINE_DIR);
+    const target = path.join(dir, path.basename(job.filePath));
+    try {
+      await fsp.mkdir(dir, { recursive: true });
+      await fsp.rename(job.filePath, target);
+      return target;
+    } catch (e) {
+      console.warn('[upload-queue] quarantine move failed key=' + job.key + ':', e && (e.message || e));
+      return null;
+    }
   }
 
   async function runJob(job) {
@@ -338,6 +387,17 @@ function createUploadQueue(opts) {
 
     if (stable.sizeBytes === 0) {
       await reportEmptyFile(job);
+      return;
+    }
+
+    const invalid = await checkRecordingPlayable(job, stable.sizeBytes);
+    if (invalid) {
+      const movedTo = await quarantineRecording(job);
+      console.warn('[upload-queue] WARN: unplayable recording NOT uploaded key=' + job.key
+        + ' reason=' + invalid.reason + ' sizeBytes=' + invalid.sizeBytes
+        + (invalid.probeError ? ' probe_error=' + invalid.probeError : '')
+        + ' quarantined=' + (movedTo || 'no'));
+      await reportEmptyFile(job, invalid);
       return;
     }
 
@@ -424,9 +484,12 @@ function createUploadQueue(opts) {
 
     const proxyBase = path.basename(job.filePath, path.extname(job.filePath));
     const proxyKey = 'proxies/' + buildingId + '/' + job.source + '/' + proxyBase + '.mp4';
-    const tmpProxyPath = job.filePath + '.proxy.mp4';
+    // Never inside the camera folder: stop picks the newest file there, and a proxy
+    // still transcoding from the previous take is newer than the take just recorded.
+    const tmpProxyPath = path.join(stateDir + '-proxy-tmp', toSafeFileName(job.source + '-' + proxyBase) + '.proxy.mp4');
 
     try {
+      await fsp.mkdir(path.dirname(tmpProxyPath), { recursive: true });
       let st;
       try {
         st = await fsp.stat(job.filePath);

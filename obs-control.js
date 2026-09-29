@@ -306,12 +306,23 @@ async function callVendor(client, requestType, source) {
   }
 }
 
+// Only camera recordings count as "the newest file". Proxies used to be transcoded
+// beside the recording as <name>.proxy.mp4 and, while still being written, won
+// the newest-file race and were enqueued in place of the take (issue #10, take 2).
+const RECORDING_EXTENSIONS = new Set(['.mp4', '.mov', '.mkv', '.flv', '.ts', '.m4v']);
+
+function isRecordingFileName(name) {
+  const lower = String(name || '').toLowerCase();
+  if (lower.startsWith('.') || lower.includes('.proxy.')) return false;
+  return RECORDING_EXTENSIONS.has(path.extname(lower));
+}
+
 function getNewestFileSample(sourceDir) {
   const entries = fs.readdirSync(sourceDir, { withFileTypes: true });
   let newest = null;
 
   for (const entry of entries) {
-    if (!entry.isFile()) continue;
+    if (!entry.isFile() || !isRecordingFileName(entry.name)) continue;
 
     const absPath = path.join(sourceDir, entry.name);
     const stat = fs.statSync(absPath);
@@ -429,5 +440,6 @@ module.exports = {
   callVendor,
   getSourceScreenshot,
   getNewestFileSample,
+  isRecordingFileName,
   sampleFeedsWriting,
 };

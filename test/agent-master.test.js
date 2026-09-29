@@ -11,6 +11,11 @@ const { spawn } = require('node:child_process');
 const test = require('node:test');
 const { createUploadQueue } = require('../upload-queue');
 
+// The fixtures below are a few bytes of text, not video; the fake ffprobe says
+// they have streams so the zero-stream upload gate lets them through. Spawned
+// agents inherit this.
+process.env.FFPROBE_BIN = path.join(__dirname, 'fake-ffmpeg.js');
+
 function listen(server) {
   return new Promise((resolve, reject) => {
     server.once('error', reject);
