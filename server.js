@@ -1,7 +1,7 @@
 'use strict';
 
 const { installConsoleTimestamps } = require('./log-timestamps');
-installConsoleTimestamps();
+installConsoleTimestamps({ teeWarnings: true }); // warnings reach agent.log too (#10)
 
 // EVRYBDY Studios FLEET — Mini-side agent.
 // Proves the app -> Cloudflare Worker (api.evrybdystudios.com) -> Mini connection is real.
@@ -30,7 +30,7 @@ const { checkTake } = require('./take-health');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.09.30-1';
+const AGENT_VERSION = '2026.09.30-2';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -91,6 +91,10 @@ const UPLOAD_STATE_DIR = process.env.UPLOAD_STATE_DIR || path.join(__dirname, '.
 // .cameras) says "capture": "rtsp"; the others keep Source Record. Switching a camera
 // is a data change, no install. RTSP_CAPTURE=0 in the plist turns it off on this Mini.
 const RTSP_CAPTURE_ENABLED = process.env.RTSP_CAPTURE !== '0';
+// Camera + master originals are deleted from the Mini once their upload is verified
+// in S3 (Robbie, Sep 29: ~43 GB per recorded hour, 103 GB free). DELETE_AFTER_UPLOAD=0
+// in the LaunchAgent keeps them.
+const DELETE_AFTER_UPLOAD = process.env.DELETE_AFTER_UPLOAD !== '0';
 const rtspCapture = createRtspCapture({ ffmpegBin: () => resolveFfmpegBin().bin });
 process.once('exit', () => rtspCapture.killAll());
 if (killOrphanedCaptures(OBS_RECORD_DIR)) {
@@ -257,6 +261,7 @@ const uploadQueue = isStorageConfigured()
     webhookUrl: () => activeWebhookUrl,
     buildingId: BUILDING_ID,
     audioSplit: AUDIO_SPLIT,
+    deleteAfterUpload: DELETE_AFTER_UPLOAD,
   })
   : null;
 
@@ -1336,9 +1341,13 @@ async function handleOp(op, body) {
               continue;
             }
             try {
-              const out = uploadQueue.enqueue({ filePath: f.filePath, source: f.source, sessionRef, meta });
-              if (out && out.queued) uploadQueued += 1;
-              else console.warn('[es-mini-agent] upload enqueue skipped source=' + f.source + ' reason=' + (out && out.reason));
+              // A failed RTSP join keeps every part; filePath is the first, and each later one is footage too.
+              const extraParts = f.rtsp && Array.isArray(f.rtsp.keptParts) ? f.rtsp.keptParts.filter((p) => p !== f.filePath) : [];
+              for (const filePath of [f.filePath, ...extraParts]) {
+                const out = uploadQueue.enqueue({ filePath, source: f.source, sessionRef, meta });
+                if (out && out.queued) uploadQueued += 1;
+                else console.warn('[es-mini-agent] upload enqueue skipped source=' + f.source + ' reason=' + (out && out.reason));
+              }
             } catch (e) {
               console.warn('[es-mini-agent] upload enqueue failed source=' + f.source + ':', e && (e.stack || e.message || e));
             }

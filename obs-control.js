@@ -312,6 +312,8 @@ function getNewestFileSample(sourceDir) {
 
   for (const entry of entries) {
     if (!entry.isFile()) continue;
+    // Only recordings: not .DS_Store, the concat list, or a sidecar next to a take.
+    if (!/\.(mp4|mov|mkv|flv|ts)$/i.test(entry.name)) continue;
 
     // Not takes: the upload queue's proxy temp (deleted when done, so it can
     // vanish between readdir and stat) and RTSP capture's in-progress parts.

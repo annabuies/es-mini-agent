@@ -265,3 +265,25 @@ test('ffmpeg running with no new video on disk is reported as a stall', { timeou
   assert.equal(out.stalls, 1);
   assert.match(warnings.join('\n'), /cam1 STALLED: no new video on disk/);
 });
+
+test('fragments are cut every 0.5 s as well as at keyframes', () => {
+  const { recordArgs } = require('../rtsp-capture');
+  const args = recordArgs('rtsp://10.0.0.5:554/1', '/tmp/x.mp4');
+  assert.equal(args[args.indexOf('-frag_duration') + 1], '500000');
+  assert.match(args[args.indexOf('-movflags') + 1], /frag_keyframe/);
+  assert.equal(args[args.length - 1], '/tmp/x.mp4');
+});
+
+test('a join that exits 0 but comes out short keeps every part instead of losing the later ones', { timeout: 10000 }, async (t) => {
+  const dir = tempDir(t);
+  withEnv(t, { FAKE_RTSP_DROP_ONCE: path.join(dir, 'dropped.marker'), FAKE_CONCAT_SHORT: '1' });
+  const cap = capture();
+  await cap.start({ source: 'cam2', url: 'rtsp://10.0.0.6:554/1', dir });
+  await sleep(700);
+  const out = await cap.stop('cam2', { finalBase: 'take' });
+  assert.equal(out.ok, false);
+  assert.equal(out.reason, 'rtsp_concat_failed');
+  assert.equal(out.keptParts.length, 2);
+  for (const p of out.keptParts) assert.ok(fs.existsSync(p));
+  assert.equal(fs.existsSync(path.join(dir, 'take.mp4')), false);
+});

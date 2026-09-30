@@ -97,7 +97,10 @@ function recordArgs(url, outPath, options) {
     '-map', '0:v:0',
     ...(audio ? ['-map', '0:a:0?', '-c:a', 'copy'] : ['-an']),
     '-c:v', 'copy',
-    '-f', 'mp4', '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
+    // Fragments also every 0.5 s, not only at keyframes: video is on disk ~0.2 s after
+    // the first keyframe instead of at the second (2-5 s), `writing` tracks growth
+    // smoothly, and a killed ffmpeg loses at most ~0.5 s instead of a whole GOP.
+    '-f', 'mp4', '-movflags', '+frag_keyframe+empty_moov+default_base_moof', '-frag_duration', '500000',
     outPath,
   ];
 }
@@ -400,8 +403,15 @@ function createRtspCapture(options) {
       child.on('error', (e) => resolve({ code: -1, stderr: String(e && (e.message || e)) }));
       child.on('exit', (code) => resolve({ code, stderr }));
     });
-    if (result.code !== 0 || fileSize(finalPath) === 0) {
-      // Keep the parts: they are the footage. Report the first one as the file.
+    // ffmpeg's concat stops at a part whose last fragment was cut off (a SIGKILLed
+    // ffmpeg) and still exits 0, dropping every later part: 5 s + 4.5 s parts
+    // joined to 4.9 s (ffmpeg 8.1, 2026-09-30). Clean q/SIGTERM parts join fine.
+    // A join well short of its parts is a failed join.
+    const partBytes = parts.reduce((sum, p) => sum + fileSize(p), 0);
+    const short = fileSize(finalPath) < partBytes * 0.95;
+    if (result.code !== 0 || fileSize(finalPath) === 0 || short) {
+      if (short && result.code === 0) result.stderr = 'joined ' + fileSize(finalPath) + ' of ' + partBytes + ' bytes';
+      // Keep the parts: they are the footage. The caller uploads every one.
       warn(take.source + ' concat failed code=' + result.code + ' ' + String(result.stderr || '').trim().slice(-300) + '; keeping ' + parts.length + ' parts');
       await fsp.rm(finalPath, { force: true }).catch(() => {});
       return { ok: false, reason: 'rtsp_concat_failed', keptParts: parts };
@@ -448,7 +458,7 @@ function createRtspCapture(options) {
     if (!joined.ok) {
       const kept = joined.keptParts && joined.keptParts[0];
       warn(source + ' stop: ' + joined.reason + (joined.detail ? ' ' + joined.detail : ''));
-      return Object.assign({ ok: false, reason: joined.reason, filePath: kept || null, sizeBytes: kept ? fileSize(kept) : 0 }, summary);
+      return Object.assign({ ok: false, reason: joined.reason, filePath: kept || null, keptParts: joined.keptParts || [], sizeBytes: (joined.keptParts || []).reduce((sum, p) => sum + fileSize(p), 0) }, summary);
     }
     const sizeBytes = fileSize(finalPath);
     const line = source + ' saved ' + path.basename(finalPath) + ' bytes=' + sizeBytes + ' segments=' + summary.segments

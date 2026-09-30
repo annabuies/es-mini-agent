@@ -28,3 +28,14 @@ test('console timestamp installer prefixes every line once and is idempotent', (
     ['error', '2026-09-27T14:07:02.123Z [es-mini-agent] already prefixed'],
   ]);
 });
+
+test('teeWarnings writes warn/error to stdout (agent.log) as well as stderr', () => {
+  const out = [];
+  const err = [];
+  const fake = { log: (l) => out.push(l), info: (l) => out.push(l), warn: (l) => err.push(l), error: (l) => err.push(l) };
+  installConsoleTimestamps({ console: fake, now: () => new Date('2026-09-30T00:00:00.000Z'), teeWarnings: true });
+  fake.warn('[es-mini-agent] [rtsp] WARN FALLBACK cam1');
+  fake.log('[es-mini-agent] plain');
+  assert.deepEqual(err, ['2026-09-30T00:00:00.000Z [es-mini-agent] [rtsp] WARN FALLBACK cam1']);
+  assert.deepEqual(out, ['2026-09-30T00:00:00.000Z [es-mini-agent] [rtsp] WARN FALLBACK cam1', '2026-09-30T00:00:00.000Z [es-mini-agent] plain']);
+});
