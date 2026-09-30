@@ -211,10 +211,15 @@ async function startAgent(t, options = {}) {
       OBS_WS_URL: `ws://127.0.0.1:${obsPort}`, OBS_SOURCES: 'cam1,cam2,cam3',
       OBS_RECORD_DIR: recordDir, MASTER_RECORD: options.masterRecord === false ? '0' : '1',
       UPLOAD_STATE_DIR: uploadStateDir,
+      // Tests read the take files after stop; the deletion test turns this back on.
+      DELETE_AFTER_UPLOAD: '0',
       ...(options.env || {}),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  let stdoutText = '';
+  child.stdout.on('data', (chunk) => { stdoutText += chunk.toString('utf8'); });
+  child.stderr.on('data', () => {});
   t.after(async () => {
     if (child.exitCode === null && !child.killed) child.kill('SIGTERM');
     if (child.exitCode === null) await new Promise((resolve) => child.once('exit', resolve));
@@ -222,7 +227,7 @@ async function startAgent(t, options = {}) {
   await waitFor(async () => {
     try { return (await fetch(`http://127.0.0.1:${agentPort}/health`)).ok; } catch (_) { return false; }
   });
-  return { agentPort, obsRequests, relayRequests, recordDir };
+  return { agentPort, obsRequests, relayRequests, recordDir, stdout: () => stdoutText };
 }
 
 test('heartbeat is sent from cached state on the first poll only once per minute and old poll responses still work', { timeout: 8000 }, async (t) => {
@@ -232,7 +237,7 @@ test('heartbeat is sent from cached state on the first poll only once per minute
   const [first, second] = polls;
 
   assert.equal(first.searchParams.get('hb'), '1');
-  assert.equal(first.searchParams.get('v'), '2026.09.29-2');
+  assert.equal(first.searchParams.get('v'), '2026.09.30-1');
   assert.equal(first.searchParams.get('c'), 'unknown');
   const heartbeatState = JSON.parse(Buffer.from(first.searchParams.get('state'), 'base64url').toString('utf8'));
   assert.deepEqual(heartbeatState, {
@@ -338,7 +343,7 @@ test('smoke: fake relay and OBS start the three camera recordings', { timeout: 8
   await waitFor(async () => {
     try { return (await fetch(`http://127.0.0.1:${agentPort}/health`)).ok; } catch (_) { return false; }
   });
-  assert.deepEqual(await postAgent(agentPort, 'start'), { ok: true, recording: true, feeds_writing: null });
+  assert.deepEqual(await postAgent(agentPort, 'start'), { ok: true, recording: true, feeds_writing: null, capture: { cam1: 'source_record', cam2: 'source_record', cam3: 'source_record' }, fallbacks: {} });
   await waitFor(() => obsRequests.length === 3);
   assert.deepEqual(obsRequests.map((request) => request.data.requestData), [
     { source: 'cam1' }, { source: 'cam2' }, { source: 'cam3' },
@@ -347,7 +352,7 @@ test('smoke: fake relay and OBS start the three camera recordings', { timeout: 8
 
 test('master start follows three camera starts', { timeout: 8000 }, async (t) => {
   const agent = await startAgent(t);
-  assert.deepEqual(await postAgent(agent.agentPort, 'start'), { ok: true, recording: true, feeds_writing: null });
+  assert.deepEqual(await postAgent(agent.agentPort, 'start'), { ok: true, recording: true, feeds_writing: null, capture: { cam1: 'source_record', cam2: 'source_record', cam3: 'source_record' }, fallbacks: {} });
   await waitFor(() => agent.obsRequests.length === 5);
   assert.deepEqual(agent.obsRequests.map((request) => request.type), [
     'CallVendorRequest', 'CallVendorRequest', 'CallVendorRequest', 'GetRecordStatus', 'StartRecord',
@@ -417,7 +422,10 @@ test('stop enqueues three camera files plus the returned master output path', { 
   t.after(() => fs.rmSync(recordDir, { recursive: true, force: true }));
   await postAgent(agent.agentPort, 'start');
   const result = await postAgent(agent.agentPort, 'stop');
-  assert.deepEqual(result, { ok: true, saved: true, upload_queued: 4 });
+  assert.deepEqual(result, {
+    ok: true, saved: true, upload_queued: 4, files_ok: true,
+    files: ['cam1', 'cam2', 'cam3'].map((source) => ({ source, capture: 'source_record', ok: true, bytes: CAMERA_FILE_BYTES.length })),
+  });
   assert.deepEqual(agent.obsRequests.map((request) => request.type).slice(-4).sort(), [
     'CallVendorRequest', 'CallVendorRequest', 'CallVendorRequest', 'StopRecord',
   ].sort());
@@ -434,7 +442,7 @@ test('stop enqueues three camera files plus the returned master output path', { 
 
 test('MASTER_RECORD=0 preserves the camera-only request sequence', { timeout: 8000 }, async (t) => {
   const agent = await startAgent(t, { masterRecord: false });
-  assert.deepEqual(await postAgent(agent.agentPort, 'start'), { ok: true, recording: true, feeds_writing: null });
+  assert.deepEqual(await postAgent(agent.agentPort, 'start'), { ok: true, recording: true, feeds_writing: null, capture: { cam1: 'source_record', cam2: 'source_record', cam3: 'source_record' }, fallbacks: {} });
   await waitFor(() => agent.obsRequests.length === 3);
   assert.deepEqual(agent.obsRequests.map((request) => request.type), [
     'CallVendorRequest', 'CallVendorRequest', 'CallVendorRequest',
@@ -638,6 +646,10 @@ async function startRtspAgent(t, extraEnv) {
   const r2Server = createFakeR2(uploads);
   const r2Port = await listen(r2Server);
   t.after(() => close(r2Server));
+  const webhookBodies = [];
+  const webhookServer = createFakeWebhook(webhookBodies);
+  const webhookPort = await listen(webhookServer);
+  t.after(() => close(webhookServer));
   const agent = await startAgent(t, {
     recordDir,
     obs: { masterOutputPath: path.join(recordDir, 'master', TAKE + '.mp4') },
@@ -651,6 +663,7 @@ async function startRtspAgent(t, extraEnv) {
     },
     env: {
       FFMPEG_BIN: FAKE_RTSP_FFMPEG, AUDIO_SPLIT: '0',
+      UPLOAD_CONFIRMED_WEBHOOK_URL: `http://127.0.0.1:${webhookPort}`,
       S3_ACCESS_KEY_ID: 'fake-access-key', S3_SECRET_ACCESS_KEY: 'fake-secret-key',
       S3_BUCKET: 'fake-bucket', S3_ENDPOINT: `http://127.0.0.1:${r2Port}`,
       ...(extraEnv || {}),
@@ -660,7 +673,7 @@ async function startRtspAgent(t, extraEnv) {
   t.after(() => fs.rmSync(recordDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
   await waitFor(() => agent.relayRequests.some((url) => url.searchParams.has('want_sources')));
   await new Promise((resolve) => setTimeout(resolve, 200)); // camera config applied
-  return Object.assign(agent, { uploads, recordDir });
+  return Object.assign(agent, { uploads, recordDir, webhooks: () => webhookBodies });
 }
 
 const vendorCalls = (agent, requestType) => agent.obsRequests
@@ -669,13 +682,21 @@ const vendorCalls = (agent, requestType) => agent.obsRequests
 
 test('an RTSP camera skips Source Record and its file is named after the master and uploaded', { timeout: 30000 }, async (t) => {
   const agent = await startRtspAgent(t);
-  assert.deepEqual(await postAgent(agent.agentPort, 'start'), { ok: true, recording: true, feeds_writing: null });
+  assert.deepEqual(await postAgent(agent.agentPort, 'start'), { ok: true, recording: true, feeds_writing: null, capture: { cam1: 'rtsp', cam2: 'source_record', cam3: 'source_record' }, fallbacks: {} });
   assert.equal(vendorCalls(agent, 'record_start').length, 2, 'Source Record started for cam2 and cam3 only');
   await new Promise((resolve) => setTimeout(resolve, 300));
   const status = await postAgent(agent.agentPort, 'status');
   assert.equal(status.rtsp.cam1.writing, true);
+  // The RTSP camera counts from its growing part, not the OBS sampler (which skips parts).
+  assert.equal(status.feeds_writing, 3);
+  assert.equal(status.fallbacks, undefined);
   const result = await postAgent(agent.agentPort, 'stop');
-  assert.deepEqual(result, { ok: true, saved: true, upload_queued: 4 });
+  assert.equal(result.saved, true);
+  assert.equal(result.upload_queued, 4);
+  assert.equal(result.files_ok, true);
+  assert.deepEqual(result.files.map((f) => [f.source, f.capture, f.ok, f.problem]), [
+    ['cam1', 'rtsp', true, undefined], ['cam2', 'source_record', true, undefined], ['cam3', 'source_record', true, undefined],
+  ]);
   assert.equal(vendorCalls(agent, 'record_stop').length, 2);
   assert.deepEqual(fs.readdirSync(path.join(agent.recordDir, 'cam1')).filter((f) => f.endsWith('.mp4')), [TAKE + '.mp4']);
   await waitFor(() => agent.uploads.filter((r) => r.method === 'POST' && r.query.has('uploads') && r.path.includes('/recordings/')).length === 4, 28000);
@@ -689,12 +710,26 @@ test('an RTSP camera skips Source Record and its file is named after the master 
 
 test('an RTSP camera that cannot connect falls back to Source Record for that take', { timeout: 15000 }, async (t) => {
   const agent = await startRtspAgent(t, { FAKE_RTSP_FAIL: '1' });
-  assert.deepEqual(await postAgent(agent.agentPort, 'start'), { ok: true, recording: true, feeds_writing: null });
+  const started = await postAgent(agent.agentPort, 'start');
+  assert.deepEqual(started.capture, { cam1: 'source_record', cam2: 'source_record', cam3: 'source_record' });
+  assert.match(started.fallbacks.cam1, /^rtsp_start_failed/);
   assert.equal(vendorCalls(agent, 'record_start').length, 3, 'cam1 recorded by Source Record after RTSP failed');
   const status = await postAgent(agent.agentPort, 'status');
   assert.equal(status.rtsp, undefined);
-  await postAgent(agent.agentPort, 'stop');
+  assert.match(status.fallbacks.cam1, /^rtsp_start_failed/);
+  fs.writeFileSync(path.join(agent.recordDir, 'cam1', TAKE + '.mp4'), CAMERA_FILE_BYTES); // Source Record's file
+  const stopped = await postAgent(agent.agentPort, 'stop');
   assert.equal(vendorCalls(agent, 'record_stop').length, 3);
+  // Never silent: agent.log (stdout) says so, and the file carries the fallback to the webhook.
+  assert.match(agent.stdout(), /\[rtsp\] FALLBACK cam1 -> Source Record for this take: rtsp_start_failed/);
+  const cam1 = stopped.files.find((f) => f.source === 'cam1');
+  assert.equal(cam1.capture, 'source_record');
+  assert.match(cam1.fallback_reason, /^rtsp_start_failed/);
+  assert.equal(cam1.problem, 'fallback');
+  await waitFor(() => agent.webhooks().some((b) => b.source === 'cam1'), 12000);
+  const hook = agent.webhooks().find((b) => b.source === 'cam1');
+  assert.equal(hook.capture, 'source_record_fallback');
+  assert.match(hook.fallback_reason, /^rtsp_start_failed/);
 });
 
 test('pause and resume on an RTSP take pause ffmpeg, not Source Record, for that camera', { timeout: 15000 }, async (t) => {
@@ -712,4 +747,46 @@ test('pause and resume on an RTSP take pause ffmpeg, not Source Record, for that
   assert.equal(status.rtsp.cam1.segments, 2);
   await postAgent(agent.agentPort, 'stop');
   assert.deepEqual(fs.readdirSync(path.join(agent.recordDir, 'cam1')).filter((f) => f.endsWith('.mp4')), [TAKE + '.mp4']);
+});
+
+test('DELETE_AFTER_UPLOAD: camera and master originals leave the Mini only after a verified upload and their proxy / audio split', { timeout: 12000 }, async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-delete-after-'));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const camPath = path.join(tempDir, 'cam1.mp4');
+  const masterPath = path.join(tempDir, 'master.mp4');
+  const keptPath = path.join(tempDir, 'cam2.mp4');
+  fs.writeFileSync(camPath, CAMERA_FILE_BYTES);
+  fs.writeFileSync(masterPath, CAMERA_FILE_BYTES);
+  fs.writeFileSync(keptPath, CAMERA_FILE_BYTES);
+  const uploads = [];
+  let failNext = false;
+  const make = (deleteAfterUpload) => createUploadQueue({
+    stateDir: path.join(tempDir, 'state'),
+    buildingId: 'bench-1',
+    deleteAfterUpload,
+    audioSplit: false,
+    stabilityPollMs: 5,
+    uploader: async (input) => {
+      if (failNext) { failNext = false; throw new Error('HeadObject size mismatch'); }
+      uploads.push(input);
+      return { key: input.key, sizeBytes: input.sizeBytes, partsUploaded: 1 };
+    },
+  });
+  const previousFfmpeg = process.env.FFMPEG_BIN;
+  const previousFfprobe = process.env.FFPROBE_BIN;
+  process.env.FFMPEG_BIN = path.join(__dirname, 'fake-ffmpeg.js');
+  process.env.FFPROBE_BIN = path.join(__dirname, 'fake-ffmpeg.js');
+  t.after(() => { restoreEnv('FFMPEG_BIN', previousFfmpeg); restoreEnv('FFPROBE_BIN', previousFfprobe); });
+  const queue = make(true);
+  queue.enqueue({ filePath: camPath, source: 'cam1', meta: { capture: 'source_record_fallback', fallback_reason: 'rtsp_start_failed: x', bogus: 'dropped' } });
+  queue.enqueue({ filePath: masterPath, source: 'master' });
+  await waitFor(() => !fs.existsSync(camPath) && !fs.existsSync(masterPath), 10000);
+  const camUpload = uploads.find((u) => u.key === 'recordings/bench-1/cam1/cam1.mp4');
+  assert.deepEqual(camUpload.webhookExtra, { kind: 'recording', building_id: 'bench-1', source: 'cam1', session_ref: null, capture: 'source_record_fallback', fallback_reason: 'rtsp_start_failed: x' });
+  assert.ok(uploads.some((u) => u.key === 'proxies/bench-1/cam1/cam1.mp4'), 'proxy made from the original before it was removed');
+  // A failed upload keeps the file.
+  failNext = true;
+  queue.enqueue({ filePath: keptPath, source: 'cam2' });
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.ok(fs.existsSync(keptPath));
 });

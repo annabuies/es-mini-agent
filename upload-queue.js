@@ -14,6 +14,21 @@ const MASTER_SOURCE = 'master';
 const AUDIO_KIND = 'audio';
 const EMPTY_CAMERA_FILE_BYTES = 64 * 1024;
 
+// How a camera file was captured, sent with its upload_confirmed webhook so the cloud
+// can flag a take that fell back to Source Record or lost footage on a reconnect
+// (es-mini-agent #10: the Sep 29 fallbacks were visible nowhere).
+const META_KEYS = ['capture', 'fallback_reason', 'reconnects', 'lost_s'];
+function cleanMeta(meta) {
+  const out = {};
+  if (!meta || typeof meta !== 'object') return out;
+  for (const k of META_KEYS) {
+    const v = meta[k];
+    if (typeof v === 'string' && v) out[k] = v.slice(0, 200);
+    else if (typeof v === 'number' && Number.isFinite(v)) out[k] = v;
+  }
+  return out;
+}
+
 function isCameraRecording(job) {
   return !!job && job.source !== MASTER_SOURCE && job.kind !== AUDIO_KIND && /^cam(?:era)?[-_ ]?\d+$/i.test(String(job.source || ''));
 }
@@ -99,6 +114,10 @@ function createUploadQueue(opts) {
   const buildingId = String(options.buildingId || '').trim() || 'unknown';
   const uploader = typeof options.uploader === 'function' ? options.uploader : runMultipartUpload;
   const audioSplit = !!options.audioSplit;
+  // Delete a camera/master original from the Mini once S3 holds a verified copy
+  // (the uploader checks size with HeadObject) and the proxy / audio split that
+  // read it are done. ~43 GB per recorded hour vs ~100 GB free (Sep 29).
+  const deleteAfterUpload = !!options.deleteAfterUpload;
   const stabilityPollMs = Number.isFinite(options.stabilityPollMs) && options.stabilityPollMs >= 0
     ? options.stabilityPollMs
     : STABILITY_POLL_MS;
@@ -125,6 +144,7 @@ function createUploadQueue(opts) {
       source: job.source,
       sessionRef: job.sessionRef,
       removeAfterConfirm: job.removeAfterConfirm,
+      meta: job.meta,
       sizeBytes: null,
       status,
       enqueuedAt: job.enqueuedAt,
@@ -318,6 +338,7 @@ function createUploadQueue(opts) {
             building_id: buildingId,
             source: job.source,
             session_ref: job.sessionRef,
+            ...job.meta,
           }),
         });
         if (!res.ok) console.warn('[upload-queue] empty file webhook failed status=' + res.status + ' key=' + job.key);
@@ -374,7 +395,7 @@ function createUploadQueue(opts) {
         isRecording,
         shouldAbort: () => false,
         webhookUrl: typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl,
-        webhookExtra: { kind: job.kind, building_id: buildingId, source: job.source, session_ref: job.sessionRef },
+        webhookExtra: Object.assign({ kind: job.kind, building_id: buildingId, source: job.source, session_ref: job.sessionRef }, job.meta),
         abortOnFailure: false,
         deleteObjectAfterVerify: false,
         onProgress: (partial) => {
@@ -400,6 +421,7 @@ function createUploadQueue(opts) {
       if (job.source === MASTER_SOURCE) {
         console.log('[upload-queue] proxy skipped for master key=' + job.key);
         await splitMasterAudio(job);
+        await removeUploadedOriginal(job);
       } else if (job.kind === AUDIO_KIND) {
         console.log('[upload-queue] proxy skipped for audio key=' + job.key);
       } else {
@@ -421,6 +443,16 @@ function createUploadQueue(opts) {
       console.warn('[upload-queue] upload failed key=' + job.key + ' error=' + (detail || 'upload_failed'));
     } finally {
       activeSnapshot = null;
+    }
+  }
+
+  async function removeUploadedOriginal(job) {
+    if (!deleteAfterUpload || job.kind === AUDIO_KIND || job.removeAfterConfirm) return;
+    try {
+      await removeFileIfExists(job.filePath);
+      console.log('[upload-queue] removed local original after verified upload key=' + job.key);
+    } catch (e) {
+      console.warn('[upload-queue] could not remove local original key=' + job.key + ':', e && (e.message || e));
     }
   }
 
@@ -478,6 +510,8 @@ function createUploadQueue(opts) {
       console.warn('[upload-queue] proxy failed key=' + job.key + ' error=' + truncateError(e && (e.message || e.stack || e)));
     } finally {
       await removeFileIfExists(tmpProxyPath);
+      // The original is already verified in S3; a failed proxy is not a reason to keep it.
+      await removeUploadedOriginal(job);
     }
   }
 
@@ -532,6 +566,7 @@ function createUploadQueue(opts) {
         kind,
         sessionRef,
         removeAfterConfirm: !!(input && input.removeAfterConfirm),
+        meta: cleanMeta(input && input.meta),
         key,
         stateFilePath,
         enqueuedAt: new Date().toISOString(),
@@ -610,7 +645,7 @@ function createUploadQueue(opts) {
 
           if (sourceExists) {
             const source = stateData.source ? String(stateData.source) : '';
-            const out = enqueue({ filePath: sourceFilePath, source, kind: stateData.kind, sessionRef: stateData.sessionRef, removeAfterConfirm: stateData.removeAfterConfirm });
+            const out = enqueue({ filePath: sourceFilePath, source, kind: stateData.kind, sessionRef: stateData.sessionRef, removeAfterConfirm: stateData.removeAfterConfirm, meta: stateData.meta });
             if (!out.queued) {
               console.warn('[upload-queue] sweep enqueue skipped key=' + String(stateData.key || '?') + ' reason=' + String(out.reason || 'unknown'));
             }

@@ -189,3 +189,65 @@ test('a camera that connects but sends nothing fails the start within the probe 
   assert.ok(Date.now() - began < 2000, 'no 6 s wait on a q that is never read');
   assert.equal(cap.active('cam1'), false);
 });
+
+test('fragments are cut every 0.5 s as well as at keyframes, so video reaches disk before the second keyframe', () => {
+  const { recordArgs } = require('../rtsp-capture');
+  const args = recordArgs('rtsp://10.0.0.5:554/1', '/tmp/x.mp4');
+  assert.equal(args[args.indexOf('-frag_duration') + 1], '500000');
+  assert.match(args[args.indexOf('-movflags') + 1], /frag_keyframe/);
+  assert.equal(args[args.length - 1], '/tmp/x.mp4');
+});
+
+test('a reconnect reports how much footage the gap lost, and the first retry does not wait the full delay', { timeout: 10000 }, async (t) => {
+  const dir = tempDir(t);
+  withEnv(t, { FAKE_RTSP_DROP_ONCE: path.join(dir, 'dropped.marker') });
+  const cap = capture({ restartDelayMs: 5000, firstRestartDelayMs: 50 });
+  await cap.start({ source: 'cam1', url: 'rtsp://10.0.0.5:554/1', dir });
+  await sleep(700); // drop at 150 ms; with the 5 s delay there would be no second segment yet
+  const live = cap.describe().cam1;
+  assert.equal(live.segments, 2);
+  assert.ok(live.lost_ms > 0 && live.lost_ms < 1000, 'lost_ms=' + live.lost_ms);
+  const out = await cap.stop('cam1', { finalBase: 'take' });
+  assert.equal(out.restarts, 1);
+  assert.ok(out.lostMs > 0 && out.lostMs < 1000, 'lostMs=' + out.lostMs);
+});
+
+test('describe() says writing only while the part is growing', { timeout: 10000 }, async (t) => {
+  const dir = tempDir(t);
+  const cap = capture({ writingStaleMs: 300 });
+  await cap.start({ source: 'cam1', url: 'rtsp://10.0.0.5:554/1', dir });
+  assert.equal(cap.describe().cam1.writing, true);
+  await cap.pause('cam1'); // segment ended: the part stops growing
+  await sleep(400);
+  assert.equal(cap.describe().cam1.writing, false);
+  await cap.stop('cam1', { finalBase: 'take' });
+});
+
+test('RTSP warnings also go to stdout (agent.log), not only stderr (agent.error.log)', { timeout: 10000 }, async (t) => {
+  const dir = tempDir(t);
+  withEnv(t, { FAKE_RTSP_FAIL: '1' });
+  const lines = [];
+  const orig = console.log;
+  console.log = (msg) => { lines.push(String(msg)); };
+  t.after(() => { console.log = orig; });
+  const origWarn = console.warn;
+  console.warn = () => {};
+  t.after(() => { console.warn = origWarn; });
+  const out = await capture({ startProbeMs: 400 }).start({ source: 'cam1', url: 'rtsp://10.0.0.5:554/1', dir });
+  assert.equal(out.ok, false);
+  assert.ok(lines.some((l) => /\[rtsp\] WARN cam1 could not start/.test(l)), lines.join('\n'));
+});
+
+test('a join that exits 0 but comes out short keeps every part instead of losing the later ones', { timeout: 10000 }, async (t) => {
+  const dir = tempDir(t);
+  withEnv(t, { FAKE_RTSP_DROP_ONCE: path.join(dir, 'dropped.marker'), FAKE_CONCAT_SHORT: '1' });
+  const cap = capture();
+  await cap.start({ source: 'cam2', url: 'rtsp://10.0.0.6:554/1', dir });
+  await sleep(700);
+  const out = await cap.stop('cam2', { finalBase: 'take' });
+  assert.equal(out.ok, false);
+  assert.equal(out.reason, 'rtsp_concat_failed');
+  assert.equal(out.keptParts.length, 2);
+  for (const p of out.keptParts) assert.ok(fs.existsSync(p));
+  assert.equal(fs.existsSync(path.join(dir, 'take.mp4')), false);
+});

@@ -18,7 +18,9 @@ const input = args[args.indexOf('-i') + 1] || '';
 if (args.includes('concat')) {
   const list = fs.readFileSync(input, 'utf8').split('\n').filter(Boolean)
     .map((line) => line.replace(/^file '/, '').replace(/'$/, '').replace(/'\\''/g, "'"));
-  fs.writeFileSync(out, Buffer.concat(list.map((p) => fs.readFileSync(p))));
+  // FAKE_CONCAT_SHORT=1: stops after the first part and still exits 0, like ffmpeg on a cut-off fragment.
+  const joined = process.env.FAKE_CONCAT_SHORT === '1' ? list.slice(0, 1) : list;
+  fs.writeFileSync(out, Buffer.concat(joined.map((p) => fs.readFileSync(p))));
   process.exit(0);
 }
 

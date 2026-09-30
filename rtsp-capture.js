@@ -26,12 +26,20 @@ const { spawn, execFileSync } = require('child_process');
 
 const DEFAULT_RTSP_PORT = 554;
 const DEFAULT_RTSP_PATH = '/1';
-// ffmpeg writes the MP4 header as soon as it has the stream parameters, which
-// RTSP gives at connect; no bytes by then means no stream (PR #11 review).
-const START_PROBE_MS = 4000;
+// Start counts as up once video is on disk. With 0.5 s fragments (FRAGMENT_US)
+// that is ~0.2 s after the camera's first keyframe, so a healthy camera passes in
+// about a second; the window only runs out for a camera that sends nothing.
+// 4 s was too tight while fragments were cut only at keyframes (es-mini-agent #10,
+// Sep 29 takes 3-5 fell back to Source Record).
+const START_PROBE_MS = 8000;
 const STOP_QUIT_MS = 6000;
 const STOP_TERM_MS = 3000;
+// First reconnect goes straight away (every second of delay is lost footage);
+// later ones wait, so a camera that is down does not spin ffmpeg.
+const FIRST_RESTART_DELAY_MS = 250;
 const RESTART_DELAY_MS = 2000;
+// A camera whose part has not grown for this long is not writing (status op).
+const WRITING_STALE_MS = 5000;
 const MAX_RESTARTS = 20;
 const STDERR_TAIL_LINES = 12;
 // A part with only the MP4 header (~1 KB, camera never sent a frame) is not footage.
@@ -40,6 +48,10 @@ const MIN_PART_BYTES = 16 * 1024;
 // writes a 28-byte ftyp and then nothing. One second of a camera here is ~4 MB.
 const START_MIN_BYTES = 4 * 1024;
 const SAFE_HOST_RE = /^[A-Za-z0-9.-]+$/;
+// Fragment length. Fragments cut only at keyframes (frag_keyframe) put nothing on
+// disk until the camera's SECOND keyframe after connect, 2-5 s on these cameras,
+// and a crash lost up to a whole keyframe interval. 0.5 s fragments fix both.
+const FRAGMENT_US = 500000;
 
 function isRtspCamera(camera) {
   return !!camera && typeof camera === 'object' && String(camera.capture || '').toLowerCase() === 'rtsp';
@@ -82,7 +94,7 @@ function recordArgs(url, outPath, options) {
     '-map', '0:v:0',
     ...(audio ? ['-map', '0:a:0?', '-c:a', 'copy'] : ['-an']),
     '-c:v', 'copy',
-    '-f', 'mp4', '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
+    '-f', 'mp4', '-movflags', '+frag_keyframe+empty_moov+default_base_moof', '-frag_duration', String(FRAGMENT_US),
     outPath,
   ];
 }
@@ -101,9 +113,14 @@ function createRtspCapture(options) {
   const spawnImpl = opts.spawnImpl || spawn;
   const logPrefix = '[es-mini-agent] [rtsp] ';
   const log = (msg) => console.log(logPrefix + msg);
-  const warn = (msg) => console.warn(logPrefix + msg);
+  // agent.log is the log people read; stderr goes to agent.error.log. On Sep 29
+  // every RTSP warning (fallbacks, reconnects) landed only in agent.error.log, so
+  // the fallback looked silent (es-mini-agent #10). Warnings now go to both.
+  const warn = (msg) => { console.log(logPrefix + 'WARN ' + msg); console.warn(logPrefix + msg); };
   const startProbeMs = Number.isFinite(opts.startProbeMs) ? opts.startProbeMs : START_PROBE_MS;
   const restartDelayMs = Number.isFinite(opts.restartDelayMs) ? opts.restartDelayMs : RESTART_DELAY_MS;
+  const writingStaleMs = Number.isFinite(opts.writingStaleMs) ? opts.writingStaleMs : WRITING_STALE_MS;
+  const firstRestartDelayMs = Number.isFinite(opts.firstRestartDelayMs) ? opts.firstRestartDelayMs : Math.min(FIRST_RESTART_DELAY_MS, restartDelayMs);
   const stopQuitMs = Number.isFinite(opts.stopQuitMs) ? opts.stopQuitMs : STOP_QUIT_MS;
 
   const takes = new Map(); // source -> take
@@ -118,14 +135,14 @@ function createRtspCapture(options) {
     } catch (e) {
       return { ok: false, error: e && (e.message || String(e)) };
     }
-    const seg = { child, partPath, exited: false, code: null, signal: null, stderr: [], startedAt: Date.now() };
+    const seg = { child, partPath, exited: false, code: null, signal: null, stderr: [], startedAt: Date.now(), exitedAt: null };
     seg.done = new Promise((resolve) => {
       child.on('error', (e) => {
         seg.stderr.push(String(e && (e.message || e)));
         if (!seg.exited) { seg.exited = true; seg.code = -1; resolve(); }
       });
       child.on('exit', (code, signal) => {
-        seg.exited = true; seg.code = code; seg.signal = signal;
+        seg.exited = true; seg.code = code; seg.signal = signal; seg.exitedAt = Date.now();
         resolve();
       });
     });
@@ -158,14 +175,34 @@ function createRtspCapture(options) {
       return;
     }
     take.restarts += 1;
+    const lostFrom = seg.exitedAt || Date.now();
     take.restartTimer = setTimeout(() => {
       take.restartTimer = null;
       if (take.stopping || take.paused) return;
       const out = spawnSegment(take);
-      if (out.ok) log(take.source + ' reconnect #' + take.restarts + ' -> segment ' + take.segmentIndex);
-      else warn(take.source + ' reconnect failed: ' + out.error);
-    }, restartDelayMs);
+      if (out.ok) {
+        warn(take.source + ' reconnect #' + take.restarts + ' -> segment ' + take.segmentIndex);
+        watchGap(take, out.seg, lostFrom);
+      } else {
+        warn(take.source + ' reconnect failed: ' + out.error);
+      }
+    }, take.restarts === 1 ? firstRestartDelayMs : restartDelayMs);
     if (take.restartTimer.unref) take.restartTimer.unref();
+  }
+
+  /** Adds the footage missing between a dropped segment and the next one's first video to take.lostMs. */
+  function watchGap(take, seg, lostFrom) {
+    const settle = (ms) => {
+      take.lostMs += Math.max(0, ms);
+      warn(take.source + ' back after a ' + (Math.max(0, ms) / 1000).toFixed(1) + ' s gap (' + (take.lostMs / 1000).toFixed(1) + ' s lost this take)');
+    };
+    const tick = () => {
+      if (fileSize(seg.partPath) >= START_MIN_BYTES) { settle(Date.now() - lostFrom); return; }
+      if (seg.exited || take.stopping || take.paused) { settle((seg.exitedAt || Date.now()) - lostFrom); return; }
+      const t = setTimeout(tick, 100);
+      if (t.unref) t.unref();
+    };
+    tick();
   }
 
   async function probeStart(seg) {
@@ -215,7 +252,7 @@ function createRtspCapture(options) {
     const take = {
       source, url, dir, audio: !!(input && input.audio),
       stamp: takeStamp(input.startedAt || Date.now()),
-      segments: [], segmentIndex: 0, restarts: 0,
+      segments: [], segmentIndex: 0, restarts: 0, lostMs: 0, lastBytes: 0, lastGrowAt: 0,
       paused: false, stopping: false, starting: true, restartTimer: null,
     };
     takes.set(source, take);
@@ -284,8 +321,14 @@ function createRtspCapture(options) {
       child.on('error', (e) => resolve({ code: -1, stderr: String(e && (e.message || e)) }));
       child.on('exit', (code) => resolve({ code, stderr }));
     });
-    if (result.code !== 0 || fileSize(finalPath) === 0) {
-      // Keep the parts: they are the footage. Report the first one as the file.
+    // ffmpeg's concat stops at a part whose last fragment was cut off (a SIGKILLed
+    // ffmpeg) and still exits 0, dropping every part after it (tested with ffmpeg
+    // 8.1, 2026-09-30). A join well short of its parts is a failed join.
+    const partBytes = parts.reduce((sum, p) => sum + fileSize(p), 0);
+    const short = fileSize(finalPath) < partBytes * 0.95;
+    if (result.code !== 0 || fileSize(finalPath) === 0 || short) {
+      if (short && result.code === 0) result.stderr = 'joined ' + fileSize(finalPath) + ' of ' + partBytes + ' bytes';
+      // Keep the parts: they are the footage. The caller uploads every one.
       warn(take.source + ' concat failed code=' + result.code + ' ' + String(result.stderr || '').trim().slice(-300) + '; keeping ' + parts.length + ' parts');
       await fsp.rm(finalPath, { force: true }).catch(() => {});
       return { ok: false, reason: 'rtsp_concat_failed', keptParts: parts };
@@ -315,14 +358,15 @@ function createRtspCapture(options) {
     } catch (e) {
       joined = { ok: false, reason: 'rtsp_join_failed', detail: e && (e.message || String(e)) };
     }
-    const summary = { segments: take.segments.length, restarts: take.restarts };
+    const summary = { segments: take.segments.length, restarts: take.restarts, lostMs: take.lostMs };
     if (!joined.ok) {
       const kept = joined.keptParts && joined.keptParts[0];
       warn(source + ' stop: ' + joined.reason + (joined.detail ? ' ' + joined.detail : ''));
-      return Object.assign({ ok: false, reason: joined.reason, filePath: kept || null, sizeBytes: kept ? fileSize(kept) : 0 }, summary);
+      return Object.assign({ ok: false, reason: joined.reason, filePath: kept || null, keptParts: joined.keptParts || [], sizeBytes: (joined.keptParts || []).reduce((sum, p) => sum + fileSize(p), 0) }, summary);
     }
     const sizeBytes = fileSize(finalPath);
-    log(source + ' saved ' + path.basename(finalPath) + ' bytes=' + sizeBytes + ' segments=' + summary.segments + ' reconnects=' + summary.restarts);
+    const line = source + ' saved ' + path.basename(finalPath) + ' bytes=' + sizeBytes + ' segments=' + summary.segments + ' reconnects=' + summary.restarts + (summary.restarts ? ' lost=' + (summary.lostMs / 1000).toFixed(1) + 's' : '');
+    if (summary.restarts) warn(line); else log(line);
     return Object.assign({ ok: true, filePath: finalPath, sizeBytes }, summary);
   }
 
@@ -330,11 +374,21 @@ function createRtspCapture(options) {
     return takes.has(source);
   }
 
+  /**
+   * Per camera: `writing` is true only while the current part is growing, the same
+   * test the status op applies to OBS files. Parts are skipped by the OBS sampler
+   * (getNewestFileSample), which then measured the previous take's finished file,
+   * so a clean RTSP take read as "camera failed" on the kiosk (Sep 29 take 2).
+   */
   function describe() {
     const out = {};
+    const now = Date.now();
     for (const [source, take] of takes) {
       const seg = take.segments[take.segments.length - 1];
-      out[source] = { paused: take.paused, segments: take.segments.length, restarts: take.restarts, writing: !!seg && !seg.exited, bytes: seg ? fileSize(seg.partPath) : 0 };
+      const bytes = seg ? fileSize(seg.partPath) : 0;
+      if (bytes !== take.lastBytes) { take.lastBytes = bytes; take.lastGrowAt = now; }
+      const growing = !!seg && !seg.exited && bytes > 0 && now - take.lastGrowAt <= writingStaleMs;
+      out[source] = { paused: take.paused, segments: take.segments.length, restarts: take.restarts, lost_ms: take.lostMs, writing: growing, bytes };
     }
     return out;
   }
