@@ -18,7 +18,9 @@ const input = args[args.indexOf('-i') + 1] || '';
 if (args.includes('concat')) {
   const list = fs.readFileSync(input, 'utf8').split('\n').filter(Boolean)
     .map((line) => line.replace(/^file '/, '').replace(/'$/, '').replace(/'\\''/g, "'"));
-  fs.writeFileSync(out, Buffer.concat(list.map((p) => fs.readFileSync(p))));
+  // FAKE_CONCAT_SHORT=1: stops after the first part and still exits 0, like ffmpeg on a cut-off fragment.
+  const joined = process.env.FAKE_CONCAT_SHORT === '1' ? list.slice(0, 1) : list;
+  fs.writeFileSync(out, Buffer.concat(joined.map((p) => fs.readFileSync(p))));
   process.exit(0);
 }
 
@@ -41,10 +43,23 @@ if (process.env.FAKE_RTSP_SILENT === '1') {
   return;
 }
 
+// -progress pipe:1 like real ffmpeg: out_time_us is N/A until video is muxed.
+// FAKE_RTSP_PROGRESS_ONLY=1: video is muxed but nothing reaches the file after
+// the header (a fragment not flushed yet, or the empty-audio stall).
+const progress = args.includes('-progress');
+let outTimeUs = null;
 setTimeout(() => {
   fs.writeFileSync(out, Buffer.alloc(1024, 7));
-  if (process.env.FAKE_RTSP_NO_FRAMES === '1') return;
-  setInterval(() => fs.appendFileSync(out, Buffer.alloc(32 * 1024, 7)), 50);
+  if (process.env.FAKE_RTSP_NO_FRAMES === '1') {
+    if (progress) setInterval(() => process.stdout.write('out_time_us=N/A\nprogress=continue\n'), 50);
+    return;
+  }
+  outTimeUs = 0;
+  setInterval(() => {
+    outTimeUs += 50000;
+    if (process.env.FAKE_RTSP_PROGRESS_ONLY !== '1') fs.appendFileSync(out, Buffer.alloc(32 * 1024, 7));
+    if (progress) process.stdout.write('frame=0\nout_time_us=' + outTimeUs + '\nprogress=continue\n');
+  }, 50);
 }, 20);
 
 const marker = process.env.FAKE_RTSP_DROP_ONCE;

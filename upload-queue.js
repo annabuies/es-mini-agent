@@ -69,6 +69,27 @@ async function readResponseTextSafe(res) {
   }
 }
 
+// Capture/health fields the stop path attaches to a take's files. They ride on
+// the upload_confirmed webhook so the cloud can mark the booking thread.
+const META_KEYS = ['capture_mode', 'fallback', 'fallback_reason', 'health', 'health_reason', 'duration_s', 'master_duration_s', 'short_by_s', 'reconnects', 'lost_s', 'take_health', 'fallback_sources', 'failed_sources'];
+
+function cleanMeta(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const out = {};
+  for (const key of META_KEYS) {
+    const v = value[key];
+    if (v === undefined || v === null) continue;
+    if (typeof v === 'string' || typeof v === 'boolean' || Number.isFinite(v)) out[key] = v;
+    else if (Array.isArray(v)) out[key] = v.filter((x) => typeof x === 'string');
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+function resolveFfprobeBin() {
+  const configured = String(process.env.FFPROBE_BIN || '').trim();
+  return configured || path.join(path.dirname(resolveFfmpegBin().bin), 'ffprobe');
+}
+
 function resolveFfmpegBin() {
   if (ffmpegBinMemo) return ffmpegBinMemo;
 
@@ -99,6 +120,10 @@ function createUploadQueue(opts) {
   const buildingId = String(options.buildingId || '').trim() || 'unknown';
   const uploader = typeof options.uploader === 'function' ? options.uploader : runMultipartUpload;
   const audioSplit = !!options.audioSplit;
+  // Delete a camera/master original from the Mini once S3 holds a verified copy
+  // (the uploader checks size with HeadObject) and the proxy / audio split that
+  // read it are done. ~43 GB per recorded hour vs ~100 GB free (Robbie, Sep 29).
+  const deleteAfterUpload = !!options.deleteAfterUpload;
   const stabilityPollMs = Number.isFinite(options.stabilityPollMs) && options.stabilityPollMs >= 0
     ? options.stabilityPollMs
     : STABILITY_POLL_MS;
@@ -125,6 +150,7 @@ function createUploadQueue(opts) {
       source: job.source,
       sessionRef: job.sessionRef,
       removeAfterConfirm: job.removeAfterConfirm,
+      meta: job.meta,
       sizeBytes: null,
       status,
       enqueuedAt: job.enqueuedAt,
@@ -246,8 +272,7 @@ function createUploadQueue(opts) {
 
   function runFfprobe(args) {
     return new Promise((resolve, reject) => {
-      const configured = String(process.env.FFPROBE_BIN || '').trim();
-      const ffprobeBin = configured || path.join(path.dirname(resolveFfmpegBin().bin), 'ffprobe');
+      const ffprobeBin = resolveFfprobeBin();
       let proc;
       try {
         proc = spawn(ffprobeBin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -300,33 +325,49 @@ function createUploadQueue(opts) {
   // file is reported through the normal upload_confirmed webhook with sizeBytes 0,
   // which the cloud posts as "Camera N recording failed" (es-honeybook #18) and
   // never links. Audio/master files are only logged. The entry is then dropped.
-  async function reportEmptyFile(job, sizeBytes) {
-    console.warn('[upload-queue] empty file, nothing to upload key=' + job.key + ' bytes=' + (sizeBytes || 0) + ' file=' + job.filePath);
-    const camera = isCameraRecording(job);
+  async function postFailedCamera(key, source, sessionRef, meta) {
     const url = typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl;
-    if (camera && url) {
-      try {
-        const res = await fetch(String(url), {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            event: 'upload_confirmed',
-            key: job.key,
-            sizeBytes: 0,
-            confirmedAt: new Date().toISOString(),
-            kind: job.kind,
-            building_id: buildingId,
-            source: job.source,
-            session_ref: job.sessionRef,
-          }),
-        });
-        if (!res.ok) console.warn('[upload-queue] empty file webhook failed status=' + res.status + ' key=' + job.key);
-      } catch (e) {
-        console.warn('[upload-queue] empty file webhook error key=' + job.key + ':', e && (e.message || e));
-      }
+    if (!url) return;
+    try {
+      const res = await fetch(String(url), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(Object.assign({}, meta || {}, {
+          event: 'upload_confirmed',
+          key,
+          sizeBytes: 0,
+          confirmedAt: new Date().toISOString(),
+          kind: 'recording',
+          building_id: buildingId,
+          source,
+          session_ref: sessionRef,
+        })),
+      });
+      if (!res.ok) console.warn('[upload-queue] failed-camera webhook failed status=' + res.status + ' key=' + key);
+    } catch (e) {
+      console.warn('[upload-queue] failed-camera webhook error key=' + key + ':', e && (e.message || e));
     }
+  }
+
+  async function reportEmptyFile(job, sizeBytes, why) {
+    console.warn('[upload-queue] ' + (why || 'empty file') + ', nothing to upload key=' + job.key + ' bytes=' + (sizeBytes || 0) + ' file=' + job.filePath);
+    if (isCameraRecording(job)) await postFailedCamera(job.key, job.source, job.sessionRef, job.meta);
     await removeFileIfExists(job.stateFilePath);
     completedFilePaths.add(job.filePath);
+  }
+
+  /**
+   * A camera that wrote no file this take never reaches the queue, so the
+   * booking thread would just lack it. Report it the way an empty file is
+   * reported (sizeBytes 0 = "Camera N recording failed").
+   */
+  function reportMissingCamera(input) {
+    const source = input && input.source ? String(input.source) : '';
+    if (!isCameraRecording({ source, kind: 'recording' })) return Promise.resolve();
+    const fileName = path.basename(String(input.fileName || 'missing.mp4'));
+    const key = 'recordings/' + buildingId + '/' + source + '/' + fileName;
+    console.warn('[upload-queue] camera wrote no file this take, reporting as failed key=' + key);
+    return postFailedCamera(key, source, input.sessionRef || null, cleanMeta(input.meta));
   }
 
   async function runJob(job) {
@@ -347,6 +388,11 @@ function createUploadQueue(opts) {
     // camera here is megabytes. Report it as failed, like a 0-byte file.
     if (stable.sizeBytes === 0 || (isCameraRecording(job) && stable.sizeBytes < EMPTY_CAMERA_FILE_BYTES)) {
       await reportEmptyFile(job, stable.sizeBytes);
+      return;
+    }
+    // The stop path's file check found no usable video (e.g. no video stream).
+    if (isCameraRecording(job) && job.meta && job.meta.health === 'failed') {
+      await reportEmptyFile(job, stable.sizeBytes, 'no usable video (' + (job.meta.health_reason || 'failed') + ')');
       return;
     }
 
@@ -374,7 +420,7 @@ function createUploadQueue(opts) {
         isRecording,
         shouldAbort: () => false,
         webhookUrl: typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl,
-        webhookExtra: { kind: job.kind, building_id: buildingId, source: job.source, session_ref: job.sessionRef },
+        webhookExtra: Object.assign({}, job.meta || {}, { kind: job.kind, building_id: buildingId, source: job.source, session_ref: job.sessionRef }),
         abortOnFailure: false,
         deleteObjectAfterVerify: false,
         onProgress: (partial) => {
@@ -400,6 +446,7 @@ function createUploadQueue(opts) {
       if (job.source === MASTER_SOURCE) {
         console.log('[upload-queue] proxy skipped for master key=' + job.key);
         await splitMasterAudio(job);
+        await removeUploadedOriginal(job);
       } else if (job.kind === AUDIO_KIND) {
         console.log('[upload-queue] proxy skipped for audio key=' + job.key);
       } else {
@@ -421,6 +468,16 @@ function createUploadQueue(opts) {
       console.warn('[upload-queue] upload failed key=' + job.key + ' error=' + (detail || 'upload_failed'));
     } finally {
       activeSnapshot = null;
+    }
+  }
+
+  async function removeUploadedOriginal(job) {
+    if (!deleteAfterUpload || job.kind === AUDIO_KIND || job.removeAfterConfirm) return;
+    try {
+      await removeFileIfExists(job.filePath);
+      console.log('[upload-queue] removed local original after verified upload key=' + job.key);
+    } catch (e) {
+      console.warn('[upload-queue] could not remove local original key=' + job.key + ':', e && (e.message || e));
     }
   }
 
@@ -478,6 +535,8 @@ function createUploadQueue(opts) {
       console.warn('[upload-queue] proxy failed key=' + job.key + ' error=' + truncateError(e && (e.message || e.stack || e)));
     } finally {
       await removeFileIfExists(tmpProxyPath);
+      // The original is already verified in S3; a failed proxy is not a reason to keep it.
+      await removeUploadedOriginal(job);
     }
   }
 
@@ -532,6 +591,7 @@ function createUploadQueue(opts) {
         kind,
         sessionRef,
         removeAfterConfirm: !!(input && input.removeAfterConfirm),
+        meta: cleanMeta(input && input.meta),
         key,
         stateFilePath,
         enqueuedAt: new Date().toISOString(),
@@ -610,7 +670,7 @@ function createUploadQueue(opts) {
 
           if (sourceExists) {
             const source = stateData.source ? String(stateData.source) : '';
-            const out = enqueue({ filePath: sourceFilePath, source, kind: stateData.kind, sessionRef: stateData.sessionRef, removeAfterConfirm: stateData.removeAfterConfirm });
+            const out = enqueue({ filePath: sourceFilePath, source, kind: stateData.kind, sessionRef: stateData.sessionRef, removeAfterConfirm: stateData.removeAfterConfirm, meta: stateData.meta });
             if (!out.queued) {
               console.warn('[upload-queue] sweep enqueue skipped key=' + String(stateData.key || '?') + ' reason=' + String(out.reason || 'unknown'));
             }
@@ -655,7 +715,7 @@ function createUploadQueue(opts) {
     }
   }
 
-  return { enqueue, sweep, status };
+  return { enqueue, sweep, status, reportMissingCamera };
 }
 
-module.exports = { createUploadQueue, resolveFfmpegBin };
+module.exports = { createUploadQueue, resolveFfmpegBin, resolveFfprobeBin };

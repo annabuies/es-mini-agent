@@ -153,7 +153,20 @@ After a master upload confirms, the agent probes its audio streams and stream-co
 ## Contract (what the Cloudflare Worker expects back)
 
 - `start`, `status`, `resume` → `{ ok, recording, feeds_writing }` (demo mode keeps `feeds_writing: null`; OBS mode reports a verified count when recording and `0` when idle)
-- `stop` → `{ ok, saved }`
+- `stop` → `{ ok, saved }`, plus in OBS mode the file check below
+- OBS-mode `start` and `status` (recording) also return `cameras: { camN: { capture_mode: 'rtsp'|'source_record', fallback, fallback_reason?, writing? } }` and `fallback_sources: [...]` (cameras configured for RTSP that are on Source Record this take). `feeds_writing` counts RTSP cameras by their files growing on disk. Idle `status` carries `last_take` (the last stop's `saved`, `health`, `files`, `failed_files`, `fallback_sources`).
+
+### Stop: the file check (since 2026.09.30-1)
+
+After stop, every camera file of the take is probed with ffprobe and compared with the master. The kiosk banner and the booking thread should key off this, not off whether a capture ran.
+
+- `files: [{ source, size_bytes, ok, health }]`: every camera file this take wrote. `ok: false` means no usable video.
+- `failed_files: [{ source, size_bytes, reason }]`: cameras with no usable file (`reason` is a lowercase slug: `no_file`, `rtsp_no_data`, `too_small`, `empty_file`, `no_video_stream`, `unreadable_file`).
+- `health`: `ok`, `degraded` (a camera is more than 2 s shorter than the master, or RTSP measured more than 2 s of lost footage), `failed` (a camera has no usable file), or `unverified` (no ffprobe / no record dir).
+- `saved` is `false` unless `health` is `ok` (or `unverified`) and every stop succeeded.
+- `cameras: { camN: { capture_mode, fallback, fallback_reason?, health, reason?, size_bytes, duration_s?, master_duration_s?, short_by_s?, reconnects?, lost_s? } }`, `fallback_sources`, `master: { health, duration_s }`.
+
+The same per-camera fields ride on each file's `upload_confirmed` webhook (`capture_mode`, `fallback`, `fallback_reason`, `health`, `health_reason`, `duration_s`, `master_duration_s`, `short_by_s`, `reconnects`, `lost_s`, plus `take_health`, `fallback_sources`, `failed_sources`; the master's webhook carries the take-level three). A camera whose file has no usable video, or that wrote no file at all, is reported with `sizeBytes: 0` like an empty file. The agent log has one `[take]` line per stop, `WARN` whenever a camera fell back or the take is not `ok`.
 - `pause` → `{ ok, paused }`
 - `look` → `{ ok, look, cameras: { cam1: 'ok'|'timeout'|'http_<code>'|'auth_required'|'error' }, reason? }`
 
@@ -174,13 +187,22 @@ A 0-byte recording file is never uploaded (S3 multipart needs at least one byte)
 A camera whose entry in `studios.fleet_buildings.cameras` has `"capture": "rtsp"` is recorded by ffmpeg straight from its own RTSP stream instead of OBS Source Record (added 2026.09.29-2, after Source Record's silent cam1 failures in issue #10). The video is copied as the camera sends it (H.264, no encode). Camera audio is left out: the bench-1 cameras send an empty AAC track, and an audio stream with no packets makes ffmpeg hold all video in memory until stop. Set `"rtsp_audio": true` on a camera to copy its audio once it carries sound (for example after the mixer is wired into the camera's 3.5 mm input). OBS still records the master and mic tracks and still drives the live preview.
 
 - URL: `rtsp://<host>:554/1` by default (confirmed by Robbie on 2026-09-29: TCP, no login). Optional per-camera keys: `rtsp_path` (e.g. `"/2"`), `rtsp_port`, a full `rtsp_url`, `rtsp_audio`. Never put a password in `rtsp_url`; the table is readable by the app backend.
-- Files: the camera's file is named after the take's master file (`cam1/<same name as master>.mp4`), so a take's files still match. A pause ends a segment and resume starts the next; a dropped connection is retried every 2 s as a new segment (up to 20 per take). Segments (`<stamp> rtsp-partN.mp4`, fragmented MP4) are joined at stop, then deleted.
-- Safety: if a camera's RTSP stream does not come up within 4 s at Start (no bytes from a camera that accepts the connection counts as not up), that camera is recorded by Source Record for that take and the log says `falling back to Source Record`.
+- Files: the camera's file is named after the take's master file (`cam1/<same name as master>.mp4`), so a take's files still match. A pause ends a segment and resume starts the next; a dropped connection is retried as a new segment after 0.25 s, then 1 s, then every 2 s (up to 20 per take). Segments (`<stamp> rtsp-partN.mp4`, fragmented MP4) are joined at stop, then deleted. Each reconnect and resume logs how long video took to come back, and stop reports the total as `lost_s`.
+- Safety: a camera is up at Start once ffmpeg reports video reaching the muxer (`-progress` `out_time`), within 8 s. If not, that camera is recorded by Source Record for that take, logged as `WARN FALLBACK camN ... reason=... detail=...` and reported in `fallback_sources` on start, status and stop. (Until 2026.09.30-1 the gate was 4 KiB on disk within 4 s, which a healthy camera with a 3 s GOP missed on 5 of 8 starts.)
+- Stall: ffmpeg running with no new video on disk for 12 s logs `STALLED` and the camera stops counting as writing.
 - Switching is a data change, picked up within 60 s (next take); no install, no restart. `RTSP_CAPTURE=0` in the plist turns it off on one Mini regardless of the table.
 - `status` (while recording) and `diag` include an `rtsp` block: which cameras are on RTSP and, per recording camera, `writing`, `bytes`, `segments`, `restarts`, `paused`.
 - Size: three cameras at the Sep 24 measured 32 Mbps are about 43 GB per recorded hour, versus about 24 GB per hour with Source Record (cam1 HEVC ~30 Mbps, cam2/3 ~12 Mbps).
 
 Also since 2026.09.29-2: a camera file under 64 KiB is treated like a 0-byte file (reported as a failed recording with `sizeBytes: 0`, not uploaded). That catches Source Record's 1,737-byte zero-stream stub. The stop path no longer mistakes the upload queue's `*.proxy.mp4` temp file for a take's newest camera file.
+
+### 2026.09.30-2 additions
+
+- **Warnings reach `agent.log`.** launchd sends stdout to `agent.log` and stderr to `agent.error.log`. Every `console.warn` / `console.error` line is now written to both, so `grep WARN agent.log` shows fallbacks, reconnects and file-check failures. On Sep 29 they were only in `agent.error.log`.
+- **0.5 s fragments.** RTSP parts are cut every 0.5 s as well as at keyframes (`-frag_duration 500000`). Video reaches disk ~0.2 s after the first keyframe instead of at the second, and a killed ffmpeg loses at most ~0.5 s.
+- **Short joins keep every part.** ffmpeg's concat stops at a part whose last fragment was cut off (a SIGKILLed ffmpeg) and still exits 0, silently dropping the later parts. A join under 95% of its parts' bytes now counts as failed, and every part is kept and uploaded.
+- **Delete after upload.** Camera and master originals are deleted once S3 holds a copy verified with a HeadObject size match, and only after the proxy or master audio split that reads them has finished. A failed upload keeps the file. `DELETE_AFTER_UPLOAD=0` in the LaunchAgent keeps originals. Three RTSP cameras are about 43 GB per recorded hour against ~100 GB free.
+- **Newest-file lookup is recordings only** (`.mp4/.mov/.mkv/.flv/.ts`), so a sidecar or `.DS_Store` in a camera folder can never be taken for the take's file.
 
 ## OBS control (optional)
 

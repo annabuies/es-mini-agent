@@ -20,6 +20,12 @@ function installConsoleTimestamps(options = {}) {
   if (target[INSTALL_STATE]) return false;
 
   const now = typeof options.now === 'function' ? options.now : () => new Date();
+  // launchd sends stdout to agent.log and stderr to agent.error.log, and agent.log
+  // is the one people read. On Sep 29 every RTSP fallback and reconnect warning
+  // went only to agent.error.log, so the fallback looked silent (es-mini-agent #10).
+  // With teeWarnings, warn/error lines are written to both.
+  const teeWarnings = !!options.teeWarnings;
+  const originalLog = target.log;
   Object.defineProperty(target, INSTALL_STATE, {
     value: true,
     configurable: false,
@@ -34,7 +40,9 @@ function installConsoleTimestamps(options = {}) {
       const timestamp = now().toISOString();
       const rendered = util.format(...args);
       for (const line of rendered.split('\n')) {
-        original.call(target, prefixLine(line, timestamp));
+        const out = prefixLine(line, timestamp);
+        original.call(target, out);
+        if (teeWarnings && (method === 'warn' || method === 'error') && typeof originalLog === 'function') originalLog.call(target, out);
       }
     };
   }

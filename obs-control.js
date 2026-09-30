@@ -312,6 +312,8 @@ function getNewestFileSample(sourceDir) {
 
   for (const entry of entries) {
     if (!entry.isFile()) continue;
+    // Only recordings: not .DS_Store, the concat list, or a sidecar next to a take.
+    if (!/\.(mp4|mov|mkv|flv|ts)$/i.test(entry.name)) continue;
 
     // Not takes: the upload queue's proxy temp (deleted when done, so it can
     // vanish between readdir and stat) and RTSP capture's in-progress parts.
@@ -345,6 +347,7 @@ function sampleFeedsWriting(sources, recordDir, prevSamples) {
   const prev = prevSamples instanceof Map ? prevSamples : new Map();
   const now = Date.now();
   let count = 0;
+  const writing = new Set();
 
   for (const source of sources) {
     try {
@@ -364,13 +367,14 @@ function sampleFeedsWriting(sources, recordDir, prevSamples) {
       const grewSincePrevious = !prevSample || sample.size > prevSample.size;
       if (freshEnough && grewSincePrevious) {
         count += 1;
+        writing.add(source);
       }
     } catch (_) {
       // Missing source folder/file or transient IO error: treat as not writing.
     }
   }
 
-  return { count, samples: nextSamples };
+  return { count, samples: nextSamples, writing };
 }
 
 async function getSourceScreenshot(client, source, width, quality) {

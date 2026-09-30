@@ -1,7 +1,7 @@
 'use strict';
 
 const { installConsoleTimestamps } = require('./log-timestamps');
-installConsoleTimestamps();
+installConsoleTimestamps({ teeWarnings: true }); // warnings reach agent.log too (#10)
 
 // EVRYBDY Studios FLEET — Mini-side agent.
 // Proves the app -> Cloudflare Worker (api.evrybdystudios.com) -> Mini connection is real.
@@ -13,7 +13,7 @@ const { ObsClient, callVendor, getNewestFileSample, getSourceScreenshot, sampleF
 const crypto = require('crypto');
 const os = require('os');
 const path = require('path');
-const { createUploadQueue, resolveFfmpegBin } = require('./upload-queue');
+const { createUploadQueue, resolveFfmpegBin, resolveFfprobeBin } = require('./upload-queue');
 const { runMultipartUploadTest, signS3Request } = require('./storage-upload');
 const { createCredentialsProvider } = require('./aws-creds');
 const { runSelfUpdate, getVersionBlock } = require('./self-update');
@@ -25,11 +25,12 @@ const { readGolden, restoreCameras, snapshotCameras, writeGolden } = require('./
 const { sampleDiskUsage } = require('./disk-usage');
 const { describePower, readPowerConfig, runPower } = require('./power');
 const { createRtspCapture, isRtspCamera, killOrphanedCaptures, rtspUrlForCamera } = require('./rtsp-capture');
+const { checkTake } = require('./take-health');
 
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.09.29-2';
+const AGENT_VERSION = '2026.09.30-2';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -90,6 +91,10 @@ const UPLOAD_STATE_DIR = process.env.UPLOAD_STATE_DIR || path.join(__dirname, '.
 // .cameras) says "capture": "rtsp"; the others keep Source Record. Switching a camera
 // is a data change, no install. RTSP_CAPTURE=0 in the plist turns it off on this Mini.
 const RTSP_CAPTURE_ENABLED = process.env.RTSP_CAPTURE !== '0';
+// Camera + master originals are deleted from the Mini once their upload is verified
+// in S3 (Robbie, Sep 29: ~43 GB per recorded hour, 103 GB free). DELETE_AFTER_UPLOAD=0
+// in the LaunchAgent keeps them.
+const DELETE_AFTER_UPLOAD = process.env.DELETE_AFTER_UPLOAD !== '0';
 const rtspCapture = createRtspCapture({ ffmpegBin: () => resolveFfmpegBin().bin });
 process.once('exit', () => rtspCapture.killAll());
 if (killOrphanedCaptures(OBS_RECORD_DIR)) {
@@ -114,6 +119,10 @@ const state = {
   sources: null,
   masterActive: false,
   rtspSources: [],
+  // Per camera for the current take: how it is recorded and whether RTSP fell back.
+  capture: {},
+  takeStartedAt: null,
+  lastTake: null,
   sessionRef: null,
   clientCode: null,
   cameras: [],
@@ -252,6 +261,7 @@ const uploadQueue = isStorageConfigured()
     webhookUrl: () => activeWebhookUrl,
     buildingId: BUILDING_ID,
     audioSplit: AUDIO_SPLIT,
+    deleteAfterUpload: DELETE_AFTER_UPLOAD,
   })
   : null;
 
@@ -914,6 +924,49 @@ async function stopRtspTakes(sources, masterOutputPath) {
   }));
 }
 
+function captureConfigured(source) {
+  const camera = (state.cameras || []).find((c) => c.name === source);
+  return RTSP_CAPTURE_ENABLED && isRtspCamera(camera) ? 'rtsp' : 'source_record';
+}
+
+function fallbackSources(capture) {
+  return Object.keys(capture || {}).filter((source) => capture[source].fallback);
+}
+
+/** Per-camera capture block for start/status: { capture_mode, fallback, fallback_reason? }. */
+function captureBlock(capture) {
+  const out = {};
+  for (const [source, c] of Object.entries(capture || {})) {
+    out[source] = { capture_mode: c.capture_mode, fallback: !!c.fallback };
+    if (c.fallback) out[source].fallback_reason = c.fallback_reason;
+  }
+  return out;
+}
+
+/** This take's Source Record file: the newest in the camera folder, written since the take began. */
+function sourceRecordFile(source, takeStartedAt) {
+  let newest = null;
+  try {
+    newest = getNewestFileSample(path.join(OBS_RECORD_DIR, source));
+  } catch (_) {
+    return null; // no camera folder: nothing written
+  }
+  // The stub Source Record leaves is finalized ~130 ms after its output opens, a
+  // moment before the take's start is recorded; anything older is a previous take.
+  if (!newest || !newest.absPath || newest.mtimeMs < takeStartedAt - 2000) return null;
+  return newest.absPath;
+}
+
+function cameraSummary(source, capture, verdict, rtsp) {
+  const c = capture[source] || { capture_mode: 'source_record', fallback: false };
+  const bits = [verdict.health, c.capture_mode + (c.fallback ? '(FALLBACK ' + c.fallback_reason + ')' : '')];
+  if (Number.isFinite(verdict.duration_s)) bits.push(verdict.duration_s + 's');
+  if (verdict.short_by_s) bits.push('-' + verdict.short_by_s + 's');
+  if (verdict.reason && verdict.health !== 'ok') bits.push(verdict.reason);
+  if (rtsp && rtsp.restarts) bits.push('reconnects=' + rtsp.restarts);
+  return source + ' ' + bits.join(' ');
+}
+
 // The `update` op. Defined once and called from BOTH the demo and the real block
 // of handleOp -- the demo block returns early, so an op handled only in the real
 // block is invisible on a demo machine, and a demo machine is exactly the kind we
@@ -1086,17 +1139,25 @@ async function handleOp(op, body) {
     const parkedPreview = rtspUrlForSource('cam1') ? null : await parkPreviewOffCam1();
     const startedAt = Date.now();
     const rtspStarted = [];
+    const capture = {};
     const startResults = await Promise.all(startingSources.map(async (source) => {
-      const url = rtspUrlForSource(source);
-      if (url) {
+      const configured = captureConfigured(source);
+      capture[source] = { capture_mode: 'source_record', configured, fallback: false };
+      if (configured === 'rtsp') {
+        const url = rtspUrlForSource(source);
         const camera = (state.cameras || []).find((c) => c.name === source);
-        const rtsp = await rtspCapture.start({ source, url, dir: path.join(OBS_RECORD_DIR, source), startedAt, audio: !!(camera && camera.rtsp_audio) });
+        const rtsp = url
+          ? await rtspCapture.start({ source, url, dir: path.join(OBS_RECORD_DIR, source), startedAt, audio: !!(camera && camera.rtsp_audio) })
+          : { ok: false, reason: 'rtsp_misconfigured', detail: 'no usable host or rtsp_url in the camera config' };
         if (rtsp.ok) {
           rtspStarted.push(source);
+          capture[source] = { capture_mode: 'rtsp', configured, fallback: false, video_after_ms: rtsp.video_after_ms };
           return { source, vendor: { success: true } };
         }
-        // Never lose the camera: record it the old way for this take.
-        console.warn('[es-mini-agent] [rtsp] ' + source + ' falling back to Source Record for this take: ' + (rtsp.reason || 'unknown'));
+        // Never lose the camera: record it the old way for this take, and never quietly.
+        capture[source] = { capture_mode: 'source_record', configured, fallback: true, fallback_reason: rtsp.reason || 'rtsp_start_failed', fallback_detail: rtsp.detail || null };
+        console.warn('[es-mini-agent] [rtsp] WARN FALLBACK ' + source + ' is configured for RTSP but is recording with OBS Source Record this take:'
+          + ' reason=' + capture[source].fallback_reason + (rtsp.detail ? ' detail=' + rtsp.detail : ''));
       }
       const vendor = await callVendor(client, 'record_start', source);
       return { source, vendor };
@@ -1134,11 +1195,16 @@ async function handleOp(op, body) {
     state.recordingStartedAt = Date.now();
     state.sources = startingSources;
     state.rtspSources = rtspStarted.slice();
+    state.capture = capture;
+    state.takeStartedAt = startedAt;
+    state.lastTake = null;
     state.masterActive = MASTER_RECORD;
     state.sessionRef = sessionValue(body && body.session_ref);
     state.clientCode = sessionValue(body && body.client_code);
     restorePreviewAfterPark(parkedPreview, CAM1_PARK_RESTORE_MS);
-    return Object.assign({ ok: true, recording: true, feeds_writing: null }, startSessionResponse());
+    const fellBack = fallbackSources(capture);
+    if (fellBack.length) console.warn('[es-mini-agent] [take] WARN take started with Source Record FALLBACK for ' + fellBack.join(',') + ' (configured for RTSP)');
+    return Object.assign({ ok: true, recording: true, feeds_writing: null }, startSessionResponse(), { cameras: captureBlock(capture), fallback_sources: fellBack });
     })();
     try {
       return await startInFlight;
@@ -1205,41 +1271,90 @@ async function handleOp(op, body) {
       }
 
       const allStopsSucceeded = stopResults.every((entry) => entry.vendor.success) && rtspStops.every((entry) => entry.rtsp.ok);
-      const saved = allStopsSucceeded && masterStop.success && filesStable;
       const recordingStartedAt = state.recordingStartedAt;
+      const takeStartedAt = state.takeStartedAt || recordingStartedAt;
       const sessionRef = state.sessionRef;
+      const capture = state.capture || {};
+      const masterPath = masterWasActive && masterStop.success ? masterStop.outputPath : null;
+      const masterBase = masterStop.outputPath ? path.basename(String(masterStop.outputPath)) : null;
       let uploadQueued = 0;
 
+      // The take's files, one per camera; null filePath = the camera wrote nothing.
+      const rtspBySource = new Map(rtspStops.map((entry) => [entry.source, entry.rtsp]));
+      const takeFiles = sources.map((source) => {
+        const rtsp = rtspBySource.get(source);
+        if (rtsp) return { source, filePath: rtsp.filePath || null, captureError: rtsp.ok ? null : rtsp.reason, gapS: Number.isFinite(rtsp.gap_ms) ? rtsp.gap_ms / 1000 : null, rtsp };
+        return { source, filePath: OBS_RECORD_DIR && takeStartedAt ? sourceRecordFile(source, takeStartedAt) : null, captureError: null, gapS: null, rtsp: null };
+      });
+
+      // File health, not capture state, decides what the kiosk and the booking thread say.
+      let check = null;
+      if (OBS_RECORD_DIR) {
+        try {
+          check = await checkTake({ cameras: takeFiles, masterPath }, { ffprobeBin: resolveFfprobeBin });
+        } catch (e) {
+          console.warn('[es-mini-agent] [take] WARN file check failed:', e && (e.message || e));
+        }
+      }
+      const verdicts = check ? check.cameras : {};
+      const takeHealth = check ? check.health : 'unverified';
+      const fellBack = fallbackSources(capture);
+      const failedSources = Object.keys(verdicts).filter((source) => verdicts[source].health === 'failed' || verdicts[source].health === 'missing');
+      const saved = allStopsSucceeded && masterStop.success && filesStable && takeHealth !== 'failed' && takeHealth !== 'degraded';
+
+      const files = [];
+      const failedFiles = [];
+      const cameras = {};
+      for (const f of takeFiles) {
+        const v = verdicts[f.source] || { health: 'unverified', size_bytes: f.filePath ? (getFileSample(f.filePath) || { size: 0 }).size : 0 };
+        const c = capture[f.source] || { capture_mode: 'source_record', fallback: false };
+        const usable = v.health !== 'failed' && v.health !== 'missing';
+        const entry = { capture_mode: c.capture_mode, fallback: !!c.fallback, health: v.health, size_bytes: v.size_bytes || 0 };
+        if (c.fallback) entry.fallback_reason = c.fallback_reason;
+        if (v.reason) entry.reason = v.reason;
+        for (const k of ['duration_s', 'master_duration_s', 'short_by_s']) if (v[k] !== undefined && v[k] !== null) entry[k] = v[k];
+        if (f.rtsp) { entry.reconnects = f.rtsp.restarts || 0; entry.lost_s = Math.round((f.rtsp.gap_ms || 0) / 100) / 10; }
+        cameras[f.source] = entry;
+        if (f.filePath) files.push({ source: f.source, size_bytes: entry.size_bytes, ok: usable, health: v.health });
+        if (!usable) failedFiles.push({ source: f.source, size_bytes: entry.size_bytes, reason: v.reason || 'no_file' });
+      }
+
+      const takeName = masterBase ? path.basename(masterBase, path.extname(masterBase)) : 'take';
+      const summary = '[es-mini-agent] [take] ' + takeName + ' health=' + takeHealth + ' saved=' + saved
+        + (fellBack.length ? ' FALLBACK=' + fellBack.join(',') : '') + (failedSources.length ? ' FAILED=' + failedSources.join(',') : '')
+        + ' | ' + takeFiles.map((f) => cameraSummary(f.source, capture, verdicts[f.source] || { health: 'unverified' }, f.rtsp)).join(' | ')
+        + (check && check.master ? ' | master ' + check.master.health + (Number.isFinite(check.master.duration_s) ? ' ' + check.master.duration_s + 's' : '') : '');
+      if (takeHealth === 'ok' && !fellBack.length) console.log(summary);
+      else console.warn(summary.replace('[take] ', '[take] WARN '));
+
+      const takeMeta = { take_health: takeHealth, fallback_sources: fellBack, failed_sources: failedSources };
       if (uploadQueue && OBS_RECORD_DIR) {
         if (!recordingStartedAt) {
           console.warn('[es-mini-agent] upload skipped: unknown recording start');
         } else {
-          for (const entry of rtspStops) {
-            // The exact file this take wrote (or its first kept part if the join failed).
-            if (!entry.rtsp.filePath) {
-              console.warn('[es-mini-agent] [rtsp] ' + entry.source + ' has no file to upload: ' + (entry.rtsp.reason || 'unknown'));
+          for (const f of takeFiles) {
+            const entry = cameras[f.source];
+            const meta = Object.assign({}, takeMeta, entry, { health_reason: entry.reason || null });
+            if (!f.filePath) {
+              console.warn('[es-mini-agent] ' + f.source + ' has no file to upload: ' + (entry.reason || 'unknown'));
+              uploadQueue.reportMissingCamera({ source: f.source, sessionRef, fileName: masterBase || (f.source + '.mp4'), meta }).catch(() => {});
               continue;
             }
-            const out = uploadQueue.enqueue({ filePath: entry.rtsp.filePath, source: entry.source, sessionRef });
-            if (out && out.queued) uploadQueued += 1;
-            else console.warn('[es-mini-agent] upload enqueue skipped source=' + entry.source + ' reason=' + (out && out.reason));
-          }
-          for (const source of obsSources) {
             try {
-              const sourceDir = path.join(OBS_RECORD_DIR, source);
-              const newest = getNewestFileSample(sourceDir);
-              if (!newest || !newest.absPath) continue;
-              if (newest.mtimeMs < (recordingStartedAt - 60000)) continue;
-              const out = uploadQueue.enqueue({ filePath: newest.absPath, source, sessionRef });
-              if (out && out.queued) uploadQueued += 1;
-              else console.warn('[es-mini-agent] upload enqueue skipped source=' + source + ' reason=' + (out && out.reason));
+              // A failed RTSP join keeps every part; filePath is the first, and each later one is footage too.
+              const extraParts = f.rtsp && Array.isArray(f.rtsp.keptParts) ? f.rtsp.keptParts.filter((p) => p !== f.filePath) : [];
+              for (const filePath of [f.filePath, ...extraParts]) {
+                const out = uploadQueue.enqueue({ filePath, source: f.source, sessionRef, meta });
+                if (out && out.queued) uploadQueued += 1;
+                else console.warn('[es-mini-agent] upload enqueue skipped source=' + f.source + ' reason=' + (out && out.reason));
+              }
             } catch (e) {
-              console.warn('[es-mini-agent] upload enqueue failed source=' + source + ':', e && (e.stack || e.message || e));
+              console.warn('[es-mini-agent] upload enqueue failed source=' + f.source + ':', e && (e.stack || e.message || e));
             }
           }
           if (masterWasActive && masterStop.success && masterStop.outputPath) {
             try {
-              const out = uploadQueue.enqueue({ filePath: masterStop.outputPath, source: MASTER_SOURCE, sessionRef });
+              const out = uploadQueue.enqueue({ filePath: masterStop.outputPath, source: MASTER_SOURCE, sessionRef, meta: takeMeta });
               if (out && out.queued) uploadQueued += 1;
             } catch (e) {
               console.warn('[es-mini-agent] upload enqueue failed source=' + MASTER_SOURCE + ':', e && (e.stack || e.message || e));
@@ -1248,14 +1363,18 @@ async function handleOp(op, body) {
         }
       }
 
-      response = { ok: true, saved };
+      response = { ok: true, saved, health: takeHealth, files, failed_files: failedFiles, cameras, fallback_sources: fellBack };
+      if (check && check.master) response.master = check.master;
       if (uploadQueue) response.upload_queued = uploadQueued;
+      state.lastTake = { finished_at: new Date().toISOString(), saved, health: takeHealth, files, failed_files: failedFiles, fallback_sources: fellBack };
     } finally {
       state.recording = false;
       state.paused = false;
       state.recordingStartedAt = null;
       state.sources = null;
       state.rtspSources = [];
+      state.capture = {};
+      state.takeStartedAt = null;
       state.masterActive = false;
       state.sessionRef = null;
       state.clientCode = null;
@@ -1331,6 +1450,8 @@ async function handleOp(op, body) {
       state.recordingStartedAt = null;
       state.sources = null;
       state.rtspSources = [];
+      state.capture = {};
+      state.takeStartedAt = null;
       state.masterActive = false;
       state.sessionRef = null;
       state.clientCode = null;
@@ -1344,13 +1465,27 @@ async function handleOp(op, body) {
     const masterActive = await getMasterActiveSafe();
     if (!state.recording) {
       const out = { ok: true, recording: false, feeds_writing: 0, preview: previewActive(), sources: sources.slice(), master_active: masterActive, master_enabled: MASTER_RECORD };
+      if (state.lastTake) out.last_take = state.lastTake;
       if (uploadQueue) out.uploads = uploadQueue.status();
       return out;
     }
-    const sampled = sampleFeedsWriting(sources, OBS_RECORD_DIR, feedsPrevSamples);
+    // RTSP cameras write "<stamp> rtsp-partN.mp4", which the Source Record sampler
+    // skips on purpose; counting them there made a healthy RTSP camera look dead
+    // on the kiosk ("Camera failed") while a fallen-back one looked fine (Sep 29).
+    const obsSources = sources.filter((source) => !isRtspSession(source));
+    const sampled = sampleFeedsWriting(obsSources, OBS_RECORD_DIR, feedsPrevSamples);
     feedsPrevSamples = sampled.samples;
-    const out = Object.assign({ ok: true, recording: true, feeds_writing: sampled.count, preview: previewActive(), sources: sources.slice(), master_active: masterActive, master_enabled: MASTER_RECORD }, activeSessionResponse());
-    if (state.rtspSources.length) out.rtsp = rtspCapture.describe();
+    const rtspState = state.rtspSources.length ? rtspCapture.describe() : {};
+    const cameras = captureBlock(state.capture);
+    for (const source of sources) {
+      if (!cameras[source]) cameras[source] = { capture_mode: 'source_record', fallback: false };
+      cameras[source].writing = isRtspSession(source) ? !!(rtspState[source] && rtspState[source].writing) : sampled.writing.has(source);
+    }
+    const feedsWriting = sampled.count + sources.filter((source) => isRtspSession(source) && rtspState[source] && rtspState[source].writing).length;
+    const out = Object.assign({ ok: true, recording: true, feeds_writing: feedsWriting, preview: previewActive(), sources: sources.slice(), master_active: masterActive, master_enabled: MASTER_RECORD }, activeSessionResponse());
+    out.cameras = cameras;
+    out.fallback_sources = fallbackSources(state.capture);
+    if (state.rtspSources.length) out.rtsp = rtspState;
     if (uploadQueue) out.uploads = uploadQueue.status();
     return out;
   }

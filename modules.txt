@@ -21,3 +21,4 @@ digest-auth.js
 cam-settings.js
 power.js
 rtsp-capture.js
+take-health.js

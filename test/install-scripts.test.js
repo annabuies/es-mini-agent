@@ -36,9 +36,9 @@ test('installer removes the stale agent plist and supports the opt-in OBS launch
   assert.match(obsLauncher, /pgrep -x OBS/);
 });
 
-test('agent release version is 2026.09.29-2', () => {
+test('agent release version is 2026.09.30-2', () => {
   const server = fs.readFileSync(path.join(projectDir, 'server.js'), 'utf8');
-  assert.match(server, /const AGENT_VERSION = '2026\.09\.29-2';/);
+  assert.match(server, /const AGENT_VERSION = '2026\.09\.30-2';/);
 });
 
 test('installer persists the power strip env into the plist and modules.txt ships power.js', () => {
