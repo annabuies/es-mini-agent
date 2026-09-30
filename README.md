@@ -204,6 +204,15 @@ Also since 2026.09.29-2: a camera file under 64 KiB is treated like a 0-byte fil
 - **Delete after upload.** Camera and master originals are deleted once S3 holds a copy verified with a HeadObject size match, and only after the proxy or master audio split that reads them has finished. A failed upload keeps the file. `DELETE_AFTER_UPLOAD=0` in the LaunchAgent keeps originals. Three RTSP cameras are about 43 GB per recorded hour against ~100 GB free.
 - **Newest-file lookup is recordings only** (`.mp4/.mov/.mkv/.flv/.ts`), so a sidecar or `.DS_Store` in a camera folder can never be taken for the take's file.
 
+### 2026.09.30-3: proxies never run during a take
+
+The proxy step is a software encode (libx264) of each 4K camera file. Until now it started right after each camera upload, up to three at once, and kept running if the next take started. On Sep 30 the three takes that started 40 to 56 s after an all-RTSP take were the ones where RTSP failed to start or dropped mid-take (`Failed reading RTSP data: End of file`); the takes after a long gap or after a small take were clean.
+
+- Proxies run **one at a time**, at low priority (`nice -n 15`).
+- A take start **stops a running proxy** before any camera capture starts (`[take] WARN stopped a running proxy encode`), and no proxy starts while a take is recording. The stopped proxy is redone after the take; the original stays on the Mini until its proxy is made.
+- Deferred proxies are picked up again by the queue itself (they used to wait for the next agent restart).
+- `uploads.proxies_pending` in `status` / `diag` counts proxies still to make.
+
 ## OBS control (optional)
 
 - Requires OBS Studio 28+ (obs-websocket v5 is built in). Enable/configure it in **Tools -> obs-websocket Settings** (port/password must match env vars here).
