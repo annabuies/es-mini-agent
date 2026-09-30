@@ -30,7 +30,7 @@ const { checkTake } = require('./take-health');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.09.30-2';
+const AGENT_VERSION = '2026.09.30-3';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -1133,6 +1133,12 @@ async function handleOp(op, body) {
       client = await getObsClient();
     } catch (e) {
       return { ok: false, reason: 'obs_start_failed', detail: truncateDetail(e && (e.message || e)) };
+    }
+
+    // A proxy encode of the last take takes every core; stop it before the cameras start.
+    if (uploadQueue) {
+      const held = await uploadQueue.holdProxies().catch(() => null);
+      if (held && held.stopped) console.warn('[es-mini-agent] [take] WARN stopped a running proxy encode to start this take; it is redone after the take');
     }
 
     // The cam1 park only works around Source Record; RTSP capture does not need it.

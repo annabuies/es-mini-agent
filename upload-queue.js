@@ -13,6 +13,13 @@ const MAX_ERROR_LEN = 300;
 const MASTER_SOURCE = 'master';
 const AUDIO_KIND = 'audio';
 const EMPTY_CAMERA_FILE_BYTES = 64 * 1024;
+// The proxy is a software encode of a 4K file and takes every core. It must never
+// run during a take: on 2026-09-30 the takes started within a minute of the last
+// one (proxies of that take still encoding) were the ones where the cameras' RTSP
+// streams failed to start or dropped mid-take (es-mini-agent #10).
+const PROXY_POLL_MS = 2000;
+const PROXY_HOLD_MS = 30000;
+const NICE_BIN = '/usr/bin/nice';
 
 function isCameraRecording(job) {
   return !!job && job.source !== MASTER_SOURCE && job.kind !== AUDIO_KIND && /^cam(?:era)?[-_ ]?\d+$/i.test(String(job.source || ''));
@@ -128,8 +135,13 @@ function createUploadQueue(opts) {
     ? options.stabilityPollMs
     : STABILITY_POLL_MS;
 
+  const proxyPollMs = Number.isFinite(options.proxyPollMs) && options.proxyPollMs >= 0 ? options.proxyPollMs : PROXY_POLL_MS;
+
   const queue = [];
   const pendingProxyJobs = [];
+  let proxyWorkerRunning = false;
+  let activeProxy = null; // { proc, closed } while a proxy encode runs
+  let proxyHoldUntil = 0;
   const queuedFilePaths = new Set();
   const completedFilePaths = new Set();
   let activeJob = null;
@@ -268,6 +280,70 @@ function createUploadQueue(opts) {
         else reject(new Error('ffmpeg exited with code ' + code + (stderrTail ? ': ' + stderrTail : '')));
       });
     });
+  }
+
+  function proxiesBlocked() {
+    return isRecording() || Date.now() < proxyHoldUntil;
+  }
+
+  /** The proxy encode: one at a time, low priority, killed the moment a take starts. */
+  function runProxyFfmpeg(args) {
+    return new Promise((resolve, reject) => {
+      let proc;
+      try {
+        const ffmpegBin = resolveFfmpegBin().bin;
+        proc = fs.existsSync(NICE_BIN)
+          ? spawn(NICE_BIN, ['-n', '15', ffmpegBin].concat(args), { stdio: ['ignore', 'ignore', 'pipe'] })
+          : spawn(ffmpegBin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+      } catch (e) {
+        reject(e);
+        return;
+      }
+      const run = { proc, preempted: false, closed: null };
+      const preempt = () => {
+        if (run.preempted) return;
+        run.preempted = true;
+        try { proc.kill('SIGKILL'); } catch (_) {}
+      };
+      run.preempt = preempt;
+      // holdProxies() is the fast path; this also catches a take that started without it.
+      const watch = setInterval(() => { if (proxiesBlocked()) preempt(); }, 500);
+      if (watch.unref) watch.unref();
+      let stderrTail = '';
+      proc.stderr.on('data', (chunk) => {
+        stderrTail = (stderrTail + chunk.toString('utf8')).slice(-MAX_ERROR_LEN);
+      });
+      run.closed = new Promise((done) => {
+        const finish = (err) => {
+          clearInterval(watch);
+          if (activeProxy === run) activeProxy = null;
+          done();
+          if (run.preempted) {
+            const e = new Error('proxy stopped for a take');
+            e.preempted = true;
+            reject(e);
+          } else if (err) reject(err);
+          else resolve();
+        };
+        proc.on('error', (e) => finish(e));
+        proc.on('close', (code) => finish(code === 0 ? null : new Error('ffmpeg exited with code ' + code + (stderrTail ? ': ' + stderrTail : ''))));
+      });
+      activeProxy = run;
+    });
+  }
+
+  /**
+   * Called at the start of a take, before any camera capture starts: stops a
+   * running proxy encode (it is redone after the take) and keeps new ones from
+   * starting until the take is recording. Resolves once the encoder is gone.
+   */
+  async function holdProxies(ms) {
+    proxyHoldUntil = Date.now() + (Number.isFinite(ms) && ms >= 0 ? ms : PROXY_HOLD_MS);
+    const run = activeProxy;
+    if (!run) return { stopped: false };
+    run.preempt();
+    await run.closed;
+    return { stopped: true };
   }
 
   function runFfprobe(args) {
@@ -481,16 +557,38 @@ function createUploadQueue(opts) {
     }
   }
 
-  async function maybeMakeProxy(job) {
-    if (isRecording()) {
-      pendingProxyJobs.push(job);
-      console.warn('[upload-queue] proxy deferred (recording active) key=' + job.key);
-      return;
-    }
+  function maybeMakeProxy(job) {
+    pendingProxyJobs.push(job);
+    if (proxiesBlocked()) console.warn('[upload-queue] proxy deferred (recording active) key=' + job.key);
+    ensureProxyWorker().catch((e) => {
+      console.warn('[upload-queue] proxy worker error:', e && (e.stack || e.message || e));
+    });
+    return Promise.resolve();
+  }
 
+  async function ensureProxyWorker() {
+    if (proxyWorkerRunning) return;
+    proxyWorkerRunning = true;
+    try {
+      while (pendingProxyJobs.length > 0) {
+        if (proxiesBlocked()) {
+          await new Promise((resolve) => { const t = setTimeout(resolve, proxyPollMs); if (t.unref) t.unref(); });
+          continue;
+        }
+        // A proxy stopped for a take stays at the head of the line and is redone.
+        if (await makeProxy(pendingProxyJobs[0])) pendingProxyJobs.shift();
+      }
+    } finally {
+      proxyWorkerRunning = false;
+    }
+  }
+
+  /** Resolves true when the job is finished (made, failed or skipped), false if a take stopped it. */
+  async function makeProxy(job) {
     const proxyBase = path.basename(job.filePath, path.extname(job.filePath));
     const proxyKey = 'proxies/' + buildingId + '/' + job.source + '/' + proxyBase + '.mp4';
     const tmpProxyPath = job.filePath + '.proxy.mp4';
+    let preempted = false;
 
     try {
       let st;
@@ -498,11 +596,11 @@ function createUploadQueue(opts) {
         st = await fsp.stat(job.filePath);
       } catch (e) {
         console.warn('[upload-queue] proxy skipped, master file gone key=' + job.key);
-        return;
+        return true;
       }
-      if (!st.isFile()) return;
+      if (!st.isFile()) return true;
 
-      await runFfmpeg([
+      await runProxyFfmpeg([
         '-y',
         '-i', job.filePath,
         '-vf', 'scale=1920:1080',
@@ -532,12 +630,16 @@ function createUploadQueue(opts) {
       await removeFileIfExists(proxyStateFilePath);
       console.log('[upload-queue] proxy confirmed ' + proxyKey);
     } catch (e) {
-      console.warn('[upload-queue] proxy failed key=' + job.key + ' error=' + truncateError(e && (e.message || e.stack || e)));
+      preempted = !!(e && e.preempted);
+      if (preempted) console.warn('[upload-queue] proxy stopped for a take, will redo after it key=' + job.key);
+      else console.warn('[upload-queue] proxy failed key=' + job.key + ' error=' + truncateError(e && (e.message || e.stack || e)));
     } finally {
-      await removeFileIfExists(tmpProxyPath);
+      await removeFileIfExists(tmpProxyPath).catch(() => {});
       // The original is already verified in S3; a failed proxy is not a reason to keep it.
-      await removeUploadedOriginal(job);
+      // A proxy stopped for a take still needs the original.
+      if (!preempted) await removeUploadedOriginal(job);
     }
+    return !preempted;
   }
 
   async function ensureWorker() {
@@ -689,13 +791,10 @@ function createUploadQueue(opts) {
         }
       }
 
-      if (pendingProxyJobs.length > 0 && !isRecording()) {
-        const jobsToRetry = pendingProxyJobs.splice(0, pendingProxyJobs.length);
-        for (const job of jobsToRetry) {
-          maybeMakeProxy(job).catch((e) => {
-            console.warn('[upload-queue] deferred proxy retry error:', e && (e.stack || e.message || e));
-          });
-        }
+      if (pendingProxyJobs.length > 0) {
+        ensureProxyWorker().catch((e) => {
+          console.warn('[upload-queue] deferred proxy retry error:', e && (e.stack || e.message || e));
+        });
       }
     } catch (e) {
       console.warn('[upload-queue] sweep error:', e && (e.stack || e.message || e));
@@ -706,6 +805,7 @@ function createUploadQueue(opts) {
     try {
       return {
         queued: queue.length,
+        proxies_pending: pendingProxyJobs.length,
         active: activeSnapshot ? Object.assign({}, activeSnapshot) : null,
         last_confirmed: lastConfirmed ? Object.assign({}, lastConfirmed) : null,
       };
@@ -715,7 +815,7 @@ function createUploadQueue(opts) {
     }
   }
 
-  return { enqueue, sweep, status, reportMissingCamera };
+  return { enqueue, sweep, status, reportMissingCamera, holdProxies };
 }
 
 module.exports = { createUploadQueue, resolveFfmpegBin, resolveFfprobeBin };
