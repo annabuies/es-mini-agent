@@ -196,6 +196,14 @@ A camera whose entry in `studios.fleet_buildings.cameras` has `"capture": "rtsp"
 
 Also since 2026.09.29-2: a camera file under 64 KiB is treated like a 0-byte file (reported as a failed recording with `sizeBytes: 0`, not uploaded). That catches Source Record's 1,737-byte zero-stream stub. The stop path no longer mistakes the upload queue's `*.proxy.mp4` temp file for a take's newest camera file.
 
+### 2026.09.30-2 additions
+
+- **Warnings reach `agent.log`.** launchd sends stdout to `agent.log` and stderr to `agent.error.log`. Every `console.warn` / `console.error` line is now written to both, so `grep WARN agent.log` shows fallbacks, reconnects and file-check failures. On Sep 29 they were only in `agent.error.log`.
+- **0.5 s fragments.** RTSP parts are cut every 0.5 s as well as at keyframes (`-frag_duration 500000`). Video reaches disk ~0.2 s after the first keyframe instead of at the second, and a killed ffmpeg loses at most ~0.5 s.
+- **Short joins keep every part.** ffmpeg's concat stops at a part whose last fragment was cut off (a SIGKILLed ffmpeg) and still exits 0, silently dropping the later parts. A join under 95% of its parts' bytes now counts as failed, and every part is kept and uploaded.
+- **Delete after upload.** Camera and master originals are deleted once S3 holds a copy verified with a HeadObject size match, and only after the proxy or master audio split that reads them has finished. A failed upload keeps the file. `DELETE_AFTER_UPLOAD=0` in the LaunchAgent keeps originals. Three RTSP cameras are about 43 GB per recorded hour against ~100 GB free.
+- **Newest-file lookup is recordings only** (`.mp4/.mov/.mkv/.flv/.ts`), so a sidecar or `.DS_Store` in a camera folder can never be taken for the take's file.
+
 ## OBS control (optional)
 
 - Requires OBS Studio 28+ (obs-websocket v5 is built in). Enable/configure it in **Tools -> obs-websocket Settings** (port/password must match env vars here).

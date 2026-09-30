@@ -231,6 +231,8 @@ async function startAgent(t, options = {}) {
       OBS_RECORD_DIR: recordDir, MASTER_RECORD: options.masterRecord === false ? '0' : '1',
       UPLOAD_STATE_DIR: uploadStateDir,
       FFPROBE_BIN: path.join(__dirname, 'fake-ffprobe.js'),
+      // Tests read the take files after stop; the deletion test turns this back on.
+      DELETE_AFTER_UPLOAD: '0',
       ...(options.env || {}),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -255,7 +257,7 @@ test('heartbeat is sent from cached state on the first poll only once per minute
   const [first, second] = polls;
 
   assert.equal(first.searchParams.get('hb'), '1');
-  assert.equal(first.searchParams.get('v'), '2026.09.30-1');
+  assert.equal(first.searchParams.get('v'), '2026.09.30-2');
   assert.equal(first.searchParams.get('c'), 'unknown');
   const heartbeatState = JSON.parse(Buffer.from(first.searchParams.get('state'), 'base64url').toString('utf8'));
   assert.deepEqual(heartbeatState, {
@@ -845,4 +847,36 @@ test('pause and resume on an RTSP take pause ffmpeg, not Source Record, for that
   assert.equal(status.rtsp.cam1.segments, 2);
   await postAgent(agent.agentPort, 'stop');
   assert.deepEqual(fs.readdirSync(path.join(agent.recordDir, 'cam1')).filter((f) => f.endsWith('.mp4')), [TAKE + '.mp4']);
+});
+
+test('DELETE_AFTER_UPLOAD: camera and master originals leave the Mini only after a verified upload and their proxy', { timeout: 12000 }, async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-delete-after-'));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const camPath = path.join(tempDir, 'cam1.mp4');
+  const masterPath = path.join(tempDir, 'master.mp4');
+  const keptPath = path.join(tempDir, 'cam2.mp4');
+  for (const p of [camPath, masterPath, keptPath]) fs.writeFileSync(p, CAMERA_FILE_BYTES);
+  const uploads = [];
+  let failNext = false;
+  const previousFfmpeg = process.env.FFMPEG_BIN;
+  const previousFfprobe = process.env.FFPROBE_BIN;
+  process.env.FFMPEG_BIN = path.join(__dirname, 'fake-ffmpeg.js');
+  process.env.FFPROBE_BIN = path.join(__dirname, 'fake-ffmpeg.js');
+  t.after(() => { restoreEnv('FFMPEG_BIN', previousFfmpeg); restoreEnv('FFPROBE_BIN', previousFfprobe); });
+  const queue = createUploadQueue({
+    stateDir: path.join(tempDir, 'state'), buildingId: 'bench-1', deleteAfterUpload: true, audioSplit: false, stabilityPollMs: 5,
+    uploader: async (input) => {
+      if (failNext) { failNext = false; throw new Error('HeadObject size mismatch'); }
+      uploads.push(input);
+      return { key: input.key, sizeBytes: input.sizeBytes, partsUploaded: 1 };
+    },
+  });
+  queue.enqueue({ filePath: camPath, source: 'cam1' });
+  queue.enqueue({ filePath: masterPath, source: 'master' });
+  await waitFor(() => !fs.existsSync(camPath) && !fs.existsSync(masterPath), 10000);
+  assert.ok(uploads.some((u) => u.key === 'proxies/bench-1/cam1/cam1.mp4'), 'proxy made from the original before it was removed');
+  failNext = true;
+  queue.enqueue({ filePath: keptPath, source: 'cam2' });
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.ok(fs.existsSync(keptPath), 'a failed upload keeps the file');
 });

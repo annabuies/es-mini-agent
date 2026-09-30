@@ -120,6 +120,10 @@ function createUploadQueue(opts) {
   const buildingId = String(options.buildingId || '').trim() || 'unknown';
   const uploader = typeof options.uploader === 'function' ? options.uploader : runMultipartUpload;
   const audioSplit = !!options.audioSplit;
+  // Delete a camera/master original from the Mini once S3 holds a verified copy
+  // (the uploader checks size with HeadObject) and the proxy / audio split that
+  // read it are done. ~43 GB per recorded hour vs ~100 GB free (Robbie, Sep 29).
+  const deleteAfterUpload = !!options.deleteAfterUpload;
   const stabilityPollMs = Number.isFinite(options.stabilityPollMs) && options.stabilityPollMs >= 0
     ? options.stabilityPollMs
     : STABILITY_POLL_MS;
@@ -442,6 +446,7 @@ function createUploadQueue(opts) {
       if (job.source === MASTER_SOURCE) {
         console.log('[upload-queue] proxy skipped for master key=' + job.key);
         await splitMasterAudio(job);
+        await removeUploadedOriginal(job);
       } else if (job.kind === AUDIO_KIND) {
         console.log('[upload-queue] proxy skipped for audio key=' + job.key);
       } else {
@@ -463,6 +468,16 @@ function createUploadQueue(opts) {
       console.warn('[upload-queue] upload failed key=' + job.key + ' error=' + (detail || 'upload_failed'));
     } finally {
       activeSnapshot = null;
+    }
+  }
+
+  async function removeUploadedOriginal(job) {
+    if (!deleteAfterUpload || job.kind === AUDIO_KIND || job.removeAfterConfirm) return;
+    try {
+      await removeFileIfExists(job.filePath);
+      console.log('[upload-queue] removed local original after verified upload key=' + job.key);
+    } catch (e) {
+      console.warn('[upload-queue] could not remove local original key=' + job.key + ':', e && (e.message || e));
     }
   }
 
@@ -520,6 +535,8 @@ function createUploadQueue(opts) {
       console.warn('[upload-queue] proxy failed key=' + job.key + ' error=' + truncateError(e && (e.message || e.stack || e)));
     } finally {
       await removeFileIfExists(tmpProxyPath);
+      // The original is already verified in S3; a failed proxy is not a reason to keep it.
+      await removeUploadedOriginal(job);
     }
   }
 
