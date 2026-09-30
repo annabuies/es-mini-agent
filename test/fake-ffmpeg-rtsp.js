@@ -41,10 +41,23 @@ if (process.env.FAKE_RTSP_SILENT === '1') {
   return;
 }
 
+// -progress pipe:1 like real ffmpeg: out_time_us is N/A until video is muxed.
+// FAKE_RTSP_PROGRESS_ONLY=1: video is muxed but nothing reaches the file after
+// the header (a fragment not flushed yet, or the empty-audio stall).
+const progress = args.includes('-progress');
+let outTimeUs = null;
 setTimeout(() => {
   fs.writeFileSync(out, Buffer.alloc(1024, 7));
-  if (process.env.FAKE_RTSP_NO_FRAMES === '1') return;
-  setInterval(() => fs.appendFileSync(out, Buffer.alloc(32 * 1024, 7)), 50);
+  if (process.env.FAKE_RTSP_NO_FRAMES === '1') {
+    if (progress) setInterval(() => process.stdout.write('out_time_us=N/A\nprogress=continue\n'), 50);
+    return;
+  }
+  outTimeUs = 0;
+  setInterval(() => {
+    outTimeUs += 50000;
+    if (process.env.FAKE_RTSP_PROGRESS_ONLY !== '1') fs.appendFileSync(out, Buffer.alloc(32 * 1024, 7));
+    if (progress) process.stdout.write('frame=0\nout_time_us=' + outTimeUs + '\nprogress=continue\n');
+  }, 50);
 }, 20);
 
 const marker = process.env.FAKE_RTSP_DROP_ONCE;

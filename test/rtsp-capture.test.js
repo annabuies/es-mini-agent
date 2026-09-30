@@ -51,7 +51,9 @@ test('camera config: RTSP only when capture is "rtsp"; URL defaults to :554/1 an
 test('one uninterrupted take becomes <finalBase>.mp4, with no parts left behind', { timeout: 10000 }, async (t) => {
   const dir = tempDir(t);
   const cap = capture();
-  assert.deepEqual(await cap.start({ source: 'cam1', url: 'rtsp://10.0.0.5:554/1', dir }), { ok: true });
+  const started = await cap.start({ source: 'cam1', url: 'rtsp://10.0.0.5:554/1', dir });
+  assert.equal(started.ok, true);
+  assert.ok(started.video_after_ms >= 0 && started.video_after_ms < 2000, 'reports how long video took');
   assert.equal(cap.active('cam1'), true);
   await sleep(300);
   const out = await cap.stop('cam1', { finalBase: '2026-09-29 08-13-05' });
@@ -188,4 +190,78 @@ test('a camera that connects but sends nothing fails the start within the probe 
   assert.match(out.detail, /no video from the camera/);
   assert.ok(Date.now() - began < 2000, 'no 6 s wait on a q that is never read');
   assert.equal(cap.active('cam1'), false);
+});
+
+test('start is up once video is muxed, before a fragment reaches the disk (a long GOP no longer falls back)', { timeout: 10000 }, async (t) => {
+  const dir = tempDir(t);
+  withEnv(t, { FAKE_RTSP_PROGRESS_ONLY: '1' });
+  const cap = capture({ startProbeMs: 1500 });
+  const out = await cap.start({ source: 'cam1', url: 'rtsp://10.0.0.5:554/1', dir });
+  assert.equal(out.ok, true);
+  assert.ok(out.video_after_ms < 1000);
+  assert.equal(cap.describe().cam1.writing, true, 'muxed video counts as writing until the first fragment is due');
+  await cap.stop('cam1', { finalBase: 'take' });
+});
+
+test('a start failure says whether the camera connected, and never logs a password', { timeout: 10000 }, async (t) => {
+  const dir = tempDir(t);
+  withEnv(t, { FAKE_RTSP_NO_FRAMES: '1' });
+  const warnings = [];
+  const previousWarn = console.warn;
+  console.warn = (...args) => { warnings.push(args.join(' ')); };
+  t.after(() => { console.warn = previousWarn; });
+  const cap = capture({ startProbeMs: 400 });
+  const out = await cap.start({ source: 'cam1', url: 'rtsp://admin:hunter2@10.0.0.5:554/1', dir });
+  assert.equal(out.ok, false);
+  assert.match(out.detail, /connected \(stream header written\) but no video packets within 0\.4 s/);
+  assert.doesNotMatch(warnings.join('\n') + out.detail, /hunter2/);
+  assert.match(warnings.join('\n'), /rtsp:\/\/\*\*\*@10\.0\.0\.5/);
+  assert.equal(redactUrl('a rtsp://u:p@h/1 b rtsp://x:y@h/2'), 'a rtsp://***@h/1 b rtsp://***@h/2');
+});
+
+test('a reconnect reports the footage it lost, in the stop result and the log', { timeout: 10000 }, async (t) => {
+  const dir = tempDir(t);
+  withEnv(t, { FAKE_RTSP_DROP_ONCE: path.join(dir, 'dropped.marker') });
+  const warnings = [];
+  const previousWarn = console.warn;
+  console.warn = (...args) => { warnings.push(args.join(' ')); };
+  t.after(() => { console.warn = previousWarn; });
+  const cap = capture({ restartDelayMs: 300 });
+  await cap.start({ source: 'cam3', url: 'rtsp://10.0.0.7:554/1', dir });
+  await sleep(1200);
+  const out = await cap.stop('cam3', { finalBase: 'take' });
+  assert.equal(out.restarts, 1, warnings.join('\n'));
+  assert.ok(out.gap_ms >= 300 && out.gap_ms < 1500, 'gap covers the restart delay and reconnect: ' + out.gap_ms);
+  assert.match(warnings.join('\n'), /cam3 video back after \d\.\d s \(segment 2, reconnect\)/);
+  assert.match(warnings.join('\n'), /cam3 saved take\.mp4 .* reconnects=1 lost=\d\.\d s/);
+});
+
+test('a resume reports how long video took to come back, without counting the pause itself', { timeout: 10000 }, async (t) => {
+  const dir = tempDir(t);
+  const cap = capture();
+  await cap.start({ source: 'cam2', url: 'rtsp://10.0.0.6:554/1', dir });
+  await sleep(200);
+  await cap.pause('cam2');
+  await sleep(600);
+  await cap.resume('cam2');
+  await sleep(300);
+  const out = await cap.stop('cam2', { finalBase: 'take' });
+  assert.equal(out.segments, 2);
+  assert.ok(out.gap_ms < 500, 'only the reconnect wait, not the 600 ms pause: ' + out.gap_ms);
+});
+
+test('ffmpeg running with no new video on disk is reported as a stall', { timeout: 10000 }, async (t) => {
+  const dir = tempDir(t);
+  withEnv(t, { FAKE_RTSP_PROGRESS_ONLY: '1' });
+  const warnings = [];
+  const previousWarn = console.warn;
+  console.warn = (...args) => { warnings.push(args.join(' ')); };
+  t.after(() => { console.warn = previousWarn; });
+  const cap = capture({ stallWarnMs: 300 });
+  await cap.start({ source: 'cam1', url: 'rtsp://10.0.0.5:554/1', dir });
+  await sleep(1600);
+  assert.equal(cap.describe().cam1.stalled, true);
+  const out = await cap.stop('cam1', { finalBase: 'take' });
+  assert.equal(out.stalls, 1);
+  assert.match(warnings.join('\n'), /cam1 STALLED: no new video on disk/);
 });
