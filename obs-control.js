@@ -345,6 +345,7 @@ function sampleFeedsWriting(sources, recordDir, prevSamples) {
   const prev = prevSamples instanceof Map ? prevSamples : new Map();
   const now = Date.now();
   let count = 0;
+  const writing = new Set();
 
   for (const source of sources) {
     try {
@@ -364,13 +365,14 @@ function sampleFeedsWriting(sources, recordDir, prevSamples) {
       const grewSincePrevious = !prevSample || sample.size > prevSample.size;
       if (freshEnough && grewSincePrevious) {
         count += 1;
+        writing.add(source);
       }
     } catch (_) {
       // Missing source folder/file or transient IO error: treat as not writing.
     }
   }
 
-  return { count, samples: nextSamples };
+  return { count, samples: nextSamples, writing };
 }
 
 async function getSourceScreenshot(client, source, width, quality) {
