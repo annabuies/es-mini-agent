@@ -39,6 +39,11 @@ const STOP_TERM_MS = 3000;
 // Every millisecond between a drop and the reconnect is footage lost, so retry
 // at once and only back off if the camera keeps refusing.
 const RESTART_DELAYS_MS = [250, 1000, 2000];
+// A resume reconnects to the camera like a start, while the OBS master resumes at
+// once: video is back after the connect and the first keyframe (~1.1 s on bench-1,
+// up to 4.1 s against a 3 s GOP on 2026-09-30). That wait follows every pause, so
+// it is reported as resume_wait, not as lost footage. A slower resume is an outage.
+const RESUME_GRACE_MS = 5000;
 const MAX_RESTARTS = 20;
 const STDERR_TAIL_LINES = 12;
 // A part with only the MP4 header (~1 KB, camera never sent a frame) is not footage.
@@ -126,19 +131,30 @@ function createRtspCapture(options) {
     : RESTART_DELAYS_MS[Math.min(attempt, RESTART_DELAYS_MS.length - 1)]);
   const stopQuitMs = Number.isFinite(opts.stopQuitMs) ? opts.stopQuitMs : STOP_QUIT_MS;
   const stallWarnMs = Number.isFinite(opts.stallWarnMs) ? opts.stallWarnMs : STALL_WARN_MS;
+  const resumeGraceMs = Number.isFinite(opts.resumeGraceMs) ? opts.resumeGraceMs : RESUME_GRACE_MS;
   const secs = (ms) => (ms / 1000).toFixed(1) + ' s';
 
   const takes = new Map(); // source -> take
+
+  function isResumeWait(seg, gap) {
+    const dropped = seg.exited && !seg.quitRequested;
+    return seg.cause === 'resume' && !dropped && gap <= resumeGraceMs;
+  }
 
   function onVideo(take, seg, now) {
     if (seg.firstVideoAt === null) {
       seg.firstVideoAt = now;
       if (seg.gapFrom !== null) {
         const gap = Math.max(0, now - seg.gapFrom);
-        take.gapMs += gap;
         seg.gapFrom = null;
         const line = take.source + ' video back after ' + secs(gap) + ' (segment ' + seg.index + ', ' + seg.cause + ')';
-        if (seg.cause === 'reconnect') warn(line); else log(line);
+        if (isResumeWait(seg, gap)) {
+          take.resumeWaitMs += gap;
+          log(line);
+        } else {
+          take.gapMs += gap;
+          warn(line + (seg.cause === 'resume' ? '; a resume is expected within ' + secs(resumeGraceMs) + ', counted as lost' : ''));
+        }
       }
     }
     seg.lastVideoAt = now;
@@ -175,8 +191,11 @@ function createRtspCapture(options) {
       firstVideoAt: null, lastVideoAt: null, progress: {},
       lastSize: 0, lastGrowthAt: now, stalled: false,
       // Lost time is measured from the last video the previous segment muxed
-      // (a reconnect) or from the resume itself (a pause is intentional).
-      gapFrom: cause === 'reconnect' ? ((prev && (prev.lastVideoAt || prev.exitedAt)) || now) : (cause === 'resume' ? now : null),
+      // (a reconnect) or from the resume itself (a pause is intentional). A
+      // previous segment that dropped before any video hands on its own start.
+      gapFrom: cause === 'reconnect'
+        ? (prev ? (prev.firstVideoAt === null && prev.gapFrom !== null ? prev.gapFrom : (prev.lastVideoAt || prev.exitedAt || now)) : now)
+        : (cause === 'resume' ? now : null),
     };
     seg.done = new Promise((resolve) => {
       child.on('error', (e) => {
@@ -331,7 +350,7 @@ function createRtspCapture(options) {
     const take = {
       source, url, dir, audio: !!(input && input.audio),
       stamp: takeStamp(input.startedAt || Date.now()),
-      segments: [], segmentIndex: 0, restarts: 0, gapMs: 0, stalls: 0,
+      segments: [], segmentIndex: 0, restarts: 0, gapMs: 0, resumeWaitMs: 0, stalls: 0,
       paused: false, stopping: false, starting: true, restartTimer: null, watchTimer: null,
     };
     takes.set(source, take);
@@ -423,9 +442,10 @@ function createRtspCapture(options) {
 
   /**
    * Stops a camera and joins its segments into <dir>/<finalBase>.mp4.
-   * Resolves { ok, filePath, sizeBytes, segments, restarts, gap_ms, stalls, reason? }.
+   * Resolves { ok, filePath, sizeBytes, segments, restarts, gap_ms, resume_wait_ms, stalls, reason? }.
    * gap_ms is footage this agent measured as missing inside the take: reconnect
-   * outages and the wait for video after each resume.
+   * outages and any resume slower than RESUME_GRACE_MS. resume_wait_ms is the
+   * expected wait for video after each resume, not counted in gap_ms.
    */
   async function stop(source, stopOpts) {
     const take = takes.get(source);
@@ -437,7 +457,8 @@ function createRtspCapture(options) {
     const last = take.segments[take.segments.length - 1];
     if (last && last.gapFrom !== null && !take.paused) {
       // Never got video back before stop: the rest of the take is missing.
-      take.gapMs += Math.max(0, stoppedAt - last.gapFrom);
+      const gap = Math.max(0, stoppedAt - last.gapFrom);
+      if (isResumeWait(last, gap)) take.resumeWaitMs += gap; else take.gapMs += gap;
       last.gapFrom = null;
     } else if (!take.paused && last && last.exited && !last.quitRequested) {
       // Dropped and not back yet (reconnect pending, or given up).
@@ -454,7 +475,7 @@ function createRtspCapture(options) {
     } catch (e) {
       joined = { ok: false, reason: 'rtsp_join_failed', detail: e && (e.message || String(e)) };
     }
-    const summary = { segments: take.segments.length, restarts: take.restarts, gap_ms: Math.round(take.gapMs), stalls: take.stalls };
+    const summary = { segments: take.segments.length, restarts: take.restarts, gap_ms: Math.round(take.gapMs), resume_wait_ms: Math.round(take.resumeWaitMs), stalls: take.stalls };
     if (!joined.ok) {
       const kept = joined.keptParts && joined.keptParts[0];
       warn(source + ' stop: ' + joined.reason + (joined.detail ? ' ' + joined.detail : ''));
@@ -462,7 +483,7 @@ function createRtspCapture(options) {
     }
     const sizeBytes = fileSize(finalPath);
     const line = source + ' saved ' + path.basename(finalPath) + ' bytes=' + sizeBytes + ' segments=' + summary.segments
-      + ' reconnects=' + summary.restarts + ' lost=' + secs(summary.gap_ms) + ' stalls=' + summary.stalls;
+      + ' reconnects=' + summary.restarts + ' lost=' + secs(summary.gap_ms) + ' resume_wait=' + secs(summary.resume_wait_ms) + ' stalls=' + summary.stalls;
     if (summary.restarts > 0 || summary.stalls > 0 || summary.gap_ms >= 1000) warn(line); else log(line);
     return Object.assign({ ok: true, filePath: finalPath, sizeBytes }, summary);
   }
@@ -477,10 +498,11 @@ function createRtspCapture(options) {
     for (const [source, take] of takes) {
       const seg = take.segments[take.segments.length - 1];
       const bytes = seg && !seg.exited && !take.paused ? sampleSegment(take, seg, now) : (seg ? fileSize(seg.partPath) : 0);
+      const pending = seg && seg.gapFrom !== null && !take.paused ? now - seg.gapFrom : 0;
       out[source] = {
         paused: take.paused, segments: take.segments.length, restarts: take.restarts,
         writing: isWriting(take, seg, now), stalled: !!(seg && seg.stalled), bytes,
-        gap_ms: Math.round(take.gapMs + (seg && seg.gapFrom !== null && !take.paused ? now - seg.gapFrom : 0)),
+        gap_ms: Math.round(take.gapMs + (pending && !isResumeWait(seg, pending) ? pending : 0)),
       };
     }
     return out;

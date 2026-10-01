@@ -257,7 +257,7 @@ test('heartbeat is sent from cached state on the first poll only once per minute
   const [first, second] = polls;
 
   assert.equal(first.searchParams.get('hb'), '1');
-  assert.equal(first.searchParams.get('v'), '2026.09.30-3');
+  assert.equal(first.searchParams.get('v'), '2026.10.01-1');
   assert.equal(first.searchParams.get('c'), 'unknown');
   const heartbeatState = JSON.parse(Buffer.from(first.searchParams.get('state'), 'base64url').toString('utf8'));
   assert.deepEqual(heartbeatState, {
@@ -847,6 +847,45 @@ test('pause and resume on an RTSP take pause ffmpeg, not Source Record, for that
   assert.equal(status.rtsp.cam1.segments, 2);
   await postAgent(agent.agentPort, 'stop');
   assert.deepEqual(fs.readdirSync(path.join(agent.recordDir, 'cam1')).filter((f) => f.endsWith('.mp4')), [TAKE + '.mp4']);
+});
+
+test('a normal pause on an RTSP take logs no WARN: resume latency is resume_wait_s, not lost_s', { timeout: 30000 }, async (t) => {
+  const webhookBodies = [];
+  const webhookServer = createFakeWebhook(webhookBodies);
+  const webhookPort = await listen(webhookServer);
+  t.after(() => close(webhookServer));
+  const agent = await startRtspAgent(t, { FAKE_RTSP_VIDEO_DELAY_MS: '1100', UPLOAD_CONFIRMED_WEBHOOK_URL: `http://127.0.0.1:${webhookPort}` });
+  await postAgent(agent.agentPort, 'start');
+  touchTakeFiles(agent.recordDir);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  await postAgent(agent.agentPort, 'pause');
+  await postAgent(agent.agentPort, 'resume');
+  await new Promise((resolve) => setTimeout(resolve, 1600));
+  const result = await postAgent(agent.agentPort, 'stop');
+  assert.equal(result.health, 'ok');
+  assert.equal(result.saved, true);
+  assert.equal(result.cameras.cam1.lost_s, 0);
+  assert.ok(result.cameras.cam1.resume_wait_s >= 1 && result.cameras.cam1.resume_wait_s < 2.5, 'resume wait reported: ' + result.cameras.cam1.resume_wait_s);
+  assert.doesNotMatch(agent.stderr(), /WARN/);
+  await waitFor(() => webhookBodies.some((b) => b.source === 'cam1'), 20000);
+  const cam1 = webhookBodies.find((b) => b.source === 'cam1');
+  assert.equal(cam1.lost_s, 0);
+  assert.equal(cam1.resume_wait_s, result.cameras.cam1.resume_wait_s);
+});
+
+test('a forced RTSP outage mid-take still WARNs and is reported as lost_s', { timeout: 30000 }, async (t) => {
+  const marker = path.join(os.tmpdir(), 'es-mini-agent-drop-' + process.pid + '-' + Date.now());
+  t.after(() => fs.rmSync(marker, { force: true }));
+  const agent = await startRtspAgent(t, { FAKE_RTSP_DROP_ONCE: marker });
+  await postAgent(agent.agentPort, 'start');
+  touchTakeFiles(agent.recordDir);
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  const result = await postAgent(agent.agentPort, 'stop');
+  assert.equal(result.cameras.cam1.reconnects, 1);
+  assert.ok(result.cameras.cam1.lost_s > 0, 'outage counted: ' + result.cameras.cam1.lost_s);
+  assert.equal(result.cameras.cam1.resume_wait_s, 0);
+  assert.match(agent.stderr(), /\[rtsp\] WARN cam1 ffmpeg exited mid-take/);
+  assert.match(agent.stderr(), /\[rtsp\] WARN cam1 saved .* reconnects=1 lost=\d\.\d s/);
 });
 
 test('DELETE_AFTER_UPLOAD: camera and master originals leave the Mini only after a verified upload and their proxy', { timeout: 12000 }, async (t) => {

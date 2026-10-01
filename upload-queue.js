@@ -78,7 +78,7 @@ async function readResponseTextSafe(res) {
 
 // Capture/health fields the stop path attaches to a take's files. They ride on
 // the upload_confirmed webhook so the cloud can mark the booking thread.
-const META_KEYS = ['capture_mode', 'fallback', 'fallback_reason', 'health', 'health_reason', 'duration_s', 'master_duration_s', 'short_by_s', 'reconnects', 'lost_s', 'take_health', 'fallback_sources', 'failed_sources'];
+const META_KEYS = ['capture_mode', 'fallback', 'fallback_reason', 'health', 'health_reason', 'duration_s', 'master_duration_s', 'short_by_s', 'reconnects', 'lost_s', 'resume_wait_s', 'take_health', 'fallback_sources', 'failed_sources'];
 
 function cleanMeta(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;

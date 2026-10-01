@@ -82,7 +82,7 @@ function probeFile(filePath, options) {
  * reason is a lowercase slug whenever health is not ok.
  */
 function classifyCamera(input) {
-  const { filePath, sizeBytes, probe, masterDurationS, captureError, gapS } = input;
+  const { filePath, sizeBytes, probe, masterDurationS, captureError, gapS, resumeWaitS } = input;
   if (!filePath || sizeBytes === null || sizeBytes === undefined) {
     return { health: 'missing', reason: slug(captureError, 'no_file'), size_bytes: 0 };
   }
@@ -94,7 +94,10 @@ function classifyCamera(input) {
   out.duration_s = round1(probe.durationS);
   if (Number.isFinite(masterDurationS)) {
     out.master_duration_s = round1(masterDurationS);
-    if (Number.isFinite(probe.durationS) && masterDurationS - probe.durationS > SHORT_TOLERANCE_S) {
+    // The master resumes at once and an RTSP camera only after reconnecting, so
+    // the camera is expected to be short by its measured resume waits.
+    const tolerance = SHORT_TOLERANCE_S + (Number.isFinite(resumeWaitS) && resumeWaitS > 0 ? resumeWaitS : 0);
+    if (Number.isFinite(probe.durationS) && masterDurationS - probe.durationS > tolerance) {
       return Object.assign(out, { health: 'short', reason: 'shorter_than_master', short_by_s: round1(masterDurationS - probe.durationS) });
     }
   }
@@ -106,7 +109,7 @@ function classifyCamera(input) {
 }
 
 /**
- * cameras: [{ source, filePath, captureError?, gapS? }]; masterPath optional.
+ * cameras: [{ source, filePath, captureError?, gapS?, resumeWaitS? }]; masterPath optional.
  * Resolves { health: ok|degraded|failed, cameras: { [source]: verdict }, master }.
  */
 async function checkTake(input, options) {
@@ -138,6 +141,7 @@ async function checkTake(input, options) {
       masterDurationS,
       captureError: c.captureError,
       gapS: c.gapS,
+      resumeWaitS: c.resumeWaitS,
     });
   });
   const all = Object.values(verdicts).concat(master ? [master] : []);

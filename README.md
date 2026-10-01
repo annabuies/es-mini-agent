@@ -162,11 +162,11 @@ After stop, every camera file of the take is probed with ffprobe and compared wi
 
 - `files: [{ source, size_bytes, ok, health }]`: every camera file this take wrote. `ok: false` means no usable video.
 - `failed_files: [{ source, size_bytes, reason }]`: cameras with no usable file (`reason` is a lowercase slug: `no_file`, `rtsp_no_data`, `too_small`, `empty_file`, `no_video_stream`, `unreadable_file`).
-- `health`: `ok`, `degraded` (a camera is more than 2 s shorter than the master, or RTSP measured more than 2 s of lost footage), `failed` (a camera has no usable file), or `unverified` (no ffprobe / no record dir).
+- `health`: `ok`, `degraded` (a camera is more than 2 s shorter than the master beyond its measured resume waits, or RTSP measured more than 2 s of lost footage), `failed` (a camera has no usable file), or `unverified` (no ffprobe / no record dir).
 - `saved` is `false` unless `health` is `ok` (or `unverified`) and every stop succeeded.
-- `cameras: { camN: { capture_mode, fallback, fallback_reason?, health, reason?, size_bytes, duration_s?, master_duration_s?, short_by_s?, reconnects?, lost_s? } }`, `fallback_sources`, `master: { health, duration_s }`.
+- `cameras: { camN: { capture_mode, fallback, fallback_reason?, health, reason?, size_bytes, duration_s?, master_duration_s?, short_by_s?, reconnects?, lost_s?, resume_wait_s? } }`, `fallback_sources`, `master: { health, duration_s }`.
 
-The same per-camera fields ride on each file's `upload_confirmed` webhook (`capture_mode`, `fallback`, `fallback_reason`, `health`, `health_reason`, `duration_s`, `master_duration_s`, `short_by_s`, `reconnects`, `lost_s`, plus `take_health`, `fallback_sources`, `failed_sources`; the master's webhook carries the take-level three). A camera whose file has no usable video, or that wrote no file at all, is reported with `sizeBytes: 0` like an empty file. The agent log has one `[take]` line per stop, `WARN` whenever a camera fell back or the take is not `ok`.
+The same per-camera fields ride on each file's `upload_confirmed` webhook (`capture_mode`, `fallback`, `fallback_reason`, `health`, `health_reason`, `duration_s`, `master_duration_s`, `short_by_s`, `reconnects`, `lost_s`, `resume_wait_s`, plus `take_health`, `fallback_sources`, `failed_sources`; the master's webhook carries the take-level three). A camera whose file has no usable video, or that wrote no file at all, is reported with `sizeBytes: 0` like an empty file. The agent log has one `[take]` line per stop, `WARN` whenever a camera fell back or the take is not `ok`.
 - `pause` → `{ ok, paused }`
 - `look` → `{ ok, look, cameras: { cam1: 'ok'|'timeout'|'http_<code>'|'auth_required'|'error' }, reason? }`
 
@@ -187,7 +187,7 @@ A 0-byte recording file is never uploaded (S3 multipart needs at least one byte)
 A camera whose entry in `studios.fleet_buildings.cameras` has `"capture": "rtsp"` is recorded by ffmpeg straight from its own RTSP stream instead of OBS Source Record (added 2026.09.29-2, after Source Record's silent cam1 failures in issue #10). The video is copied as the camera sends it (H.264, no encode). Camera audio is left out: the bench-1 cameras send an empty AAC track, and an audio stream with no packets makes ffmpeg hold all video in memory until stop. Set `"rtsp_audio": true` on a camera to copy its audio once it carries sound (for example after the mixer is wired into the camera's 3.5 mm input). OBS still records the master and mic tracks and still drives the live preview.
 
 - URL: `rtsp://<host>:554/1` by default (confirmed by Robbie on 2026-09-29: TCP, no login). Optional per-camera keys: `rtsp_path` (e.g. `"/2"`), `rtsp_port`, a full `rtsp_url`, `rtsp_audio`. Never put a password in `rtsp_url`; the table is readable by the app backend.
-- Files: the camera's file is named after the take's master file (`cam1/<same name as master>.mp4`), so a take's files still match. A pause ends a segment and resume starts the next; a dropped connection is retried as a new segment after 0.25 s, then 1 s, then every 2 s (up to 20 per take). Segments (`<stamp> rtsp-partN.mp4`, fragmented MP4) are joined at stop, then deleted. Each reconnect and resume logs how long video took to come back, and stop reports the total as `lost_s`.
+- Files: the camera's file is named after the take's master file (`cam1/<same name as master>.mp4`), so a take's files still match. A pause ends a segment and resume starts the next; a dropped connection is retried as a new segment after 0.25 s, then 1 s, then every 2 s (up to 20 per take). Segments (`<stamp> rtsp-partN.mp4`, fragmented MP4) are joined at stop, then deleted. Each reconnect and resume logs how long video took to come back. Stop reports reconnect outages as `lost_s` and the expected wait after each resume as `resume_wait_s` (see 2026.10.01-1).
 - Safety: a camera is up at Start once ffmpeg reports video reaching the muxer (`-progress` `out_time`), within 8 s. If not, that camera is recorded by Source Record for that take, logged as `WARN FALLBACK camN ... reason=... detail=...` and reported in `fallback_sources` on start, status and stop. (Until 2026.09.30-1 the gate was 4 KiB on disk within 4 s, which a healthy camera with a 3 s GOP missed on 5 of 8 starts.)
 - Stall: ffmpeg running with no new video on disk for 12 s logs `STALLED` and the camera stops counting as writing.
 - Switching is a data change, picked up within 60 s (next take); no install, no restart. `RTSP_CAPTURE=0` in the plist turns it off on one Mini regardless of the table.
@@ -212,6 +212,15 @@ The proxy step is a software encode (libx264) of each 4K camera file. Until now 
 - A take start **stops a running proxy** before any camera capture starts (`[take] WARN stopped a running proxy encode`), and no proxy starts while a take is recording. The stopped proxy is redone after the take; the original stays on the Mini until its proxy is made.
 - Deferred proxies are picked up again by the queue itself (they used to wait for the next agent restart).
 - `uploads.proxies_pending` in `status` / `diag` counts proxies still to make.
+
+### 2026.10.01-1: a normal pause no longer pages
+
+A resume reconnects each RTSP camera while the OBS master resumes at once, so video is back ~1.1 s later on bench-1 (connect + first keyframe). That wait used to be added to `lost`, and stop logs `WARN camN saved ... lost=` whenever `lost` reaches 1 s. So every clean pause wrote a WARN that paged (overnight retest, 9/9 takes clean).
+
+- Waiting for video after a resume is **`resume_wait`**, logged at info (`camN video back after 1.1 s (segment 2, resume)`) and reported as `resume_wait_s` on stop and on the webhook. It is not in `lost_s`.
+- A resume is expected within **5 s** (healthy starts took up to 4.1 s against a 3 s GOP). A slower resume counts as lost and WARNs (`... resume); a resume is expected within 5.0 s, counted as lost`). A resume whose ffmpeg drops before any video is a reconnect outage counted from the resume.
+- The file check allows a camera to be shorter than the master by its `resume_wait_s` on top of the usual 2 s, so many pauses in one take do not turn it `degraded`.
+- Unchanged, still WARN: reconnects (`ffmpeg exited mid-take`, `video back after ... reconnect`, `saved ... reconnects=N lost=`), `STALLED`, `FALLBACK`, and `[take] WARN` for any take that is not `ok`.
 
 ## OBS control (optional)
 

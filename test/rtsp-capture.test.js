@@ -250,6 +250,77 @@ test('a resume reports how long video took to come back, without counting the pa
   assert.ok(out.gap_ms < 500, 'only the reconnect wait, not the 600 ms pause: ' + out.gap_ms);
 });
 
+function captureLogs(t) {
+  const logs = { info: [], warn: [] };
+  const previousLog = console.log;
+  const previousWarn = console.warn;
+  console.log = (...args) => { logs.info.push(args.join(' ')); };
+  console.warn = (...args) => { logs.warn.push(args.join(' ')); };
+  t.after(() => { console.log = previousLog; console.warn = previousWarn; });
+  return logs;
+}
+
+test('a normal pause (video back ~1.1 s after resume) is info, not lost footage and not a WARN', { timeout: 10000 }, async (t) => {
+  const dir = tempDir(t);
+  withEnv(t, { FAKE_RTSP_VIDEO_DELAY_MS: '1100' });
+  const logs = captureLogs(t);
+  const cap = capture();
+  assert.equal((await cap.start({ source: 'cam2', url: 'rtsp://10.0.0.6:554/1', dir })).ok, true);
+  await sleep(200);
+  await cap.pause('cam2');
+  await sleep(300);
+  await cap.resume('cam2');
+  await sleep(600);
+  assert.equal(cap.describe().cam2.gap_ms, 0, 'waiting for video after a resume is not lost footage');
+  await sleep(1000);
+  const out = await cap.stop('cam2', { finalBase: 'take' });
+  assert.equal(out.ok, true);
+  assert.equal(out.gap_ms, 0);
+  assert.ok(out.resume_wait_ms >= 1000 && out.resume_wait_ms < 2500, 'resume wait measured: ' + out.resume_wait_ms);
+  assert.deepEqual(logs.warn, []);
+  assert.match(logs.info.join('\n'), /cam2 video back after 1\.\d s \(segment 2, resume\)/);
+  assert.match(logs.info.join('\n'), /cam2 saved take\.mp4 .* reconnects=0 lost=0\.0 s resume_wait=1\.\d s stalls=0/);
+});
+
+test('a resume slower than the grace window is lost footage and WARNs', { timeout: 10000 }, async (t) => {
+  const dir = tempDir(t);
+  const logs = captureLogs(t);
+  const cap = capture({ resumeGraceMs: 300 });
+  await cap.start({ source: 'cam2', url: 'rtsp://10.0.0.6:554/1', dir });
+  await sleep(200);
+  await cap.pause('cam2');
+  withEnv(t, { FAKE_RTSP_VIDEO_DELAY_MS: '1200' });
+  await cap.resume('cam2');
+  await sleep(1700);
+  const out = await cap.stop('cam2', { finalBase: 'take' });
+  assert.ok(out.gap_ms >= 1200, 'slow resume counted as lost: ' + out.gap_ms);
+  assert.equal(out.resume_wait_ms, 0);
+  const warnings = logs.warn.join('\n');
+  assert.match(warnings, /cam2 video back after 1\.\d s \(segment 2, resume\); a resume is expected within 0\.3 s, counted as lost/);
+  assert.match(warnings, /WARN cam2 saved take\.mp4 .* lost=1\.\d s resume_wait=0\.0 s/);
+});
+
+test('a resume that drops before any video is an outage counted from the resume, and WARNs', { timeout: 10000 }, async (t) => {
+  const dir = tempDir(t);
+  const logs = captureLogs(t);
+  const cap = capture();
+  await cap.start({ source: 'cam2', url: 'rtsp://10.0.0.6:554/1', dir });
+  await sleep(200);
+  await cap.pause('cam2');
+  withEnv(t, { FAKE_RTSP_DROP_ONCE: path.join(dir, 'dropped.marker'), FAKE_RTSP_DROP_AFTER_MS: '600', FAKE_RTSP_VIDEO_DELAY_MS: '1000' });
+  await cap.resume('cam2');
+  await sleep(2300);
+  const out = await cap.stop('cam2', { finalBase: 'take' });
+  assert.equal(out.restarts, 1, logs.warn.join('\n'));
+  // Resume -> drop at 0.6 s -> reconnect -> video 1 s later: all of it is missing.
+  assert.ok(out.gap_ms >= 1600, 'outage counted from the resume, not from the drop: ' + out.gap_ms);
+  assert.equal(out.resume_wait_ms, 0);
+  const warnings = logs.warn.join('\n');
+  assert.match(warnings, /cam2 ffmpeg exited mid-take/);
+  assert.match(warnings, /cam2 video back after 1\.\d s \(segment 3, reconnect\)/);
+  assert.match(warnings, /WARN cam2 saved take\.mp4 .* reconnects=1 lost=1\.\d s/);
+});
+
 test('ffmpeg running with no new video on disk is reported as a stall', { timeout: 10000 }, async (t) => {
   const dir = tempDir(t);
   withEnv(t, { FAKE_RTSP_PROGRESS_ONLY: '1' });
