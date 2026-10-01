@@ -24,6 +24,11 @@ test('a camera verdict comes from the file: missing, stub, no video, short, ok',
   assert.equal(classifyCamera({ filePath: '/x', sizeBytes: 5e6, probe: video(36.3), masterDurationS: 34.7 }).health, 'ok');
   assert.equal(classifyCamera({ filePath: '/x', sizeBytes: 5e6, probe: video(47.65), masterDurationS: 49.24 }).health, 'ok');
   assert.equal(classifyCamera({ filePath: '/x', sizeBytes: 5e6, probe: video(30), gapS: 4.2 }).reason, 'footage_gap');
+  // Four pauses at ~1.1 s each: the master resumes at once, the camera after reconnecting.
+  assert.equal(classifyCamera({ filePath: '/x', sizeBytes: 5e6, probe: video(45.6), masterDurationS: 49.0, resumeWaitS: 4.4 }).health, 'ok');
+  assert.equal(classifyCamera({ filePath: '/x', sizeBytes: 5e6, probe: video(45.6), masterDurationS: 49.0 }).reason, 'shorter_than_master');
+  // Missing footage beyond the resume waits is still short.
+  assert.equal(classifyCamera({ filePath: '/x', sizeBytes: 5e6, probe: video(41.1), masterDurationS: 49.2, resumeWaitS: 1.1 }).reason, 'shorter_than_master');
   assert.equal(classifyCamera({ filePath: '/x', sizeBytes: 5e6, probe: { ok: false, error: 'ffprobe_unavailable' } }).health, 'unverified');
   assert.equal(slug('RTSP Concat-Failed!'), 'rtsp_concat_failed');
 });

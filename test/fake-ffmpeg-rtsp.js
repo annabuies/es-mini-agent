@@ -5,7 +5,8 @@
 // - rtsp:// input: writes an MP4-header-sized first chunk, then 32 KiB every 50 ms
 //   until 'q' arrives on stdin. FAKE_RTSP_FAIL=1: refuses the connection.
 //   FAKE_RTSP_NO_FRAMES=1: header only. FAKE_RTSP_SILENT=1: connects, writes nothing. FAKE_RTSP_DROP_ONCE=<marker file>: the
-//   first process to run drops the connection after 150 ms.
+//   first process to run drops the connection after 150 ms (FAKE_RTSP_DROP_AFTER_MS to change).
+//   FAKE_RTSP_VIDEO_DELAY_MS=<ms>: video starts this long after the header (connect + first keyframe).
 // - concat: joins the listed files byte for byte.
 // - anything else (proxies, audio split): writes a small output file.
 const fs = require('node:fs');
@@ -54,12 +55,14 @@ setTimeout(() => {
     if (progress) setInterval(() => process.stdout.write('out_time_us=N/A\nprogress=continue\n'), 50);
     return;
   }
-  outTimeUs = 0;
-  setInterval(() => {
-    outTimeUs += 50000;
-    if (process.env.FAKE_RTSP_PROGRESS_ONLY !== '1') fs.appendFileSync(out, Buffer.alloc(32 * 1024, 7));
-    if (progress) process.stdout.write('frame=0\nout_time_us=' + outTimeUs + '\nprogress=continue\n');
-  }, 50);
+  setTimeout(() => {
+    outTimeUs = 0;
+    setInterval(() => {
+      outTimeUs += 50000;
+      if (process.env.FAKE_RTSP_PROGRESS_ONLY !== '1') fs.appendFileSync(out, Buffer.alloc(32 * 1024, 7));
+      if (progress) process.stdout.write('frame=0\nout_time_us=' + outTimeUs + '\nprogress=continue\n');
+    }, 50);
+  }, Number(process.env.FAKE_RTSP_VIDEO_DELAY_MS) || 0);
 }, 20);
 
 const marker = process.env.FAKE_RTSP_DROP_ONCE;
@@ -68,7 +71,7 @@ if (marker && !fs.existsSync(marker)) {
   setTimeout(() => {
     process.stderr.write('[rtsp @ 0x1] Connection timed out\n');
     process.exit(1);
-  }, 150);
+  }, Number(process.env.FAKE_RTSP_DROP_AFTER_MS) || 150);
 }
 
 process.stdin.on('data', (chunk) => {

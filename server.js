@@ -1289,8 +1289,8 @@ async function handleOp(op, body) {
       const rtspBySource = new Map(rtspStops.map((entry) => [entry.source, entry.rtsp]));
       const takeFiles = sources.map((source) => {
         const rtsp = rtspBySource.get(source);
-        if (rtsp) return { source, filePath: rtsp.filePath || null, captureError: rtsp.ok ? null : rtsp.reason, gapS: Number.isFinite(rtsp.gap_ms) ? rtsp.gap_ms / 1000 : null, rtsp };
-        return { source, filePath: OBS_RECORD_DIR && takeStartedAt ? sourceRecordFile(source, takeStartedAt) : null, captureError: null, gapS: null, rtsp: null };
+        if (rtsp) return { source, filePath: rtsp.filePath || null, captureError: rtsp.ok ? null : rtsp.reason, gapS: Number.isFinite(rtsp.gap_ms) ? rtsp.gap_ms / 1000 : null, resumeWaitS: Number.isFinite(rtsp.resume_wait_ms) ? rtsp.resume_wait_ms / 1000 : null, rtsp };
+        return { source, filePath: OBS_RECORD_DIR && takeStartedAt ? sourceRecordFile(source, takeStartedAt) : null, captureError: null, gapS: null, resumeWaitS: null, rtsp: null };
       });
 
       // File health, not capture state, decides what the kiosk and the booking thread say.
@@ -1319,7 +1319,11 @@ async function handleOp(op, body) {
         if (c.fallback) entry.fallback_reason = c.fallback_reason;
         if (v.reason) entry.reason = v.reason;
         for (const k of ['duration_s', 'master_duration_s', 'short_by_s']) if (v[k] !== undefined && v[k] !== null) entry[k] = v[k];
-        if (f.rtsp) { entry.reconnects = f.rtsp.restarts || 0; entry.lost_s = Math.round((f.rtsp.gap_ms || 0) / 100) / 10; }
+        if (f.rtsp) {
+          entry.reconnects = f.rtsp.restarts || 0;
+          entry.lost_s = Math.round((f.rtsp.gap_ms || 0) / 100) / 10;
+          entry.resume_wait_s = Math.round((f.rtsp.resume_wait_ms || 0) / 100) / 10;
+        }
         cameras[f.source] = entry;
         if (f.filePath) files.push({ source: f.source, size_bytes: entry.size_bytes, ok: usable, health: v.health });
         if (!usable) failedFiles.push({ source: f.source, size_bytes: entry.size_bytes, reason: v.reason || 'no_file' });
