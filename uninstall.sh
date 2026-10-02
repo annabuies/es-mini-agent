@@ -38,7 +38,10 @@ if [[ -f "$OBS_LAUNCHER_PLIST_PATH" ]]; then
   launchctl unload "$OBS_LAUNCHER_PLIST_PATH" >/dev/null 2>&1 || true
   rm -f "$OBS_LAUNCHER_PLIST_PATH"
   rm -f "$HOME/Library/Application Support/es-mini-agent/obs-launcher.sh"
-  ok "Removed $OBS_LAUNCHER_PLIST_PATH"
+  # install.sh --obs-launcher turned macOS session restore off; give it back.
+  defaults delete com.apple.loginwindow TALLogoutSavesState >/dev/null 2>&1 || true
+  defaults delete com.apple.loginwindow LoginwindowLaunchesRelaunchApps >/dev/null 2>&1 || true
+  ok "Removed $OBS_LAUNCHER_PLIST_PATH (macOS session restore back to default)"
 else
   info "Optional OBS launcher already gone."
 fi
