@@ -150,7 +150,7 @@ To have launchd open OBS on a cold login without the “did not properly shut do
 bash <(curl -fsSL https://raw.githubusercontent.com/annabuies/es-mini-agent/main/install.sh) --obs-launcher
 ```
 
-This installs `com.es.obs-launcher` with `RunAtLoad=true` (the script runs from `~/Library/Application Support/es-mini-agent/`, because macOS blocks launchd-started bash from reading `~/Documents`) and starts OBS with `--disable-shutdown-check`. It does nothing when OBS is already running. After enabling it, remove OBS manually from **System Settings → General → Login Items** so macOS does not launch it twice. The installer does not edit Login Items.
+This installs `com.es.obs-launcher` with `RunAtLoad=true` (the script runs from `~/Library/Application Support/es-mini-agent/`, because macOS blocks launchd-started bash from reading `~/Documents`) and starts OBS with `--disable-shutdown-check`. It does nothing when OBS is already running (it logs a line with the running OBS's arguments to `~/Library/Application Support/es-mini-agent/obs-launcher.log`). It also turns off macOS session restore for this user (`defaults write com.apple.loginwindow TALLogoutSavesState -bool false` and `LoginwindowLaunchesRelaunchApps -bool false`): a power cut never shows the “Reopen windows when logging back in” box, so without this macOS reopens OBS itself before the launcher runs, without the flag, and OBS sits at the Safe Mode dialog. `uninstall.sh` puts session restore back. After enabling it, remove OBS manually from **System Settings → General → Login Items** so macOS does not launch it twice. The installer does not edit Login Items.
 
 Confirm OBS mode actually engaged (not demo mode) — the log should show it connecting to OBS, and health should be ok:
 ```bash

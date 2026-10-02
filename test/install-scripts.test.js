@@ -36,6 +36,30 @@ test('installer removes the stale agent plist and supports the opt-in OBS launch
   assert.match(obsLauncher, /pgrep -x OBS/);
 });
 
+test('--obs-launcher turns macOS session restore off so only the launcher starts OBS; uninstall restores it', () => {
+  const install = fs.readFileSync(path.join(projectDir, 'install.sh'), 'utf8');
+  const uninstall = fs.readFileSync(path.join(projectDir, 'uninstall.sh'), 'utf8');
+  const block = install.slice(install.indexOf('# ---------- optional OBS login launcher ----------'), install.indexOf('# ---------- verify ----------'));
+  assert.match(block, /defaults write com\.apple\.loginwindow TALLogoutSavesState -bool false/);
+  assert.match(block, /defaults write com\.apple\.loginwindow LoginwindowLaunchesRelaunchApps -bool false/);
+  assert.match(uninstall, /defaults delete com\.apple\.loginwindow TALLogoutSavesState/);
+  assert.match(uninstall, /defaults delete com\.apple\.loginwindow LoginwindowLaunchesRelaunchApps/);
+});
+
+test('OBS launcher logs why it stepped aside when OBS is already running', () => {
+  const os = require('node:os');
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-obsrun-'));
+  try {
+    fs.writeFileSync(path.join(bin, 'pgrep'), '#!/bin/sh\n[ "$2" = OBS ] && echo 4242\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(bin, 'ps'), '#!/bin/sh\necho /Applications/OBS.app/Contents/MacOS/OBS\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(bin, 'open'), '#!/bin/sh\necho OPENED >&2; exit 1\n', { mode: 0o755 });
+    const out = execFileSync('/bin/bash', [path.join(projectDir, 'obs-launcher.sh')], { env: { PATH: `${bin}:/usr/bin:/bin`, HOME: bin } }).toString();
+    assert.match(out, /OBS already running \(pid 4242\), leaving it: \/Applications\/OBS\.app\/Contents\/MacOS\/OBS$/m);
+  } finally {
+    fs.rmSync(bin, { recursive: true, force: true });
+  }
+});
+
 test('agent release version is 2026.10.01-1', () => {
   const server = fs.readFileSync(path.join(projectDir, 'server.js'), 'utf8');
   assert.match(server, /const AGENT_VERSION = '2026\.10\.01-1';/);

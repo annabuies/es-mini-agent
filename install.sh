@@ -478,6 +478,18 @@ if [[ "$INSTALL_OBS_LAUNCHER" == "1" ]]; then
     exit 1
   fi
   ok "launchd loaded com.es.obs-launcher (script in $OBS_LAUNCHER_DIR)"
+
+  # A power cut never shows "Reopen windows when logging back in", so macOS
+  # relaunched OBS itself before this launcher ran; the launcher saw OBS running,
+  # stepped aside, and OBS sat at the Safe Mode dialog for 85 min (Robbie, 10-02).
+  # Turn session restore off for this user so the launcher is the only thing that
+  # starts OBS. The Apple-menu restart with the box unticked was already clean.
+  if defaults write com.apple.loginwindow TALLogoutSavesState -bool false \
+    && defaults write com.apple.loginwindow LoginwindowLaunchesRelaunchApps -bool false; then
+    ok "macOS session restore off: apps are not reopened at login, the launcher starts OBS"
+  else
+    warn "Could not turn off macOS session restore; after a power cut OBS may reopen into Safe Mode."
+  fi
   warn "Remove OBS from System Settings → General → Login Items to avoid duplicate launches."
 fi
 
