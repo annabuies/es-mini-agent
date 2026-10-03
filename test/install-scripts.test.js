@@ -42,22 +42,70 @@ test('--obs-launcher turns macOS session restore off so only the launcher starts
   const block = install.slice(install.indexOf('# ---------- optional OBS login launcher ----------'), install.indexOf('# ---------- verify ----------'));
   assert.match(block, /defaults write com\.apple\.loginwindow TALLogoutSavesState -bool false/);
   assert.match(block, /defaults write com\.apple\.loginwindow LoginwindowLaunchesRelaunchApps -bool false/);
+  assert.match(block, /defaults -currentHost delete com\.apple\.loginwindow TALAppsToRelaunchAtLogin/);
   assert.match(uninstall, /defaults delete com\.apple\.loginwindow TALLogoutSavesState/);
   assert.match(uninstall, /defaults delete com\.apple\.loginwindow LoginwindowLaunchesRelaunchApps/);
 });
 
-test('OBS launcher logs why it stepped aside when OBS is already running', () => {
+// Runs obs-launcher.sh against stub pgrep/ps/open/sleep. `kill` is a bash builtin,
+// so the "OBS" is a real orphaned sleep (launchd reaps it, so kill -0 sees it go).
+function runLauncher({ obsArgs, obsLstart, dockLstart }) {
   const os = require('node:os');
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-obsrun-'));
+  const obsPid = execFileSync('/bin/sh', ['-c', '/bin/sleep 300 >/dev/null 2>&1 & echo $!']).toString().trim();
   try {
-    fs.writeFileSync(path.join(bin, 'pgrep'), '#!/bin/sh\n[ "$2" = OBS ] && echo 4242\n', { mode: 0o755 });
-    fs.writeFileSync(path.join(bin, 'ps'), '#!/bin/sh\necho /Applications/OBS.app/Contents/MacOS/OBS\n', { mode: 0o755 });
-    fs.writeFileSync(path.join(bin, 'open'), '#!/bin/sh\necho OPENED >&2; exit 1\n', { mode: 0o755 });
-    const out = execFileSync('/bin/bash', [path.join(projectDir, 'obs-launcher.sh')], { env: { PATH: `${bin}:/usr/bin:/bin`, HOME: bin } }).toString();
-    assert.match(out, /OBS already running \(pid 4242\), leaving it: \/Applications\/OBS\.app\/Contents\/MacOS\/OBS$/m);
+    fs.writeFileSync(path.join(bin, 'pgrep'), `#!/bin/sh
+[ "$2" = OBS ] && echo ${obsPid} && exit 0
+[ "$4" = Dock ] && [ -n "$DOCK_LSTART" ] && echo 647 && exit 0
+exit 1
+`, { mode: 0o755 });
+    fs.writeFileSync(path.join(bin, 'ps'), `#!/bin/sh
+case "$2" in
+  args=) echo "$OBS_ARGS" ;;
+  lstart=) if [ "$4" = 647 ]; then echo "$DOCK_LSTART"; else echo "$OBS_LSTART"; fi ;;
+esac
+`, { mode: 0o755 });
+    fs.writeFileSync(path.join(bin, 'open'), '#!/bin/sh\necho "OPENED $*"\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(bin, 'sleep'), '#!/bin/sh\n/bin/sleep 0.2\n', { mode: 0o755 });
+    const out = execFileSync('/bin/bash', [path.join(projectDir, 'obs-launcher.sh')], {
+      env: { PATH: `${bin}:/usr/bin:/bin`, HOME: bin, OBS_ARGS: obsArgs, OBS_LSTART: obsLstart, DOCK_LSTART: dockLstart || '' },
+    }).toString();
+    let alive = true;
+    try { process.kill(Number(obsPid), 0); } catch { alive = false; }
+    return { out, alive, obsPid };
   } finally {
+    try { process.kill(Number(obsPid), 'SIGKILL'); } catch {}
     fs.rmSync(bin, { recursive: true, force: true });
   }
+}
+
+const OBS_BIN = '/Applications/OBS.app/Contents/MacOS/OBS';
+
+test('OBS launcher leaves an OBS that already has --disable-shutdown-check', () => {
+  const r = runLauncher({ obsArgs: `${OBS_BIN} --disable-shutdown-check`, obsLstart: 'Fri Oct  2 12:23:37 2026', dockLstart: 'Fri Oct  2 12:23:26 2026' });
+  assert.match(r.out, /OBS already running with --disable-shutdown-check \(pid \d+\), leaving it$/m);
+  assert.doesNotMatch(r.out, /OPENED/);
+  assert.equal(r.alive, true);
+});
+
+test('OBS launcher restarts an OBS that macOS reopened at login without the flag (power pull, 10-02)', () => {
+  const r = runLauncher({ obsArgs: OBS_BIN, obsLstart: 'Fri Oct  2 12:23:37 2026', dockLstart: 'Fri Oct  2 12:23:26 2026' });
+  assert.match(r.out, /reopened by macOS 11 s after login without --disable-shutdown-check; restarting it/);
+  assert.equal(r.alive, false);
+  assert.match(r.out, /OPENED (\/Applications\/OBS\.app|-a OBS) --args --disable-shutdown-check$/m);
+});
+
+test('OBS launcher never touches an OBS opened by hand after login (installer reload mid-day)', () => {
+  const r = runLauncher({ obsArgs: OBS_BIN, obsLstart: 'Fri Oct  2 14:40:00 2026', dockLstart: 'Fri Oct  2 12:23:26 2026' });
+  assert.match(r.out, /OBS already running \(pid \d+\), not started with this login, leaving it: \/Applications\/OBS\.app\/Contents\/MacOS\/OBS$/m);
+  assert.doesNotMatch(r.out, /OPENED/);
+  assert.equal(r.alive, true);
+});
+
+test('OBS launcher leaves OBS alone when it cannot tell when login happened', () => {
+  const r = runLauncher({ obsArgs: OBS_BIN, obsLstart: 'Fri Oct  2 12:23:37 2026', dockLstart: '' });
+  assert.match(r.out, /not started with this login, leaving it/);
+  assert.equal(r.alive, true);
 });
 
 test('agent release version is 2026.10.01-1', () => {
