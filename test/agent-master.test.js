@@ -208,9 +208,13 @@ async function startAgent(t, options = {}) {
   t.after(() => close(obsServer));
 
   const relayServer = http.createServer((req, res) => {
-    relayRequests.push(new URL(req.url, 'http://127.0.0.1'));
+    const url = new URL(req.url, 'http://127.0.0.1');
+    relayRequests.push(url);
+    // options.relay(req, url) may answer instead: { status?, body }.
+    const custom = typeof options.relay === 'function' ? options.relay(req, url) : null;
+    res.statusCode = (custom && custom.status) || 200;
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify(options.relayResponse || { command: null }));
+    res.end(JSON.stringify(custom ? custom.body : (options.relayResponse || { command: null })));
   });
   const relayPort = await listen(relayServer);
   t.after(() => close(relayServer));
@@ -257,7 +261,7 @@ test('heartbeat is sent from cached state on the first poll only once per minute
   const [first, second] = polls;
 
   assert.equal(first.searchParams.get('hb'), '1');
-  assert.equal(first.searchParams.get('v'), '2026.10.01-1');
+  assert.equal(first.searchParams.get('v'), '2026.10.03-1');
   assert.equal(first.searchParams.get('c'), 'unknown');
   const heartbeatState = JSON.parse(Buffer.from(first.searchParams.get('state'), 'base64url').toString('utf8'));
   assert.deepEqual(heartbeatState, {
@@ -326,6 +330,49 @@ test('heartbeat reports cached camera reachability without probing from the poll
   assert.match(heartbeatState.cameras_checked_at, /^2026-/);
   assert.ok(Buffer.byteLength(JSON.stringify(heartbeatState)) < 1024);
   assert.equal(cameraRequests.length, 1);
+});
+
+// Kiosk taps wait for the next command poll (testers: Record/Stop took 3-5 s before 2026.10.03-1).
+test('the relay is polled every 250 ms once a command came in and every 1 s when idle; the heartbeat stays once a minute', { timeout: 15000 }, async (t) => {
+  const polls = [];
+  let posted = 0;
+  await startAgent(t, {
+    relay(req, url) {
+      if (req.method === 'POST') {
+        posted += 1;
+        return { body: { ok: true } };
+      }
+      if (url.searchParams.has('want_sources')) return null;
+      polls.push({ at: Date.now(), url });
+      // The third poll claims a status command, like a kiosk tap.
+      if (polls.length === 3) return { body: { ok: true, command: { id: 'cmd-1', op: 'status' } } };
+      return { body: { ok: true, command: null } };
+    },
+  });
+  await waitFor(() => posted === 1, 6000);
+  await waitFor(() => polls.length >= 8, 4000);
+  const gaps = polls.slice(1).map((p, i) => p.at - polls[i].at);
+  for (const gap of gaps.slice(0, 2)) assert.ok(gap >= 900 && gap < 1600, 'idle poll gap ' + gap + ' ms');
+  for (const gap of gaps.slice(3, 7)) assert.ok(gap >= 150 && gap < 600, 'in-use poll gap ' + gap + ' ms');
+  assert.deepEqual(polls.map((p) => p.url.searchParams.get('hb')).slice(0, 8), ['1', null, null, null, null, null, null, null]);
+});
+
+test('a failing relay is retried after 1 s then 2 s, never at the fast interval, and polls fast again once it answers', { timeout: 15000 }, async (t) => {
+  const polls = [];
+  const agent = await startAgent(t, {
+    env: { POLL_INTERVAL_MS: '100', POLL_IDLE_INTERVAL_MS: '100' },
+    relay(req, url) {
+      if (req.method !== 'GET' || url.searchParams.has('want_sources')) return null;
+      polls.push(Date.now());
+      return polls.length <= 2 ? { status: 503, body: { ok: false } } : { body: { ok: true, command: null } };
+    },
+  });
+  await waitFor(() => polls.length >= 7, 8000);
+  const gaps = polls.slice(1).map((at, i) => at - polls[i]);
+  assert.ok(gaps[0] >= 900 && gaps[0] < 1600, 'after the first failure: ' + gaps[0] + ' ms');
+  assert.ok(gaps[1] >= 1900 && gaps[1] < 2600, 'after the second failure: ' + gaps[1] + ' ms');
+  for (const gap of gaps.slice(2, 6)) assert.ok(gap < 500, 'recovered poll gap ' + gap + ' ms');
+  assert.equal((agent.stderr().match(/relay: poll GET 503/g) || []).length, 2);
 });
 
 test('smoke: fake relay and OBS start the three camera recordings', { timeout: 8000 }, async (t) => {
@@ -886,6 +933,47 @@ test('a forced RTSP outage mid-take still WARNs and is reported as lost_s', { ti
   assert.equal(result.cameras.cam1.resume_wait_s, 0);
   assert.match(agent.stderr(), /\[rtsp\] WARN cam1 ffmpeg exited mid-take/);
   assert.match(agent.stderr(), /\[rtsp\] WARN cam1 saved .* reconnects=1 lost=\d\.\d s/);
+});
+
+test('stop with only RTSP cameras and no master skips the OBS file settle wait', { timeout: 30000 }, async (t) => {
+  const recordDir = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-rtsp-only-'));
+  for (const source of ['cam1', 'cam2', 'cam3']) fs.mkdirSync(path.join(recordDir, source), { recursive: true });
+  const agent = await startAgent(t, {
+    recordDir,
+    masterRecord: false,
+    relayResponse: {
+      command: null,
+      cameras: ['cam1', 'cam2', 'cam3'].map((name, i) => ({ name, host: '127.0.0.' + (i + 1), capture: 'rtsp' })),
+    },
+    // Waiting would take at least 4 s, so a quick stop proves it was skipped.
+    env: { FFMPEG_BIN: FAKE_RTSP_FFMPEG, STOP_SETTLE_MS: '4000' },
+  });
+  t.after(() => fs.rmSync(recordDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
+  await waitFor(() => agent.relayRequests.some((url) => url.searchParams.has('want_sources')));
+  await new Promise((resolve) => setTimeout(resolve, 200)); // camera config applied
+  const started = await postAgent(agent.agentPort, 'start');
+  assert.deepEqual(Object.values(started.cameras).map((c) => c.capture_mode), ['rtsp', 'rtsp', 'rtsp']);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const stopStarted = Date.now();
+  const result = await postAgent(agent.agentPort, 'stop');
+  const stopMs = Date.now() - stopStarted;
+  assert.ok(stopMs < 3000, 'stop took ' + stopMs + ' ms');
+  assert.equal(result.saved, true);
+  assert.equal(result.health, 'ok');
+  assert.equal(vendorCalls(agent, 'record_stop').length, 0);
+  assert.equal(agent.obsRequests.filter((r) => r.type === 'StopRecord').length, 0);
+});
+
+test('stop still waits for OBS to finish writing when the master was recording', { timeout: 30000 }, async (t) => {
+  const agent = await startRtspAgent(t, { STOP_SETTLE_MS: '1500' });
+  await postAgent(agent.agentPort, 'start');
+  touchTakeFiles(agent.recordDir);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const stopStarted = Date.now();
+  const result = await postAgent(agent.agentPort, 'stop');
+  const stopMs = Date.now() - stopStarted;
+  assert.ok(stopMs >= 1500, 'stop took ' + stopMs + ' ms');
+  assert.equal(result.saved, true);
 });
 
 test('DELETE_AFTER_UPLOAD: camera and master originals leave the Mini only after a verified upload and their proxy', { timeout: 12000 }, async (t) => {
