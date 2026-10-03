@@ -490,6 +490,17 @@ if [[ "$INSTALL_OBS_LAUNCHER" == "1" ]]; then
   else
     warn "Could not turn off macOS session restore; after a power cut OBS may reopen into Safe Mode."
   fi
+  # Those two keys were not enough: after the next power pull macOS still reopened
+  # OBS (and Spotify, Chrome, Slack, Claude) from the saved per-host list
+  # (Robbie, 10-02). Clear that list too. If macOS rewrites it anyway, the
+  # launcher restarts an OBS that macOS reopened at login without the flag.
+  if defaults -currentHost read com.apple.loginwindow TALAppsToRelaunchAtLogin >/dev/null 2>&1; then
+    if defaults -currentHost delete com.apple.loginwindow TALAppsToRelaunchAtLogin >/dev/null 2>&1; then
+      ok "Cleared the macOS list of apps to reopen at login"
+    else
+      warn "Could not clear the macOS list of apps to reopen at login; the launcher still restarts a reopened OBS."
+    fi
+  fi
   warn "Remove OBS from System Settings → General → Login Items to avoid duplicate launches."
 fi
 
