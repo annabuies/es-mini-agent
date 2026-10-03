@@ -22,6 +22,8 @@ Core + optional env vars:
 | `RECORD_CONTROL_KEY` | **yes**  | long random string            | must match the value set on the Cloudflare Worker `es-os-app` (`api.evrybdystudios.com`); agent refuses to start if unset |
 | `BUILDING_ID`        | **yes**  | `bench-1`                     | this Mini's identity; one Mini serves exactly one building |
 | `RECORD_POLL_URL`    | no       | `https://api.evrybdystudios.com` | outbound OS record poll host; persisted by `install.sh` so a reinstall cannot fall back to Vercel |
+| `POLL_INTERVAL_MS`   | no       | `250`                         | command poll interval while the room is in use (a take is running, or a command came in during the last 2 minutes); minimum `100`. Not written by `install.sh` |
+| `POLL_IDLE_INTERVAL_MS` | no    | `1000`                        | command poll interval when the room is idle; never below `POLL_INTERVAL_MS`. Not written by `install.sh` |
 | `OBS_WS_URL`         | no       | `ws://127.0.0.1:4455`         | optional — enables real OBS control; omit for demo mode |
 | `OBS_WS_PASSWORD`    | no       | `(empty)`                     | optional — enables real OBS control; omit for demo mode |
 | `OBS_SOURCES`        | no       | `cam1,cam2`                   | optional — enables real OBS control; omit for demo mode |
@@ -221,6 +223,17 @@ A resume reconnects each RTSP camera while the OBS master resumes at once, so vi
 - A resume is expected within **5 s** (healthy starts took up to 4.1 s against a 3 s GOP). A slower resume counts as lost and WARNs (`... resume); a resume is expected within 5.0 s, counted as lost`). A resume whose ffmpeg drops before any video is a reconnect outage counted from the resume.
 - The file check allows a camera to be shorter than the master by its `resume_wait_s` on top of the usual 2 s, so many pauses in one take do not turn it `degraded`.
 - Unchanged, still WARN: reconnects (`ffmpeg exited mid-take`, `video back after ... reconnect`, `saved ... reconnects=N lost=`), `STALLED`, `FALLBACK`, and `[take] WARN` for any take that is not `ok`.
+
+### 2026.10.03-1: Record and Stop react sooner
+
+Testers saw Record and Stop take 3-5 s to react on the kiosk. Part of that wait is in the agent:
+
+- **Faster command poll while the room is in use.** Every tap waits for the agent's next poll of the Worker. The agent now polls every **250 ms** while a take is running or for 2 minutes after any command (the kiosk sends `preview_start` every 25 s while it shows the studio), and every 1 s as before when the room is idle. That takes the average wait for a tap from ~0.5 s to ~0.13 s. An idle studio makes no more requests than before; a room in use makes 240 a minute instead of 60 (each is one Worker GET plus one Supabase select; the Worker's rate limits apply only to POSTs). The heartbeat is still sent at most once a minute.
+- **Failed polls back off.** If the Worker answers with an error, or with `ok: false` (Supabase failed), the next poll waits 1 s, then 2 s, until a poll succeeds. agent.log keeps at most one poll-error line a second, as before.
+- **No settle wait when OBS wrote nothing.** Stop and cancel wait (in 0.9 s steps, up to 4) for OBS to finish writing the master and any Source Record camera. A take with only RTSP cameras and no master (`MASTER_RECORD=0`) used to sit through one 0.9 s step anyway; it now skips it. With the master recording, as on bench-1, stop still waits for it exactly as before.
+- The agent log's startup line now reads `relay: polling .../api/record every 250ms while the room is in use, 1000ms when idle`.
+- Each command's log line says how long the agent took to run it: `relay: claimed stop (<id>) -> posted result (op took 2.4 s)`. The rest of a slow tap is poll wait, the Worker and the kiosk.
+- Not changed here, and the larger parts of a slow tap: Record waits until every RTSP camera has video (up to 8 s; healthy starts took up to 4.1 s), and Stop waits for the master file to settle (at least 0.9 s), the RTSP join and the file check before it answers.
 
 ## OBS control (optional)
 

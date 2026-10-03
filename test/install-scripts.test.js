@@ -60,9 +60,9 @@ test('OBS launcher logs why it stepped aside when OBS is already running', () =>
   }
 });
 
-test('agent release version is 2026.10.01-1', () => {
+test('agent release version is 2026.10.03-1', () => {
   const server = fs.readFileSync(path.join(projectDir, 'server.js'), 'utf8');
-  assert.match(server, /const AGENT_VERSION = '2026\.10\.01-1';/);
+  assert.match(server, /const AGENT_VERSION = '2026\.10\.03-1';/);
 });
 
 test('installer persists the power strip env into the plist and modules.txt ships power.js', () => {
