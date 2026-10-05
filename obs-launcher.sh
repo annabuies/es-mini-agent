@@ -2,15 +2,35 @@
 
 set -euo pipefail
 export LC_ALL=C
-# lsof lives in /usr/sbin, which a LaunchAgent's PATH may not include.
+# sysctl lives in /usr/sbin, which a LaunchAgent's PATH may not include.
 export PATH="${PATH:-/usr/bin:/bin}:/usr/sbin:/sbin"
 
 log() { printf '%s [es-obs-launcher] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+# An alert also goes to stderr, so obs-launcher.error.log is no longer empty.
+alert() { log "ALERT: $*"; printf '%s [es-obs-launcher] ALERT: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
 
-# An OBS without --disable-shutdown-check that started this soon after login is
-# one macOS reopened from its saved session (Robbie's power pull, 10-02: 11 s
-# after login, Safe Mode dialog up). Anything older was opened by hand.
-RESTORED_WINDOW_S="${ES_OBS_RESTORED_WINDOW_S:-180}"
+# OBS 32 removed --disable-shutdown-check (obsproject/obs-studio#12650): the
+# Safe Mode dialog now comes only from crash markers. Each OBS run creates
+# obs-studio/.sentinel/run_<uuid> and a clean quit deletes them all; on start,
+# any run_* that is not its own makes OBS log "Crash or unclean shutdown
+# detected" and wait at the dialog before it loads obs-websocket
+# (frontend/utility/CrashHandler.cpp, frontend/OBSApp.cpp in 32.1.0).
+#
+# Policy (Anna, 10-05): after a reboot, unattended recovery wins. On a cold
+# login, markers written before this boot (power cut, restart with OBS open, or a
+# crash before the restart) are moved to an archive, never deleted, and OBS is
+# started once. Markers written since this boot mean OBS crashed or was
+# force-quit during this boot: they are left, so OBS shows its dialog. The
+# launcher never stops a running OBS.
+OBS_CONFIG_DIR="$HOME/Library/Application Support/obs-studio"
+SENTINEL_DIR="$OBS_CONFIG_DIR/.sentinel"
+OBS_LOG_DIR="$OBS_CONFIG_DIR/logs"
+ARCHIVE_DIR="$HOME/Library/Application Support/es-mini-agent/obs-sentinel-archive"
+# launchd runs this at login (RunAtLoad) and again whenever the installer reloads
+# the LaunchAgent. Only a run this soon after login counts as a cold login.
+LOGIN_WINDOW_S="${ES_OBS_LOGIN_WINDOW_S:-180}"
+# How long to watch OBS's own log for the result of the one launch.
+STARTUP_WAIT_S="${ES_OBS_STARTUP_WAIT_S:-90}"
 
 first_pid() { local p; p="$("$@" 2>/dev/null || true)"; printf '%s' "${p%%$'\n'*}"; }
 
@@ -20,30 +40,6 @@ start_epoch() {
   started="$(ps -o lstart= -p "$1" 2>/dev/null | awk '{print $1, $2, $3, $4, $5}')"
   [[ -n "$started" ]] || return 0
   date -j -f '%a %b %d %T %Y' "$started" +%s 2>/dev/null || true
-}
-
-# Why this OBS may be in use, or nothing if it is not. A restored OBS stuck at
-# the Safe Mode dialog has no recording file open and no listening port (its
-# plugins, obs-websocket included, load after the dialog). A recording file
-# open means someone is recording; a listening port means OBS got past the
-# dialog and the agent or a person can be driving it. If its open files cannot
-# be read at all, that is reason enough to leave it (audit 10-05 F3).
-obs_in_use() {
-  local files listening
-  files="$(lsof -n -P -p "$1" -Fn 2>/dev/null || true)"
-  if [[ -z "$files" ]]; then
-    printf 'its open files cannot be read'
-    return 0
-  fi
-  if grep -Eiq '^n.*\.(mkv|mp4|mov|flv|ts|m3u8|m4v)$' <<<"$files"; then
-    printf 'it has a recording file open'
-    return 0
-  fi
-  listening="$(lsof -n -P -a -p "$1" -iTCP -sTCP:LISTEN -Fn 2>/dev/null || true)"
-  if grep -q '^n' <<<"$listening"; then
-    printf 'it is listening on a port, so it is past the Safe Mode dialog'
-  fi
-  return 0
 }
 
 find_obs() {
@@ -66,64 +62,152 @@ login_epoch() {
   return 0
 }
 
+# "{ sec = 1759650000, usec = 0 } Mon Oct  5 ..." -> 1759650000
+boot_epoch() {
+  local raw
+  raw="$(sysctl -n kern.boottime 2>/dev/null || true)"
+  sed -n 's/^{ sec = \([0-9][0-9]*\),.*/\1/p' <<<"$raw"
+}
+
+# Last-modified time in epoch seconds. OBS creates a marker and never writes to
+# it again, so this is when that OBS run started.
+mtime_epoch() { stat -f %m "$1" 2>/dev/null || true; }
+
+markers() {
+  local f
+  for f in "$SENTINEL_DIR"/run_*; do
+    [[ -f "$f" ]] && printf '%s\n' "$f"
+  done
+  return 0
+}
+
+# Move markers from before this boot to the archive (mv keeps their times).
+archive_previous_boot_markers() {
+  local boot dest="" f m moved=0
+  boot="$(boot_epoch)"
+  if [[ -z "$boot" ]]; then
+    log "cannot read the boot time; leaving OBS crash markers as they are"
+    return 0
+  fi
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    m="$(mtime_epoch "$f")"
+    [[ -n "$m" ]] && (( m < boot )) || continue
+    if [[ -z "$dest" ]]; then
+      dest="$ARCHIVE_DIR/$(date '+%Y%m%d-%H%M%S')"
+      if ! mkdir -p "$dest"; then
+        log "cannot create $dest; leaving OBS crash markers as they are"
+        return 0
+      fi
+    fi
+    if mv -n "$f" "$dest/"; then
+      moved=$((moved + 1))
+      log "archived OBS crash marker ${f##*/} (OBS run started $(date -r "$m" '+%Y-%m-%d %H:%M:%S'), before this boot): OBS was open at a power cut or restart, or crashed before it"
+    else
+      log "could not archive OBS crash marker ${f##*/}; leaving it"
+    fi
+  done < <(markers)
+  (( moved == 0 )) || log "archived $moved OBS crash marker(s) to $dest"
+}
+
+# Newest OBS log written at or after $1 (epoch seconds). OBS names its logs
+# "YYYY-MM-DD HH-MM-SS.txt", so the last one in C order is the newest.
+newest_log_since() {
+  local f newest="" m
+  for f in "$OBS_LOG_DIR"/*.txt; do
+    [[ -f "$f" ]] && newest="$f"
+  done
+  [[ -n "$newest" ]] || return 0
+  m="$(mtime_epoch "$newest")"
+  [[ -n "$m" ]] && (( m >= $1 )) && printf '%s' "$newest"
+  return 0
+}
+
+# Watch OBS's own log for how startup went. Log text only drives this report;
+# it is never a reason to stop OBS. Returns 1 after an alert.
+#   "Crash or unclean shutdown detected"    the dialog is up (OBSApp.cpp:95)
+#   "[Safe Mode] Normal launch selected"    someone chose Run in Normal Mode
+#   "[Safe Mode] Safe mode launch selected" someone chose Safe Mode
+#   "Current Date/Time:"                    OBSInit ran, past every startup check
+watch_startup() {
+  local since="$1" who="$2" waited=0 file="" text
+  while :; do
+    file="$(newest_log_since "$since")"
+    if [[ -n "$file" ]]; then
+      text="$(cat "$file" 2>/dev/null || true)"
+      if [[ "$text" == *"Safe mode launch selected"* ]]; then
+        alert "$who was started in Safe Mode by someone at the Mini: obs-websocket is off, so the agent cannot drive it. Quit OBS and reopen it normally. (log ${file##*/})"
+        return 1
+      fi
+      if [[ "$text" == *"Current Date/Time:"* ]]; then
+        if [[ "$text" == *"Normal launch selected"* ]]; then
+          log "$who got past the Safe Mode dialog: someone chose Run in Normal Mode (log ${file##*/})"
+        elif [[ "$text" == *"Crash or unclean shutdown detected"* ]]; then
+          log "$who got past its crash dialog (log ${file##*/})"
+        else
+          log "$who started with no Safe Mode dialog (log ${file##*/})"
+        fi
+        return 0
+      fi
+    fi
+    (( waited < STARTUP_WAIT_S )) || break
+    sleep 2
+    waited=$((waited + 2))
+  done
+  if [[ -z "$file" ]]; then
+    alert "$who wrote no startup log within ${STARTUP_WAIT_S} s; check on the Mini that OBS opened"
+  elif [[ "$text" == *"Crash or unclean shutdown detected"* ]]; then
+    alert "$who is waiting at the Safe Mode dialog (log ${file##*/}). Someone at the Mini must choose Run in Normal Mode. The launcher does not stop or restart OBS."
+  else
+    alert "$who has not finished starting after ${STARTUP_WAIT_S} s and shows no Safe Mode dialog in its log (${file##*/}); another OBS prompt may be open"
+  fi
+  return 1
+}
+
 obs_pid="$(find_obs)"
 if [[ -n "$obs_pid" ]]; then
-  obs_args="$(ps -o args= -p "$obs_pid" 2>/dev/null || true)"
-  if [[ "$obs_args" == *--disable-shutdown-check* ]]; then
-    log "OBS already running with --disable-shutdown-check (pid $obs_pid), leaving it"
-    exit 0
-  fi
-
-  # launchd also runs this mid-day when the installer reloads the LaunchAgent.
-  # Never touch an OBS someone opened by hand then: it may be recording.
+  # A person may have opened it, or macOS may have reopened it; it may be
+  # recording. Never stop it: only report how its startup went.
+  log "OBS already running (pid $obs_pid), leaving it: $(ps -o args= -p "$obs_pid" 2>/dev/null || true)"
   obs_start="$(start_epoch "$obs_pid")"
-  login_start="$(login_epoch)"
-  if [[ -z "$obs_start" || -z "$login_start" ]] \
-    || (( obs_start - login_start < -30 || obs_start - login_start > RESTORED_WINDOW_S )); then
-    log "OBS already running (pid $obs_pid), not started with this login, leaving it: $obs_args"
-    exit 0
-  fi
-
-  # A person can open OBS by hand in the same window (the launcher waits up to
-  # 30 s for the Dock) and start recording: only an OBS that shows no sign of use
-  # is restarted.
-  in_use="$(obs_in_use "$obs_pid")"
-  if [[ -n "$in_use" ]]; then
-    log "OBS (pid $obs_pid) started $((obs_start - login_start)) s after login without --disable-shutdown-check, but $in_use; leaving it: $obs_args"
-    exit 0
-  fi
-
-  # Without the flag a restored OBS sits at the Safe Mode dialog, which also
-  # ignores a polite quit. It is not recording, so end it and relaunch.
-  log "OBS (pid $obs_pid) was reopened by macOS $((obs_start - login_start)) s after login without --disable-shutdown-check; restarting it: $obs_args"
-  kill -TERM "$obs_pid" 2>/dev/null || true
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    kill -0 "$obs_pid" 2>/dev/null || break
-    sleep 1
-  done
-  if kill -0 "$obs_pid" 2>/dev/null; then
-    log "OBS (pid $obs_pid) ignored SIGTERM for 10 s; sending SIGKILL"
-    kill -KILL "$obs_pid" 2>/dev/null || true
-    sleep 2
-  fi
-  if kill -0 "$obs_pid" 2>/dev/null; then
-    log "OBS (pid $obs_pid) is still running; giving up, it may be at the Safe Mode dialog"
-    exit 1
-  fi
+  watch_startup "$(( ${obs_start:-$(date +%s)} - 2 ))" "OBS (pid $obs_pid)" || exit 1
+  exit 0
 fi
 
-log "starting OBS with --disable-shutdown-check"
+now="$(date +%s)"
+login_start="$(login_epoch)"
+if [[ -n "$login_start" ]] && (( now - login_start <= LOGIN_WINDOW_S )); then
+  archive_previous_boot_markers
+  why="written since this boot: OBS crashed or was force-quit since the Mini started"
+else
+  log "not a cold login (${login_start:+$((now - login_start)) s after login; }launcher reloaded or login time unknown); leaving OBS crash markers as they are"
+  why="not a cold login"
+fi
 
+remaining="$(markers | wc -l | tr -d ' ')"
+if (( remaining > 0 )); then
+  log "leaving $remaining OBS crash marker(s) in $SENTINEL_DIR ($why), so OBS will show its Safe Mode dialog"
+fi
+
+launch_at="$(date +%s)"
+launched=""
 for obs_app in "/Applications/OBS.app" "$HOME/Applications/OBS.app"; do
   if [[ -d "$obs_app" ]]; then
-    exec open "$obs_app" --args --disable-shutdown-check
+    log "starting OBS ($obs_app)"
+    open "$obs_app" || { alert "could not open $obs_app"; exit 1; }
+    launched=1
+    break
   fi
 done
-
 # Let Launch Services resolve non-standard installations registered as OBS.
-if open -Ra OBS >/dev/null 2>&1; then
-  exec open -a OBS --args --disable-shutdown-check
+if [[ -z "$launched" ]] && open -Ra OBS >/dev/null 2>&1; then
+  log "starting OBS (Launch Services)"
+  open -a OBS || { alert "could not open OBS"; exit 1; }
+  launched=1
+fi
+if [[ -z "$launched" ]]; then
+  alert "OBS.app was not found"
+  exit 1
 fi
 
-printf '%s\n' '[es-obs-launcher] OBS.app was not found.' >&2
-exit 1
+watch_startup "$((launch_at - 1))" "OBS" || exit 1
