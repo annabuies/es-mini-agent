@@ -30,7 +30,7 @@ const { checkTake } = require('./take-health');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.10.01-1';
+const AGENT_VERSION = '2026.10.03-1';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -48,7 +48,23 @@ const POWER_CONFIG = readPowerConfig(process.env);
 // Robbie's existing install command (which only sets BUILDING_ID and
 // RECORD_CONTROL_KEY) keeps polling api.evrybdystudios.com after this update.
 const RECORD_POLL_URL = process.env.RECORD_POLL_URL || 'https://api.evrybdystudios.com';
-const POLL_INTERVAL_MS = 1000;
+// Every kiosk tap (Record, Stop, Pause...) waits for the next command poll, so the
+// poll interval is added straight onto how long a tap takes to react (testers saw
+// Record/Stop take 3-5 s before 2026.10.03-1). Fast while the room is in use: a take
+// is running, or a command came in during the last 2 minutes (the kiosk sends
+// preview_start every 25 s while it shows the studio). Otherwise the old 1 s, so an
+// idle studio costs the Worker and Supabase no more than before. Each poll is one
+// Worker GET plus one Supabase select; the Worker only rate-limits POSTs.
+const POLL_INTERVAL_MS = Math.max(100, Number(process.env.POLL_INTERVAL_MS) || 250);
+const POLL_IDLE_INTERVAL_MS = Math.max(POLL_INTERVAL_MS, Number(process.env.POLL_IDLE_INTERVAL_MS) || 1000);
+const POLL_ACTIVE_WINDOW_MS = 2 * 60 * 1000;
+// A failing relay (Worker or Supabase down) is retried after 1 s, then every 2 s,
+// never at the fast interval. That also keeps poll errors in agent.log to at most
+// one line a second, as before.
+const POLL_ERROR_BACKOFF_MS = [1000, 2000];
+// Stop and cancel check that OBS has finished writing over this interval (up to 4
+// times). Overridable so tests can tell a skipped wait from a short one.
+const STOP_SETTLE_MS = Math.max(0, Number(process.env.STOP_SETTLE_MS) || 900);
 const SOURCES_REFRESH_MS = 60000;
 const CAM_REACH_MS = 60000;
 const DISK_USAGE_MS = 5 * 60 * 1000;
@@ -794,6 +810,41 @@ function didFileStabilize(before, after) {
   return !!(before && after && before.size === after.size);
 }
 
+// After stop/cancel: waits until OBS has finished writing the take's Source Record
+// files and master (same size across one STOP_SETTLE_MS interval, up to 4 tries).
+// Resolves whether they settled. An RTSP camera is already finished here (its
+// ffmpeg has exited and its parts are joined), so a take with no Source Record
+// camera and no master has nothing to wait for; that used to add 0.9 s to every
+// such stop.
+async function waitForObsFiles(obsSources, masterWasActive, masterOutputPath) {
+  if (!OBS_RECORD_DIR) {
+    await sleep(1200);
+    return false;
+  }
+  if (obsSources.length === 0 && !masterWasActive) {
+    feedsPrevSamples = new Map();
+    return true;
+  }
+  let filesStable = false;
+  let prevSample = sampleFeedsWriting(obsSources, OBS_RECORD_DIR, new Map()).samples;
+  let prevMasterSample = masterWasActive ? getFileSample(masterOutputPath) : null;
+  for (let i = 0; i < 4; i += 1) {
+    await sleep(STOP_SETTLE_MS);
+    const newSample = sampleFeedsWriting(obsSources, OBS_RECORD_DIR, prevSample).samples;
+    const newMasterSample = masterWasActive ? getFileSample(masterOutputPath) : null;
+    const camerasStable = obsSources.every((source) => didSourceFileStabilize(prevSample, newSample, source));
+    const masterStable = !masterWasActive || didFileStabilize(prevMasterSample, newMasterSample);
+    prevSample = newSample;
+    if (camerasStable && masterStable) {
+      filesStable = true;
+      break;
+    }
+    prevMasterSample = newMasterSample;
+  }
+  feedsPrevSamples = prevSample;
+  return filesStable;
+}
+
 async function stopStartedSources(client, sources) {
   await Promise.all(sources.map(async (source) => {
     try {
@@ -1253,28 +1304,7 @@ async function handleOp(op, body) {
       // OBS unreachable must not leave ffmpeg recording.
       if (!rtspStops) rtspStops = await stopRtspTakes(rtspList, null);
 
-      let filesStable = false;
-      if (OBS_RECORD_DIR) {
-        let prevSample = sampleFeedsWriting(obsSources, OBS_RECORD_DIR, new Map()).samples;
-        let prevMasterSample = masterWasActive ? getFileSample(masterStop.outputPath) : null;
-        for (let i = 0; i < 4; i += 1) {
-          await sleep(900);
-          const newSample = sampleFeedsWriting(obsSources, OBS_RECORD_DIR, prevSample).samples;
-          const newMasterSample = masterWasActive ? getFileSample(masterStop.outputPath) : null;
-          const camerasStable = obsSources.every((source) => didSourceFileStabilize(prevSample, newSample, source));
-          const masterStable = !masterWasActive || didFileStabilize(prevMasterSample, newMasterSample);
-          if (camerasStable && masterStable) {
-            filesStable = true;
-            prevSample = newSample;
-            break;
-          }
-          prevSample = newSample;
-          prevMasterSample = newMasterSample;
-        }
-        feedsPrevSamples = prevSample;
-      } else {
-        await sleep(1200);
-      }
+      const filesStable = await waitForObsFiles(obsSources, masterWasActive, masterStop.outputPath);
 
       const allStopsSucceeded = stopResults.every((entry) => entry.vendor.success) && rtspStops.every((entry) => entry.rtsp.ok);
       const recordingStartedAt = state.recordingStartedAt;
@@ -1426,26 +1456,7 @@ async function handleOp(op, body) {
       }
       await rtspStopCall;
 
-      if (OBS_RECORD_DIR) {
-        let prevSample = sampleFeedsWriting(obsSources, OBS_RECORD_DIR, new Map()).samples;
-        let prevMasterSample = masterWasActive ? getFileSample(masterStop.outputPath) : null;
-        for (let i = 0; i < 4; i += 1) {
-          await sleep(900);
-          const newSample = sampleFeedsWriting(obsSources, OBS_RECORD_DIR, prevSample).samples;
-          const newMasterSample = masterWasActive ? getFileSample(masterStop.outputPath) : null;
-          const camerasStable = obsSources.every((source) => didSourceFileStabilize(prevSample, newSample, source));
-          const masterStable = !masterWasActive || didFileStabilize(prevMasterSample, newMasterSample);
-          if (camerasStable && masterStable) {
-            prevSample = newSample;
-            break;
-          }
-          prevSample = newSample;
-          prevMasterSample = newMasterSample;
-        }
-        feedsPrevSamples = prevSample;
-      } else {
-        await sleep(1200);
-      }
+      await waitForObsFiles(obsSources, masterWasActive, masterStop.outputPath);
 
       const allStopsSucceeded = stopResults.every((entry) => entry.vendor.success);
       if (!allStopsSucceeded) {
@@ -1960,13 +1971,17 @@ server.on('clientError', (err, socket) => {
 });
 
 // ---------- outbound poll loop ----------
-// Reach OUT to the Cloudflare Worker every POLL_INTERVAL_MS to claim any pending
-// command, run it locally via handleOp(), and POST the result back. This
+// Reach OUT to the Cloudflare Worker every POLL_INTERVAL_MS (POLL_IDLE_INTERVAL_MS
+// when the room is idle) to claim any pending command, run it locally via
+// handleOp(), and POST the result back. This
 // replaces the old inbound cloudflared quick-tunnel path — no inbound port
 // exposure needed from this Mac. The inbound handler above is left intact
 // (harmless without a tunnel) so nothing that used to work is broken.
 let polling = false;
 let pollTimer = null;
+let pollStopped = false;
+let pollFailures = 0;
+let lastCommandAt = 0;
 let sourcesTimer = null;
 let camReachTimer = null;
 let diskUsageTimer = null;
@@ -2122,8 +2137,9 @@ async function refreshSources() {
   }
 }
 
+// Resolves 'command', 'idle' or 'error' so the loop can pick the next interval.
 async function pollOnce() {
-  if (polling) return; // network calls are async — belt-and-suspenders reentry guard
+  if (polling) return 'idle'; // network calls are async — belt-and-suspenders reentry guard
   polling = true;
   try {
     const url = `${RECORD_POLL_URL}/api/record?building_id=${encodeURIComponent(BUILDING_ID)}${heartbeatQuery()}`;
@@ -2134,16 +2150,21 @@ async function pollOnce() {
     if (!getRes.ok) {
       // 401/5xx from the relay — log once per tick and move on. Do not crash.
       console.warn(`[es-mini-agent] relay: poll GET ${getRes.status} from ${RECORD_POLL_URL}`);
-      return;
+      return 'error';
     }
     const data = await getRes.json().catch(() => ({}));
+    // The Worker answers 200 { ok: false, reason: 'exception' } when Supabase fails:
+    // back off like a 5xx, but stay quiet in the log as before.
+    if (data && data.ok === false) return 'error';
     const cmd = data && data.command;
-    if (!cmd || !cmd.id || !cmd.op) return; // nothing to do — stay quiet to keep agent.log readable
+    if (!cmd || !cmd.id || !cmd.op) return 'idle'; // nothing to do — stay quiet to keep agent.log readable
 
+    lastCommandAt = Date.now();
+    const opStartedAt = Date.now();
     const result = await handleOp(cmd.op, (cmd.payload && typeof cmd.payload === 'object') ? cmd.payload : {});
     if (result == null) {
       console.warn(`[es-mini-agent] relay: unknown op '${cmd.op}' (id=${cmd.id}) — skipping result post`);
-      return;
+      return 'command';
     }
 
     const postRes = await fetch(`${RECORD_POLL_URL}/api/record`, {
@@ -2156,22 +2177,49 @@ async function pollOnce() {
     });
     if (!postRes.ok) {
       console.warn(`[es-mini-agent] relay: result POST ${postRes.status} for ${cmd.op} (${cmd.id})`);
-      return;
+      return 'command';
     }
-    console.log(`[es-mini-agent] relay: claimed ${cmd.op} (${cmd.id}) -> posted result`);
+    // How long the op itself took, so a slow tap can be split into poll wait and agent work.
+    console.log(`[es-mini-agent] relay: claimed ${cmd.op} (${cmd.id}) -> posted result (op took ${((Date.now() - opStartedAt) / 1000).toFixed(1)} s)`);
+    return 'command';
   } catch (e) {
     // Network hiccup, DNS blip, JSON parse — never crash the process.
     console.error('[es-mini-agent] relay: poll error:', e && (e.stack || e.message || e));
+    return 'error';
   } finally {
     polling = false;
   }
 }
 
+function nextPollDelay(outcome, now = Date.now()) {
+  const active = state.recording || state.paused || now - lastCommandAt < POLL_ACTIVE_WINDOW_MS;
+  const interval = active ? POLL_INTERVAL_MS : POLL_IDLE_INTERVAL_MS;
+  if (outcome !== 'error') {
+    pollFailures = 0;
+    return interval;
+  }
+  pollFailures += 1;
+  return Math.max(interval, POLL_ERROR_BACKOFF_MS[Math.min(pollFailures, POLL_ERROR_BACKOFF_MS.length) - 1]);
+}
+
+// One poll at a time, never overlapping. A normal interval counts from the start of
+// the previous poll (as setInterval did), so the round trip to the Worker is not
+// added on top; a failed poll waits its backoff in full before the next attempt.
+async function pollLoop() {
+  const startedAt = Date.now();
+  const outcome = await pollOnce();
+  if (pollStopped) return;
+  const delay = nextPollDelay(outcome);
+  pollTimer = setTimeout(pollLoop, outcome === 'error' ? delay : Math.max(0, delay - (Date.now() - startedAt)));
+}
+
 server.listen(PORT, () => {
   console.log(`[es-mini-agent] listening on :${PORT} building_id=${BUILDING_ID}`);
-  console.log(`[es-mini-agent] relay: polling ${RECORD_POLL_URL}/api/record every ${POLL_INTERVAL_MS}ms`);
+  console.log(`[es-mini-agent] relay: polling ${RECORD_POLL_URL}/api/record every ${POLL_INTERVAL_MS}ms while the room is in use, ${POLL_IDLE_INTERVAL_MS}ms when idle`);
   console.log('[es-mini-agent] sources (env): ' + activeSources.join(','));
-  pollTimer = setInterval(pollOnce, POLL_INTERVAL_MS);
+  // First poll after one idle interval, as before: its heartbeat carries the disk and
+  // camera samples taken just below, which are not there yet at boot.
+  pollTimer = setTimeout(pollLoop, POLL_IDLE_INTERVAL_MS);
   sourcesTimer = setInterval(refreshSources, SOURCES_REFRESH_MS);
   camReachTimer = setInterval(refreshCameraReachability, CAM_REACH_MS);
   diskUsageTimer = setInterval(refreshDiskUsage, DISK_USAGE_MS);
@@ -2199,8 +2247,9 @@ server.listen(PORT, () => {
 
 function shutdown(signal) {
   console.log(`[es-mini-agent] ${signal} received, closing server...`);
+  pollStopped = true;
   if (pollTimer) {
-    clearInterval(pollTimer);
+    clearTimeout(pollTimer);
     pollTimer = null;
   }
   if (sourcesTimer) {

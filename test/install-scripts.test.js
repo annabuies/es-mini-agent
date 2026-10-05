@@ -108,9 +108,9 @@ test('OBS launcher leaves OBS alone when it cannot tell when login happened', ()
   assert.equal(r.alive, true);
 });
 
-test('agent release version is 2026.10.01-1', () => {
+test('agent release version is 2026.10.03-1', () => {
   const server = fs.readFileSync(path.join(projectDir, 'server.js'), 'utf8');
-  assert.match(server, /const AGENT_VERSION = '2026\.10\.01-1';/);
+  assert.match(server, /const AGENT_VERSION = '2026\.10\.03-1';/);
 });
 
 test('installer persists the power strip env into the plist and modules.txt ships power.js', () => {
