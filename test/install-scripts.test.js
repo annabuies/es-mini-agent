@@ -47,9 +47,11 @@ test('--obs-launcher turns macOS session restore off so only the launcher starts
   assert.match(uninstall, /defaults delete com\.apple\.loginwindow LoginwindowLaunchesRelaunchApps/);
 });
 
-// Runs obs-launcher.sh against stub pgrep/ps/open/sleep. `kill` is a bash builtin,
+// Runs obs-launcher.sh against stub pgrep/ps/lsof/open/sleep. `kill` is a bash builtin,
 // so the "OBS" is a real orphaned sleep (launchd reaps it, so kill -0 sees it go).
-function runLauncher({ obsArgs, obsLstart, dockLstart }) {
+// By default the stub lsof shows an OBS stuck at the Safe Mode dialog: only its
+// binary open, no recording file, no listening port.
+function runLauncher({ obsArgs, obsLstart, dockLstart, lsofFile = '', lsofListen = '', lsofUnreadable = false }) {
   const os = require('node:os');
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-obsrun-'));
   const obsPid = execFileSync('/bin/sh', ['-c', '/bin/sleep 300 >/dev/null 2>&1 & echo $!']).toString().trim();
@@ -65,10 +67,21 @@ case "$2" in
   lstart=) if [ "$4" = 647 ]; then echo "$DOCK_LSTART"; else echo "$OBS_LSTART"; fi ;;
 esac
 `, { mode: 0o755 });
+    fs.writeFileSync(path.join(bin, 'lsof'), `#!/bin/sh
+case "$*" in
+  *sTCP:LISTEN*) [ -n "$LSOF_LISTEN" ] || exit 1; printf 'p1\\nf20\\nn%s\\n' "$LSOF_LISTEN" ;;
+  *) [ -z "$LSOF_UNREADABLE" ] || exit 1
+     printf 'p1\\nfcwd\\nn/\\nftxt\\nn/Applications/OBS.app/Contents/MacOS/OBS\\n'
+     [ -z "$LSOF_FILE" ] || printf 'f31\\nn%s\\n' "$LSOF_FILE" ;;
+esac
+`, { mode: 0o755 });
     fs.writeFileSync(path.join(bin, 'open'), '#!/bin/sh\necho "OPENED $*"\n', { mode: 0o755 });
     fs.writeFileSync(path.join(bin, 'sleep'), '#!/bin/sh\n/bin/sleep 0.2\n', { mode: 0o755 });
     const out = execFileSync('/bin/bash', [path.join(projectDir, 'obs-launcher.sh')], {
-      env: { PATH: `${bin}:/usr/bin:/bin`, HOME: bin, OBS_ARGS: obsArgs, OBS_LSTART: obsLstart, DOCK_LSTART: dockLstart || '' },
+      env: {
+        PATH: `${bin}:/usr/bin:/bin`, HOME: bin, OBS_ARGS: obsArgs, OBS_LSTART: obsLstart, DOCK_LSTART: dockLstart || '',
+        LSOF_FILE: lsofFile, LSOF_LISTEN: lsofListen, LSOF_UNREADABLE: lsofUnreadable ? '1' : '',
+      },
     }).toString();
     let alive = true;
     try { process.kill(Number(obsPid), 0); } catch { alive = false; }
@@ -100,6 +113,35 @@ test('OBS launcher never touches an OBS opened by hand after login (installer re
   assert.match(r.out, /OBS already running \(pid \d+\), not started with this login, leaving it: \/Applications\/OBS\.app\/Contents\/MacOS\/OBS$/m);
   assert.doesNotMatch(r.out, /OPENED/);
   assert.equal(r.alive, true);
+});
+
+// Audit 10-05 F3: someone opens OBS by hand right after login (inside the restore
+// window, before the LaunchAgent gets to it) and starts recording.
+test('OBS launcher never kills a flagless OBS that is recording, even one started right after login', () => {
+  const r = runLauncher({ obsArgs: OBS_BIN, obsLstart: 'Fri Oct  2 12:23:37 2026', dockLstart: 'Fri Oct  2 12:23:26 2026', lsofFile: '/Users/megadesk/Movies/2026-10-02 12-23-50.mkv' });
+  assert.match(r.out, /started 11 s after login without --disable-shutdown-check, but it has a recording file open; leaving it/);
+  assert.doesNotMatch(r.out, /restarting it|OPENED/);
+  assert.equal(r.alive, true);
+});
+
+test('OBS launcher leaves a flagless OBS that is past the Safe Mode dialog (obs-websocket listening)', () => {
+  const r = runLauncher({ obsArgs: OBS_BIN, obsLstart: 'Fri Oct  2 12:23:37 2026', dockLstart: 'Fri Oct  2 12:23:26 2026', lsofListen: '*:4455' });
+  assert.match(r.out, /but it is listening on a port, so it is past the Safe Mode dialog; leaving it/);
+  assert.doesNotMatch(r.out, /OPENED/);
+  assert.equal(r.alive, true);
+});
+
+test('OBS launcher leaves a flagless OBS whose open files it cannot read (no proof it is idle)', () => {
+  const r = runLauncher({ obsArgs: OBS_BIN, obsLstart: 'Fri Oct  2 12:23:37 2026', dockLstart: 'Fri Oct  2 12:23:26 2026', lsofUnreadable: true });
+  assert.match(r.out, /but its open files cannot be read; leaving it/);
+  assert.doesNotMatch(r.out, /OPENED/);
+  assert.equal(r.alive, true);
+});
+
+test('OBS launcher: a non-recording file (a log, a scene collection) does not count as a recording', () => {
+  const r = runLauncher({ obsArgs: OBS_BIN, obsLstart: 'Fri Oct  2 12:23:37 2026', dockLstart: 'Fri Oct  2 12:23:26 2026', lsofFile: '/Users/megadesk/Library/Application Support/obs-studio/logs/2026-10-02 12-23-37.txt' });
+  assert.match(r.out, /restarting it/);
+  assert.equal(r.alive, false);
 });
 
 test('OBS launcher leaves OBS alone when it cannot tell when login happened', () => {

@@ -2,6 +2,8 @@
 
 set -euo pipefail
 export LC_ALL=C
+# lsof lives in /usr/sbin, which a LaunchAgent's PATH may not include.
+export PATH="${PATH:-/usr/bin:/bin}:/usr/sbin:/sbin"
 
 log() { printf '%s [es-obs-launcher] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 
@@ -18,6 +20,30 @@ start_epoch() {
   started="$(ps -o lstart= -p "$1" 2>/dev/null | awk '{print $1, $2, $3, $4, $5}')"
   [[ -n "$started" ]] || return 0
   date -j -f '%a %b %d %T %Y' "$started" +%s 2>/dev/null || true
+}
+
+# Why this OBS may be in use, or nothing if it is not. A restored OBS stuck at
+# the Safe Mode dialog has no recording file open and no listening port (its
+# plugins, obs-websocket included, load after the dialog). A recording file
+# open means someone is recording; a listening port means OBS got past the
+# dialog and the agent or a person can be driving it. If its open files cannot
+# be read at all, that is reason enough to leave it (audit 10-05 F3).
+obs_in_use() {
+  local files listening
+  files="$(lsof -n -P -p "$1" -Fn 2>/dev/null || true)"
+  if [[ -z "$files" ]]; then
+    printf 'its open files cannot be read'
+    return 0
+  fi
+  if grep -Eiq '^n.*\.(mkv|mp4|mov|flv|ts|m3u8|m4v)$' <<<"$files"; then
+    printf 'it has a recording file open'
+    return 0
+  fi
+  listening="$(lsof -n -P -a -p "$1" -iTCP -sTCP:LISTEN -Fn 2>/dev/null || true)"
+  if grep -q '^n' <<<"$listening"; then
+    printf 'it is listening on a port, so it is past the Safe Mode dialog'
+  fi
+  return 0
 }
 
 find_obs() {
@@ -58,8 +84,17 @@ if [[ -n "$obs_pid" ]]; then
     exit 0
   fi
 
+  # A person can open OBS by hand in the same window (the launcher waits up to
+  # 30 s for the Dock) and start recording: only an OBS that shows no sign of use
+  # is restarted.
+  in_use="$(obs_in_use "$obs_pid")"
+  if [[ -n "$in_use" ]]; then
+    log "OBS (pid $obs_pid) started $((obs_start - login_start)) s after login without --disable-shutdown-check, but $in_use; leaving it: $obs_args"
+    exit 0
+  fi
+
   # Without the flag a restored OBS sits at the Safe Mode dialog, which also
-  # ignores a polite quit. Nothing can be recording yet, so end it and relaunch.
+  # ignores a polite quit. It is not recording, so end it and relaunch.
   log "OBS (pid $obs_pid) was reopened by macOS $((obs_start - login_start)) s after login without --disable-shutdown-check; restarting it: $obs_args"
   kill -TERM "$obs_pid" 2>/dev/null || true
   for _ in 1 2 3 4 5 6 7 8 9 10; do
