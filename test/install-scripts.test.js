@@ -1,7 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
@@ -32,7 +32,7 @@ test('installer removes the stale agent plist and supports the opt-in OBS launch
   assert.match(obsPlist, /<key>KeepAlive<\/key>\s*<false\/>/);
   assert.match(obsPlist, /__LAUNCHER_DIR__\/obs-launcher\.sh/);
   assert.doesNotMatch(obsPlist, /__PROJECT_DIR__/);
-  assert.match(obsLauncher, /open -a OBS --args --disable-shutdown-check/);
+  assert.match(obsLauncher, /open -a OBS \|\|/);
   assert.match(obsLauncher, /pgrep -x OBS/);
 });
 
@@ -47,107 +47,218 @@ test('--obs-launcher turns macOS session restore off so only the launcher starts
   assert.match(uninstall, /defaults delete com\.apple\.loginwindow LoginwindowLaunchesRelaunchApps/);
 });
 
-// Runs obs-launcher.sh against stub pgrep/ps/lsof/open/sleep. `kill` is a bash builtin,
-// so the "OBS" is a real orphaned sleep (launchd reaps it, so kill -0 sees it go).
-// By default the stub lsof shows an OBS stuck at the Safe Mode dialog: only its
-// binary open, no recording file, no listening port.
-function runLauncher({ obsArgs, obsLstart, dockLstart, lsofFile = '', lsofListen = '', lsofUnreadable = false }) {
+// Runs obs-launcher.sh against stub pgrep/ps/sysctl/open/sleep and a temporary HOME.
+// The stub `open` behaves like OBS 32's crash check (CrashHandler.cpp): if any
+// .sentinel/run_* marker is left, its log says "Crash or unclean shutdown
+// detected" and it waits at the dialog unless `fakeObs` says someone clicked.
+// `markers` maps a marker name to its age in seconds relative to boot
+// (negative = written before this boot).
+const LAUNCHER_ON_MAC = { skip: process.platform !== 'darwin' && 'needs BSD stat/date' };
+const OBS_BIN = '/Applications/OBS.app/Contents/MacOS/OBS';
+
+function lstart(epoch) {
+  return execFileSync('/bin/date', ['-r', String(epoch), '+%a %b %e %T %Y']).toString().trim();
+}
+
+function runLauncher({ markers = {}, bootAgo = 120, dockAgo = 60, noBootTime = false, fakeObs = 'auto', running = null } = {}) {
   const os = require('node:os');
-  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-obsrun-'));
-  const obsPid = execFileSync('/bin/sh', ['-c', '/bin/sleep 300 >/dev/null 2>&1 & echo $!']).toString().trim();
-  try {
-    fs.writeFileSync(path.join(bin, 'pgrep'), `#!/bin/sh
-[ "$2" = OBS ] && echo ${obsPid} && exit 0
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-obsrun-'));
+  const bin = path.join(home, 'bin');
+  const support = path.join(home, 'Library', 'Application Support');
+  const sentinel = path.join(support, 'obs-studio', '.sentinel');
+  const logs = path.join(support, 'obs-studio', 'logs');
+  const archive = path.join(support, 'es-mini-agent', 'obs-sentinel-archive');
+  fs.mkdirSync(bin, { recursive: true });
+  fs.mkdirSync(sentinel, { recursive: true });
+  fs.mkdirSync(logs, { recursive: true });
+  const now = Math.floor(Date.now() / 1000);
+  const boot = now - bootAgo;
+  for (const [name, ageVsBoot] of Object.entries(markers)) {
+    const f = path.join(sentinel, name);
+    fs.writeFileSync(f, '');
+    fs.utimesSync(f, boot + ageVsBoot, boot + ageVsBoot);
+  }
+  // A log from an earlier OBS run that ended at the dialog must not be read as this run's.
+  const oldLog = path.join(logs, '2026-10-01 08-00-00.txt');
+  fs.writeFileSync(oldLog, '08:00:00.000: Crash or unclean shutdown detected\n');
+  fs.utimesSync(oldLog, boot - 7200, boot - 7200);
+
+  let obsPid = '';
+  if (running) {
+    obsPid = execFileSync('/bin/sh', ['-c', '/bin/sleep 300 >/dev/null 2>&1 & echo $!']).toString().trim();
+    fs.writeFileSync(path.join(logs, '2099-01-01 00-00-00.txt'), running.log);
+  }
+  fs.writeFileSync(path.join(bin, 'pgrep'), `#!/bin/sh
+[ "$2" = OBS ] && [ -n "$OBS_PID" ] && echo "$OBS_PID" && exit 0
 [ "$4" = Dock ] && [ -n "$DOCK_LSTART" ] && echo 647 && exit 0
 exit 1
 `, { mode: 0o755 });
-    fs.writeFileSync(path.join(bin, 'ps'), `#!/bin/sh
+  fs.writeFileSync(path.join(bin, 'ps'), `#!/bin/sh
 case "$2" in
-  args=) echo "$OBS_ARGS" ;;
+  args=) echo "${OBS_BIN}" ;;
   lstart=) if [ "$4" = 647 ]; then echo "$DOCK_LSTART"; else echo "$OBS_LSTART"; fi ;;
 esac
 `, { mode: 0o755 });
-    fs.writeFileSync(path.join(bin, 'lsof'), `#!/bin/sh
-case "$*" in
-  *sTCP:LISTEN*) [ -n "$LSOF_LISTEN" ] || exit 1; printf 'p1\\nf20\\nn%s\\n' "$LSOF_LISTEN" ;;
-  *) [ -z "$LSOF_UNREADABLE" ] || exit 1
-     printf 'p1\\nfcwd\\nn/\\nftxt\\nn/Applications/OBS.app/Contents/MacOS/OBS\\n'
-     [ -z "$LSOF_FILE" ] || printf 'f31\\nn%s\\n' "$LSOF_FILE" ;;
-esac
+  fs.writeFileSync(path.join(bin, 'sysctl'), `#!/bin/sh
+[ -n "$BOOT_SEC" ] || exit 1
+echo "{ sec = $BOOT_SEC, usec = 654321 } Mon Oct  5 09:00:00 2026"
 `, { mode: 0o755 });
-    fs.writeFileSync(path.join(bin, 'open'), '#!/bin/sh\necho "OPENED $*"\n', { mode: 0o755 });
-    fs.writeFileSync(path.join(bin, 'sleep'), '#!/bin/sh\n/bin/sleep 0.2\n', { mode: 0o755 });
-    const out = execFileSync('/bin/bash', [path.join(projectDir, 'obs-launcher.sh')], {
+  fs.writeFileSync(path.join(bin, 'open'), `#!/bin/sh
+[ "$1" = -Ra ] && exit 0
+echo "OPENED $*" >> "$HOME/opened"
+[ "$FAKE_OBS" = silent ] && exit 0
+crash=""
+for m in "$HOME/Library/Application Support/obs-studio/.sentinel"/run_*; do [ -f "$m" ] && crash=1; done
+f="$HOME/Library/Application Support/obs-studio/logs/2099-01-01 00-00-00.txt"
+echo "00:00:00.100: Platform: Apple" > "$f"
+[ -n "$crash" ] && echo "00:00:00.200: Crash or unclean shutdown detected" >> "$f"
+case "$FAKE_OBS" in
+  normal) [ -n "$crash" ] && echo "00:00:09.000: [Safe Mode] Normal launch selected, loading third-party plugins is enabled" >> "$f" ;;
+  safe) [ -n "$crash" ] && echo "00:00:09.000: [Safe Mode] Safe mode launch selected, loading third-party plugins is disabled" >> "$f" ;;
+  other-prompt) exit 0 ;;
+esac
+if [ -z "$crash" ] || [ "$FAKE_OBS" = normal ] || [ "$FAKE_OBS" = safe ]; then
+  echo "00:00:09.100: Current Date/Time: 2099-01-01, 00:00:09" >> "$f"
+fi
+exit 0
+`, { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, 'sleep'), '#!/bin/sh\n/bin/sleep 0.01\n', { mode: 0o755 });
+  try {
+    const r = spawnSync('/bin/bash', [path.join(projectDir, 'obs-launcher.sh')], {
       env: {
-        PATH: `${bin}:/usr/bin:/bin`, HOME: bin, OBS_ARGS: obsArgs, OBS_LSTART: obsLstart, DOCK_LSTART: dockLstart || '',
-        LSOF_FILE: lsofFile, LSOF_LISTEN: lsofListen, LSOF_UNREADABLE: lsofUnreadable ? '1' : '',
+        PATH: `${bin}:/usr/bin:/bin`, HOME: home, FAKE_OBS: fakeObs,
+        BOOT_SEC: noBootTime ? '' : String(boot),
+        DOCK_LSTART: dockAgo === null ? '' : lstart(now - dockAgo),
+        OBS_PID: obsPid, OBS_LSTART: running ? lstart(now - running.startedAgo) : '',
       },
-    }).toString();
-    let alive = true;
-    try { process.kill(Number(obsPid), 0); } catch { alive = false; }
-    return { out, alive, obsPid };
+    });
+    const list = (dir) => (fs.existsSync(dir) ? fs.readdirSync(dir).filter((n) => n.startsWith('run_')).sort() : []);
+    const archived = {};
+    if (fs.existsSync(archive)) {
+      for (const batch of fs.readdirSync(archive)) {
+        for (const n of list(path.join(archive, batch))) archived[n] = fs.statSync(path.join(archive, batch, n)).mtimeMs / 1000;
+      }
+    }
+    const openedFile = path.join(home, 'opened');
+    let alive = null;
+    if (obsPid) { try { process.kill(Number(obsPid), 0); alive = true; } catch { alive = false; } }
+    return {
+      out: r.stdout.toString(), err: r.stderr.toString(), status: r.status, boot, alive,
+      left: list(sentinel), archived,
+      opened: fs.existsSync(openedFile) ? fs.readFileSync(openedFile, 'utf8').trim().split('\n') : [],
+    };
   } finally {
-    try { process.kill(Number(obsPid), 'SIGKILL'); } catch {}
-    fs.rmSync(bin, { recursive: true, force: true });
+    if (obsPid) { try { process.kill(Number(obsPid), 'SIGKILL'); } catch {} }
+    fs.rmSync(home, { recursive: true, force: true });
   }
 }
 
-const OBS_BIN = '/Applications/OBS.app/Contents/MacOS/OBS';
+test('OBS launcher never stops OBS and no longer passes the flag OBS 32 removed', () => {
+  const launcher = fs.readFileSync(path.join(projectDir, 'obs-launcher.sh'), 'utf8');
+  assert.doesNotMatch(launcher, /\bkill\b|pkill|killall|osascript/);
+  assert.doesNotMatch(launcher, /--args|open[^\n]*--disable-shutdown-check/);
+  assert.doesNotMatch(launcher, /\brm\b/);
+});
 
-test('OBS launcher leaves an OBS that already has --disable-shutdown-check', () => {
-  const r = runLauncher({ obsArgs: `${OBS_BIN} --disable-shutdown-check`, obsLstart: 'Fri Oct  2 12:23:37 2026', dockLstart: 'Fri Oct  2 12:23:26 2026' });
-  assert.match(r.out, /OBS already running with --disable-shutdown-check \(pid \d+\), leaving it$/m);
-  assert.doesNotMatch(r.out, /OPENED/);
+test('power cut or restart: cold login archives the marker from before this boot and OBS starts with no dialog', LAUNCHER_ON_MAC, () => {
+  const r = runLauncher({ markers: { 'run_before-power-cut': -900 } });
+  assert.deepEqual(r.left, []);
+  assert.deepEqual(Object.keys(r.archived), ['run_before-power-cut']);
+  assert.equal(r.archived['run_before-power-cut'], r.boot - 900, 'archive keeps the marker and its time');
+  assert.match(r.out, /archived OBS crash marker run_before-power-cut .*before this boot/);
+  assert.equal(r.opened.length, 1);
+  assert.match(r.opened[0], /^OPENED (\/Applications\/OBS\.app|-a OBS)$/);
+  assert.match(r.out, /OBS started with no Safe Mode dialog \(log 2099-01-01 00-00-00\.txt\)$/m);
+  assert.doesNotMatch(r.out + r.err, /ALERT/);
+  assert.equal(r.status, 0);
+});
+
+test('normal restart where OBS quit cleanly: no markers, nothing archived, OBS starts', LAUNCHER_ON_MAC, () => {
+  const r = runLauncher();
+  assert.deepEqual(r.archived, {});
+  assert.doesNotMatch(r.out, /archived/);
+  assert.equal(r.opened.length, 1);
+  assert.match(r.out, /OBS started with no Safe Mode dialog/);
+  assert.equal(r.status, 0);
+});
+
+test('crash during this boot: its marker is left, OBS is started once and the dialog raises an alert', LAUNCHER_ON_MAC, () => {
+  const r = runLauncher({ markers: { 'run_crashed-this-boot': 30 } });
+  assert.deepEqual(r.left, ['run_crashed-this-boot']);
+  assert.deepEqual(r.archived, {});
+  assert.match(r.out, /leaving 1 OBS crash marker\(s\) .*written since this boot/);
+  assert.equal(r.opened.length, 1, 'one launch attempt only');
+  assert.match(r.out, /ALERT: OBS is waiting at the Safe Mode dialog \(log 2099-01-01 00-00-00\.txt\)\. Someone at the Mini must choose Run in Normal Mode/);
+  assert.match(r.err, /ALERT: OBS is waiting at the Safe Mode dialog/);
+  assert.equal(r.status, 1);
+});
+
+test('markers from before and since this boot: only the old one is archived', LAUNCHER_ON_MAC, () => {
+  const r = runLauncher({ markers: { 'run_before-power-cut': -60, 'run_crashed-this-boot': 45 } });
+  assert.deepEqual(r.left, ['run_crashed-this-boot']);
+  assert.deepEqual(Object.keys(r.archived), ['run_before-power-cut']);
+  assert.match(r.out, /ALERT: OBS is waiting at the Safe Mode dialog/);
+  assert.equal(r.opened.length, 1);
+});
+
+test('not a cold login (installer reloaded mid-day): markers are left as they are', LAUNCHER_ON_MAC, () => {
+  const r = runLauncher({ markers: { 'run_before-power-cut': -900 }, bootAgo: 9000, dockAgo: 7200 });
+  assert.deepEqual(r.left, ['run_before-power-cut']);
+  assert.deepEqual(r.archived, {});
+  assert.match(r.out, /not a cold login \(7[0-9]{3} s after login; launcher reloaded or login time unknown\)/);
+  assert.equal(r.opened.length, 1);
+  assert.match(r.out, /ALERT: OBS is waiting at the Safe Mode dialog/);
+});
+
+test('login time or boot time unknown: markers are left as they are', LAUNCHER_ON_MAC, () => {
+  const noDock = runLauncher({ markers: { 'run_before-power-cut': -900 }, dockAgo: null });
+  assert.deepEqual(noDock.left, ['run_before-power-cut']);
+  assert.match(noDock.out, /not a cold login \(launcher reloaded or login time unknown\)/);
+  const noBoot = runLauncher({ markers: { 'run_before-power-cut': -900 }, noBootTime: true });
+  assert.deepEqual(noBoot.left, ['run_before-power-cut']);
+  assert.match(noBoot.out, /cannot read the boot time; leaving OBS crash markers as they are/);
+});
+
+test('an OBS already at the Safe Mode dialog at login is never stopped: alert only', LAUNCHER_ON_MAC, () => {
+  const r = runLauncher({
+    markers: { 'run_before-power-cut': -900, 'run_reopened-by-macos': 15 },
+    running: { startedAgo: 45, log: '00:00:00.200: Crash or unclean shutdown detected\n' },
+  });
   assert.equal(r.alive, true);
+  assert.deepEqual(r.opened, []);
+  assert.deepEqual(r.left, ['run_before-power-cut', 'run_reopened-by-macos'], 'a running OBS owns the markers; none are moved');
+  assert.match(r.out, /OBS already running \(pid \d+\), leaving it/);
+  assert.match(r.out, /ALERT: OBS \(pid \d+\) is waiting at the Safe Mode dialog .*does not stop or restart OBS/);
+  assert.equal(r.status, 1);
 });
 
-test('OBS launcher restarts an OBS that macOS reopened at login without the flag (power pull, 10-02)', () => {
-  const r = runLauncher({ obsArgs: OBS_BIN, obsLstart: 'Fri Oct  2 12:23:37 2026', dockLstart: 'Fri Oct  2 12:23:26 2026' });
-  assert.match(r.out, /reopened by macOS 11 s after login without --disable-shutdown-check; restarting it/);
-  assert.equal(r.alive, false);
-  assert.match(r.out, /OPENED (\/Applications\/OBS\.app|-a OBS) --args --disable-shutdown-check$/m);
-});
-
-test('OBS launcher never touches an OBS opened by hand after login (installer reload mid-day)', () => {
-  const r = runLauncher({ obsArgs: OBS_BIN, obsLstart: 'Fri Oct  2 14:40:00 2026', dockLstart: 'Fri Oct  2 12:23:26 2026' });
-  assert.match(r.out, /OBS already running \(pid \d+\), not started with this login, leaving it: \/Applications\/OBS\.app\/Contents\/MacOS\/OBS$/m);
-  assert.doesNotMatch(r.out, /OPENED/);
+test('an OBS opened by hand right after login and recording is left alone with no alert', LAUNCHER_ON_MAC, () => {
+  const r = runLauncher({
+    markers: { 'run_opened-by-hand': 20 },
+    running: { startedAgo: 40, log: '00:00:00.200: Crash or unclean shutdown detected\n00:00:03.000: [Safe Mode] Normal launch selected, loading third-party plugins is enabled\n00:00:03.100: Current Date/Time: x\n00:00:30.000: ==== Recording Start ===\n' },
+  });
   assert.equal(r.alive, true);
+  assert.deepEqual(r.opened, []);
+  assert.match(r.out, /OBS \(pid \d+\) got past the Safe Mode dialog: someone chose Run in Normal Mode/);
+  assert.doesNotMatch(r.out + r.err, /ALERT/);
+  assert.equal(r.status, 0);
 });
 
-// Audit 10-05 F3: someone opens OBS by hand right after login (inside the restore
-// window, before the LaunchAgent gets to it) and starts recording.
-test('OBS launcher never kills a flagless OBS that is recording, even one started right after login', () => {
-  const r = runLauncher({ obsArgs: OBS_BIN, obsLstart: 'Fri Oct  2 12:23:37 2026', dockLstart: 'Fri Oct  2 12:23:26 2026', lsofFile: '/Users/megadesk/Movies/2026-10-02 12-23-50.mkv' });
-  assert.match(r.out, /started 11 s after login without --disable-shutdown-check, but it has a recording file open; leaving it/);
-  assert.doesNotMatch(r.out, /restarting it|OPENED/);
-  assert.equal(r.alive, true);
+test('someone at the Mini answers the dialog: Normal Mode is logged, Safe Mode raises an alert', LAUNCHER_ON_MAC, () => {
+  const normal = runLauncher({ markers: { 'run_crashed-this-boot': 30 }, fakeObs: 'normal' });
+  assert.match(normal.out, /OBS got past the Safe Mode dialog: someone chose Run in Normal Mode/);
+  assert.equal(normal.status, 0);
+  const safe = runLauncher({ markers: { 'run_crashed-this-boot': 30 }, fakeObs: 'safe' });
+  assert.match(safe.out, /ALERT: OBS was started in Safe Mode by someone at the Mini: obs-websocket is off/);
+  assert.equal(safe.status, 1);
 });
 
-test('OBS launcher leaves a flagless OBS that is past the Safe Mode dialog (obs-websocket listening)', () => {
-  const r = runLauncher({ obsArgs: OBS_BIN, obsLstart: 'Fri Oct  2 12:23:37 2026', dockLstart: 'Fri Oct  2 12:23:26 2026', lsofListen: '*:4455' });
-  assert.match(r.out, /but it is listening on a port, so it is past the Safe Mode dialog; leaving it/);
-  assert.doesNotMatch(r.out, /OPENED/);
-  assert.equal(r.alive, true);
-});
-
-test('OBS launcher leaves a flagless OBS whose open files it cannot read (no proof it is idle)', () => {
-  const r = runLauncher({ obsArgs: OBS_BIN, obsLstart: 'Fri Oct  2 12:23:37 2026', dockLstart: 'Fri Oct  2 12:23:26 2026', lsofUnreadable: true });
-  assert.match(r.out, /but its open files cannot be read; leaving it/);
-  assert.doesNotMatch(r.out, /OPENED/);
-  assert.equal(r.alive, true);
-});
-
-test('OBS launcher: a non-recording file (a log, a scene collection) does not count as a recording', () => {
-  const r = runLauncher({ obsArgs: OBS_BIN, obsLstart: 'Fri Oct  2 12:23:37 2026', dockLstart: 'Fri Oct  2 12:23:26 2026', lsofFile: '/Users/megadesk/Library/Application Support/obs-studio/logs/2026-10-02 12-23-37.txt' });
-  assert.match(r.out, /restarting it/);
-  assert.equal(r.alive, false);
-});
-
-test('OBS launcher leaves OBS alone when it cannot tell when login happened', () => {
-  const r = runLauncher({ obsArgs: OBS_BIN, obsLstart: 'Fri Oct  2 12:23:37 2026', dockLstart: '' });
-  assert.match(r.out, /not started with this login, leaving it/);
-  assert.equal(r.alive, true);
+test('OBS writes no new log, or stops at another prompt: alert, and an old log is not mistaken for this run', LAUNCHER_ON_MAC, () => {
+  const silent = runLauncher({ fakeObs: 'silent' });
+  assert.match(silent.out, /ALERT: OBS wrote no startup log within 90 s/);
+  assert.equal(silent.opened.length, 1);
+  const other = runLauncher({ fakeObs: 'other-prompt' });
+  assert.match(other.out, /ALERT: OBS has not finished starting after 90 s and shows no Safe Mode dialog/);
 });
 
 test('agent release version is 2026.10.03-1', () => {
@@ -172,7 +283,7 @@ test('modules.txt lists only .js runtime modules (deployed self-update rejects a
 });
 
 test('installer reuses values from the live plist for anything left unset (bash 3.2 safe)', { skip: process.platform !== 'darwin' && 'needs /usr/libexec/PlistBuddy' }, () => {
-  const { execFileSync } = require('node:child_process');
+  const { execFileSync, spawnSync } = require('node:child_process');
   const os = require('node:os');
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-reuse-'));
   try {
