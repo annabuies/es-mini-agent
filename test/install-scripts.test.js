@@ -89,7 +89,7 @@ function runLauncher({ markers = {}, bootAgo = 120, dockAgo = 60, noBootTime = f
     fs.writeFileSync(path.join(logs, '2099-01-01 00-00-00.txt'), running.log);
   }
   fs.writeFileSync(path.join(bin, 'pgrep'), `#!/bin/sh
-[ "$2" = OBS ] && [ -n "$OBS_PID" ] && echo "$OBS_PID" && exit 0
+[ "$2" = OBS ] && [ -n "$OBS_PID" ] && /bin/kill -0 "$OBS_PID" 2>/dev/null && echo "$OBS_PID" && exit 0
 [ "$4" = Dock ] && [ -n "$DOCK_LSTART" ] && echo 647 && exit 0
 exit 1
 `, { mode: 0o755 });
@@ -153,9 +153,10 @@ exit 0
   }
 }
 
-test('OBS launcher never stops OBS and no longer passes the flag OBS 32 removed', () => {
+test('OBS launcher only sends TERM to a proven dialog-blocked process and no longer passes the removed flag', () => {
   const launcher = fs.readFileSync(path.join(projectDir, 'obs-launcher.sh'), 'utf8');
-  assert.doesNotMatch(launcher, /\bkill\b|pkill|killall|osascript/);
+  assert.match(launcher, /kill -TERM "\$pid"/);
+  assert.doesNotMatch(launcher, /kill -KILL|pkill|killall|osascript/);
   assert.doesNotMatch(launcher, /--args|open[^\n]*--disable-shutdown-check/);
   assert.doesNotMatch(launcher, /\brm\b/);
 });
@@ -219,17 +220,40 @@ test('login time or boot time unknown: markers are left as they are', LAUNCHER_O
   assert.match(noBoot.out, /cannot read the boot time; leaving OBS crash markers as they are/);
 });
 
-test('an OBS already at the Safe Mode dialog at login is never stopped: alert only', LAUNCHER_ON_MAC, () => {
+test('a macOS-reopened OBS stuck at the dialog is stopped and relaunched after its markers are archived', LAUNCHER_ON_MAC, () => {
   const r = runLauncher({
-    markers: { 'run_before-power-cut': -900, 'run_reopened-by-macos': 15 },
+    markers: { 'run_before-power-cut': -900, 'run_reopened-by-macos': 78 },
+    bootAgo: 120,
+    running: { startedAgo: 45, log: '00:00:00.200: Crash or unclean shutdown detected\n' },
+  });
+  assert.equal(r.alive, false);
+  assert.deepEqual(r.left, []);
+  assert.deepEqual(Object.keys(r.archived).sort(), ['run_before-power-cut', 'run_reopened-by-macos']);
+  assert.equal(r.opened.length, 1);
+  assert.match(r.out, /dialog-blocked OBS exited and its markers were archived; starting a fresh OBS/);
+  assert.equal(r.status, 0);
+});
+
+test('same-boot crash or extra marker does not allow recovery of a running OBS', LAUNCHER_ON_MAC, () => {
+  const r = runLauncher({
+    markers: { run_crashed: 20, run_current: 78 }, bootAgo: 120,
     running: { startedAgo: 45, log: '00:00:00.200: Crash or unclean shutdown detected\n' },
   });
   assert.equal(r.alive, true);
   assert.deepEqual(r.opened, []);
-  assert.deepEqual(r.left, ['run_before-power-cut', 'run_reopened-by-macos'], 'a running OBS owns the markers; none are moved');
-  assert.match(r.out, /OBS already running \(pid \d+\), leaving it/);
-  assert.match(r.out, /ALERT: OBS \(pid \d+\) is waiting at the Safe Mode dialog .*does not stop or restart OBS/);
+  assert.deepEqual(r.left, ['run_crashed', 'run_current']);
   assert.equal(r.status, 1);
+});
+
+test('a reopened OBS that finished startup is never stopped, even with a preboot marker', LAUNCHER_ON_MAC, () => {
+  const r = runLauncher({
+    markers: { 'run_before-power-cut': -900, 'run_reopened-by-macos': 78 }, bootAgo: 120,
+    running: { startedAgo: 45, log: '00:00:00.200: Crash or unclean shutdown detected\n00:00:03.000: [Safe Mode] Normal launch selected\n00:00:03.100: Current Date/Time: x\n00:00:30.000: ==== Recording Start ===\n' },
+  });
+  assert.equal(r.alive, true);
+  assert.deepEqual(r.opened, []);
+  assert.deepEqual(r.left, ['run_before-power-cut', 'run_reopened-by-macos']);
+  assert.equal(r.status, 0);
 });
 
 test('an OBS opened by hand right after login and recording is left alone with no alert', LAUNCHER_ON_MAC, () => {
