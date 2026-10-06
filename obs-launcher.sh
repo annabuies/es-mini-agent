@@ -159,11 +159,11 @@ recover_reopened_dialog() {
   fi
   # Recheck marker times after exit. A new marker or OBS process means another
   # launch raced us; leave it alone rather than clearing its crash evidence.
-  [[ -z "$(find_obs)" ]] || return 2
+  [[ -z "$(find_obs)" ]] || { alert "another OBS process appeared during recovery; not starting a copy"; return 2; }
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
     m="$(mtime_epoch "$f")"
-    [[ -n "$m" ]] || return 2
+    [[ -n "$m" ]] || { alert "cannot read OBS marker time during recovery; not starting another copy"; return 2; }
     (( m < boot || (m >= started - 2 && m <= started + 15) )) || {
       alert "new OBS crash marker appeared during recovery; leaving markers and not starting another copy"
       return 2
@@ -245,8 +245,9 @@ watch_startup() {
 obs_pid="$(find_obs)"
 if [[ -n "$obs_pid" ]]; then
   # A person may have opened it, or macOS may have reopened it; it may be
-  # recording. Never stop it: only report how its startup went.
-  log "OBS already running (pid $obs_pid), leaving it: $(ps -o args= -p "$obs_pid" 2>/dev/null || true)"
+  # recording. Stop it only if recover_reopened_dialog proves the cold-login
+  # dialog case; otherwise report how its startup went and leave it alone.
+  log "OBS already running (pid $obs_pid), checking startup: $(ps -o args= -p "$obs_pid" 2>/dev/null || true)"
   obs_start="$(start_epoch "$obs_pid")"
   if recover_reopened_dialog "$obs_pid" "$obs_start"; then
     : # Continue to the single launch below.
