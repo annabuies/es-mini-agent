@@ -21,7 +21,8 @@ alert() { log "ALERT: $*"; printf '%s [es-obs-launcher] ALERT: %s\n' "$(date '+%
 # crash before the restart) are moved to an archive, never deleted, and OBS is
 # started once. Markers written since this boot mean OBS crashed or was
 # force-quit during this boot: they are left, so OBS shows its dialog. The
-# launcher never stops a running OBS.
+# launcher only stops a running OBS when a cold-login macOS relaunch is proven
+# stuck at the dialog. An OBS that finished startup is never stopped.
 OBS_CONFIG_DIR="$HOME/Library/Application Support/obs-studio"
 SENTINEL_DIR="$OBS_CONFIG_DIR/.sentinel"
 OBS_LOG_DIR="$OBS_CONFIG_DIR/logs"
@@ -110,6 +111,83 @@ archive_previous_boot_markers() {
   (( moved == 0 )) || log "archived $moved OBS crash marker(s) to $dest"
 }
 
+# macOS may reopen OBS before this LaunchAgent. Recover only when an old marker
+# caused that new process to wait at the dialog. Its own marker is archived only
+# after the process exits; any other marker from this boot blocks recovery.
+recover_reopened_dialog() {
+  local pid="$1" started="$2" boot login now f m old=0 own=0 other=0 file contents i
+  boot="$(boot_epoch)"
+  login="$(login_epoch)"
+  now="$(date +%s)"
+  [[ -n "$boot" && -n "$login" && -n "$started" ]] || return 1
+  (( now >= login && now - login <= LOGIN_WINDOW_S && started >= boot && started <= now )) || return 1
+
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    m="$(mtime_epoch "$f")"
+    [[ -n "$m" ]] || return 1
+    if (( m < boot )); then
+      old=$((old + 1))
+    elif (( m >= started - 2 && m <= started + 15 )); then
+      own=$((own + 1))
+    else
+      other=$((other + 1))
+    fi
+  done < <(markers)
+  (( old > 0 && own == 1 && other == 0 )) || return 1
+
+  # Check twice so a person choosing Normal Mode while we inspect the log wins.
+  for i in 1 2; do
+    [[ "$(find_obs)" == "$pid" && "$(start_epoch "$pid")" == "$started" ]] || return 1
+    file="$(newest_log_since "$((started - 2))")"
+    [[ -n "$file" ]] || return 1
+    contents="$(cat "$file" 2>/dev/null || true)"
+    [[ "$contents" == *"Crash or unclean shutdown detected"* ]] || return 1
+    [[ "$contents" != *"Current Date/Time:"* && "$contents" != *"launch selected"* ]] || return 1
+    (( i == 2 )) || sleep 2
+  done
+
+  log "OBS (pid $pid) is blocked at the Safe Mode dialog during cold login with a preboot marker; requesting a clean stop"
+  kill -TERM "$pid" 2>/dev/null || { alert "could not stop dialog-blocked OBS (pid $pid)"; return 2; }
+  for i in 1 2 3 4 5; do
+    [[ "$(find_obs)" == "$pid" ]] || break
+    sleep 2
+  done
+  if [[ "$(find_obs)" == "$pid" ]]; then
+    alert "dialog-blocked OBS (pid $pid) did not exit after TERM; leaving its markers and not starting another copy"
+    return 2
+  fi
+  # Recheck marker times after exit. A new marker or OBS process means another
+  # launch raced us; leave it alone rather than clearing its crash evidence.
+  [[ -z "$(find_obs)" ]] || { alert "another OBS process appeared during recovery; not starting a copy"; return 2; }
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    m="$(mtime_epoch "$f")"
+    [[ -n "$m" ]] || { alert "cannot read OBS marker time during recovery; not starting another copy"; return 2; }
+    (( m < boot || (m >= started - 2 && m <= started + 15) )) || {
+      alert "new OBS crash marker appeared during recovery; leaving markers and not starting another copy"
+      return 2
+    }
+  done < <(markers)
+  # The process has exited, so both its marker and the preboot marker can be
+  # archived. The same archive operation preserves timestamps and provenance.
+  archive_previous_boot_markers
+  local dest="$ARCHIVE_DIR/$(date '+%Y%m%d-%H%M%S')-reopened"
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    m="$(mtime_epoch "$f")"
+    [[ -n "$m" ]] && (( m >= started - 2 && m <= started + 15 )) || continue
+    mkdir -p "$dest" && mv -n "$f" "$dest/" || {
+      alert "could not archive reopened OBS marker ${f##*/}; not starting another copy"
+      return 2
+    }
+    log "archived reopened OBS marker ${f##*/} to $dest"
+  done < <(markers)
+  [[ -z "$(markers)" ]] || { alert "OBS markers remain after recovery; not starting another copy"; return 2; }
+  log "dialog-blocked OBS exited and its markers were archived; starting a fresh OBS"
+  return 0
+}
+
 # Newest OBS log written at or after $1 (epoch seconds). OBS names its logs
 # "YYYY-MM-DD HH-MM-SS.txt", so the last one in C order is the newest.
 newest_log_since() {
@@ -167,11 +245,18 @@ watch_startup() {
 obs_pid="$(find_obs)"
 if [[ -n "$obs_pid" ]]; then
   # A person may have opened it, or macOS may have reopened it; it may be
-  # recording. Never stop it: only report how its startup went.
-  log "OBS already running (pid $obs_pid), leaving it: $(ps -o args= -p "$obs_pid" 2>/dev/null || true)"
+  # recording. Stop it only if recover_reopened_dialog proves the cold-login
+  # dialog case; otherwise report how its startup went and leave it alone.
+  log "OBS already running (pid $obs_pid), checking startup: $(ps -o args= -p "$obs_pid" 2>/dev/null || true)"
   obs_start="$(start_epoch "$obs_pid")"
-  watch_startup "$(( ${obs_start:-$(date +%s)} - 2 ))" "OBS (pid $obs_pid)" || exit 1
-  exit 0
+  if recover_reopened_dialog "$obs_pid" "$obs_start"; then
+    : # Continue to the single launch below.
+  else
+    recovery_status=$?
+    (( recovery_status == 1 )) || exit 1
+    watch_startup "$(( ${obs_start:-$(date +%s)} - 2 ))" "OBS (pid $obs_pid)" || exit 1
+    exit 0
+  fi
 fi
 
 now="$(date +%s)"
