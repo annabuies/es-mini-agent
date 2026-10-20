@@ -1122,6 +1122,43 @@ test('DELETE_AFTER_UPLOAD: camera and master originals leave the Mini only after
 // 700 ms of meters (14 frames: enough to tell two mics carry one signal), in-take every 0.4 s.
 const FAST_AUDIO = { AUDIO_METER_WINDOW_MS: '700', AUDIO_TAKE_EVAL_MS: '400' };
 
+test('post-take audio: a pending Stop later becomes Mic 1 silent on status for the same take', { timeout: 20000 }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-late-audio-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const master = path.join(dir, 'master', 'master.mp4');
+  for (const source of ['cam1', 'cam2', 'cam3', 'master']) {
+    fs.mkdirSync(path.join(dir, source), { recursive: true });
+    fs.writeFileSync(path.join(dir, source, source === 'master' ? 'master.mp4' : source + '.mp4'), CAMERA_FILE_BYTES);
+  }
+  const gate = path.join(dir, 'finish-analysis');
+  const probe = path.join(dir, 'ffprobe');
+  const decoder = path.join(dir, 'ffmpeg');
+  fs.writeFileSync(probe, '#!' + process.execPath + '\n' +
+    `if(process.argv.includes('-select_streams')) process.stdout.write(JSON.stringify({streams:[{index:0}]})); else require(${JSON.stringify(path.join(__dirname, 'fake-ffprobe.js'))});\n`, { mode: 0o755 });
+  // Complete only when the test releases it, so Stop is deterministically pending.
+  fs.writeFileSync(decoder, '#!' + process.execPath + '\n' +
+    `const fs=require('node:fs'); const t=setInterval(()=>{if(fs.existsSync(${JSON.stringify(gate)})){clearInterval(t);process.stdout.write(Buffer.alloc(48000*2*4));}},20);\n`, { mode: 0o755 });
+  const agent = await startAgent(t, { recordDir: dir, obs: { masterOutputPath: master },
+    env: { ...FAST_AUDIO, FFPROBE_BIN: probe, FFMPEG_BIN: decoder, AUDIO_HEALTH_WAIT_MS: '25', STOP_SETTLE_MS: '25' } });
+  assert.equal((await postAgent(agent.agentPort, 'start')).recording, true);
+  touchTakeFiles(dir);
+  const stop = await postAgent(agent.agentPort, 'stop');
+  assert.equal(stop.saved, true, 'the pending mic check never delays saving indefinitely');
+  assert.equal(stop.audio_health.pending, true);
+  const pending = await postAgent(agent.agentPort, 'status');
+  assert.equal(pending.last_take.audio_health.pending, true);
+  assert.equal(pending.last_take.recorded_at, stop.recorded_at);
+  fs.writeFileSync(gate, 'done');
+  await waitFor(async () => (await postAgent(agent.agentPort, 'status')).last_take.audio_health.level === 'fail', 5000);
+  const finished = await postAgent(agent.agentPort, 'status');
+  assert.equal(finished.last_take.recorded_at, stop.recorded_at);
+  assert.equal(finished.last_take.saved, true);
+  assert.equal(finished.last_take.audio_health.pending, undefined);
+  assert.equal(finished.last_take.audio_health.tracks[0].label, 'Mic 1');
+  assert.equal(finished.last_take.audio_health.tracks[0].silent, true);
+  assert.deepEqual(finished.last_take.audio_health.tracks[0].codes, ['mic_silent']);
+});
+
 function md5File(file) {
   return crypto.createHash('md5').update(fs.readFileSync(file)).digest('hex');
 }
