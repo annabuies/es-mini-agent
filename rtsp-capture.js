@@ -57,6 +57,12 @@ const WRITING_WINDOW_MS = 8000;
 // track makes the muxer buffer all video in memory), logged and reported.
 const STALL_WARN_MS = 12000;
 const WATCH_INTERVAL_MS = 1000;
+// Capture timing for the watch copy's audio sync (Build 42). Each -progress line
+// says how much video has been muxed (out_time); "now - out_time" is when the
+// file's t=0 arrived here, plus however late that line was read. The smallest of
+// the first ANCHOR_SAMPLES (~10 s at 0.5 s) is the estimate: a late line only
+// adds, and later samples would add the camera-vs-Mini clock drift.
+const ANCHOR_SAMPLES = 20;
 const SAFE_HOST_RE = /^[A-Za-z0-9.-]+$/;
 
 function isRtspCamera(camera) {
@@ -169,7 +175,13 @@ function createRtspCapture(options) {
     if (key === 'out_time_us' || key === 'frame') {
       const prev = seg.progress[key];
       seg.progress[key] = value;
-      if (value > 0 && (prev === undefined || value > prev)) onVideo(take, seg, Date.now());
+      const now = Date.now();
+      if (value > 0 && (prev === undefined || value > prev)) onVideo(take, seg, now);
+      if (key === 'out_time_us' && value > 0 && seg.anchorSamples < ANCHOR_SAMPLES) {
+        const anchor = now - value / 1000;
+        seg.anchorSamples += 1;
+        if (seg.anchorMs === null || anchor < seg.anchorMs) seg.anchorMs = anchor;
+      }
     }
   }
 
@@ -188,7 +200,7 @@ function createRtspCapture(options) {
     const seg = {
       index: take.segmentIndex, cause: cause || 'start', child, partPath,
       exited: false, code: null, signal: null, stderr: [], startedAt: now, exitedAt: null,
-      firstVideoAt: null, lastVideoAt: null, progress: {},
+      firstVideoAt: null, lastVideoAt: null, progress: {}, anchorMs: null, anchorSamples: 0,
       lastSize: 0, lastGrowthAt: now, stalled: false,
       // Lost time is measured from the last video the previous segment muxed
       // (a reconnect) or from the resume itself (a pause is intentional). A
@@ -373,7 +385,7 @@ function createRtspCapture(options) {
     watch(take);
     const videoAfterMs = out.seg.firstVideoAt - out.seg.startedAt;
     log(source + ' recording ' + redactUrl(url) + ' -> ' + path.basename(out.seg.partPath) + ' (video after ' + videoAfterMs + ' ms)');
-    return { ok: true, video_after_ms: videoAfterMs };
+    return { ok: true, video_after_ms: videoAfterMs, first_video_at: new Date(out.seg.firstVideoAt).toISOString() };
   }
 
   async function pause(source) {
@@ -476,6 +488,17 @@ function createRtspCapture(options) {
       joined = { ok: false, reason: 'rtsp_join_failed', detail: e && (e.message || String(e)) };
     }
     const summary = { segments: take.segments.length, restarts: take.restarts, gap_ms: Math.round(take.gapMs), resume_wait_ms: Math.round(take.resumeWaitMs), stalls: take.stalls };
+    // When the file's t=0 reached the Mini (see ANCHOR_SAMPLES); falls back to
+    // when video was first seen (coarser: progress lines come every 0.5 s).
+    const first = take.segments[0];
+    if (first) {
+      const anchor = first.anchorMs !== null ? first.anchorMs : first.firstVideoAt;
+      if (anchor !== null) {
+        summary.first_packet_ms = Math.round(anchor);
+        summary.first_packet_at = new Date(Math.round(anchor)).toISOString();
+        summary.first_packet_basis = first.anchorMs !== null ? 'progress' : 'first_video';
+      }
+    }
     if (!joined.ok) {
       const kept = joined.keptParts && joined.keptParts[0];
       warn(source + ' stop: ' + joined.reason + (joined.detail ? ' ' + joined.detail : ''));

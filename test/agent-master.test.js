@@ -21,6 +21,15 @@ const SOURCE_RECORD_START = {
   cameras: { cam1: SOURCE_RECORD_CAMERA, cam2: SOURCE_RECORD_CAMERA, cam3: SOURCE_RECORD_CAMERA },
 };
 
+// Since 2026.10.20-1 start also carries the mic check (`audio`, warn only); the
+// camera/session fields are compared without it, and audio is checked on its own.
+function withoutAudio(result) {
+  const out = Object.assign({}, result);
+  assert.ok(out.audio && typeof out.audio.level === 'string', 'start carries the mic check');
+  delete out.audio;
+  return out;
+}
+
 // OBS writes a take's files during the take; the stop path ignores anything older.
 function touchTakeFiles(recordDir) {
   const now = new Date();
@@ -73,12 +82,84 @@ function frame(payload) {
   return Buffer.concat([header, text]);
 }
 
+// The studio as OBS reports it to the mic check. options.audio (mutable, so a test
+// can break and then fix it mid-run): meters: { 'Mic N': 'ok'|'zero'|'low'|'frozen'|
+// 'absent'|'copy:Mic M' }, metersOff (no meter events at all), muted: { 'Mic N': true },
+// trackOff: { 'Mic N': true } (its track N unticked), recTracks ('15' = tracks 1-4),
+// evo (the EVO 8 in the device list), missing: ['Mic N'] (no such input).
+const MICS = ['Mic 1', 'Mic 2', 'Mic 3', 'Mic 4'];
+const METERS_BIT = 1 << 16;
+const OUTPUTS_BIT = 1 << 6;
+const EVO_DEVICE = 'AppleUSBAudioEngine:Audient:EVO8:2000000:1';
+
+function healthyAudio() {
+  return { meters: {}, metersOff: false, muted: {}, trackOff: {}, recTracks: '15', evo: true, missing: [] };
+}
+
+function meterInputs(audio, tick) {
+  const levels = {};
+  MICS.forEach((name, i) => {
+    // Every mic moves on its own (distinct phase and depth): -60...-40 dBFS.
+    const db = -50 + 10 * Math.sin(tick * (0.7 + i * 0.37) + i);
+    const mag = Math.pow(10, db / 20);
+    levels[name] = [[mag, mag * 1.8, mag * 1.8], [mag * 0.98, mag * 1.7, mag * 1.7]];
+  });
+  const out = [];
+  for (const name of MICS) {
+    const mode = (audio.meters && audio.meters[name]) || 'ok';
+    if (mode === 'absent' || (audio.missing || []).includes(name)) continue;
+    let channels = levels[name];
+    if (mode === 'zero' || (audio.muted && audio.muted[name])) channels = [[0, 0, 0], [0, 0, 0]];
+    else if (mode === 'low') channels = channels.map((ch) => ch.map((v) => v * 1e-3));
+    else if (mode === 'frozen') channels = [[0.01, 0.02, 0.02], [0.01, 0.02, 0.02]];
+    else if (mode.startsWith('copy:')) channels = levels[mode.slice(5)].map((ch) => ch.map((v) => v * 0.5));
+    out.push({ inputName: name, inputLevelsMul: channels });
+  }
+  out.push({ inputName: 'Desktop Audio', inputLevelsMul: [[0, 0, 0], [0, 0, 0]] });
+  return out;
+}
+
+function audioReply(type, data, audio) {
+  const name = data && data.inputName;
+  if (type === 'GetInputList') {
+    return { inputs: MICS.filter((m) => !(audio.missing || []).includes(m)).map((inputName) => ({ inputName, inputKind: 'coreaudio_input_capture' })).concat([{ inputName: 'cam1', inputKind: 'ndi_source' }]) };
+  }
+  if (type === 'GetInputMute') return { inputMuted: !!(audio.muted && audio.muted[name]) };
+  if (type === 'GetInputVolume') return { inputVolumeMul: 1, inputVolumeDb: 0 };
+  if (type === 'GetInputAudioTracks') {
+    const n = Number(String(name).slice(-1));
+    const tracks = {};
+    for (let i = 1; i <= 6; i += 1) tracks[String(i)] = i === n && !(audio.trackOff && audio.trackOff[name]);
+    return { inputAudioTracks: tracks };
+  }
+  if (type === 'GetProfileParameter') {
+    if (data.parameterCategory === 'Output' && data.parameterName === 'Mode') return { parameterValue: 'Advanced', defaultParameterValue: 'Simple' };
+    if (data.parameterCategory === 'AdvOut' && data.parameterName === 'RecTracks') return { parameterValue: audio.recTracks, defaultParameterValue: '1' };
+    return { parameterValue: null };
+  }
+  if (type === 'GetInputSettings') return { inputKind: 'coreaudio_input_capture', inputSettings: { device_id: audio.evo ? EVO_DEVICE : 'loopback-evo-1' } };
+  if (type === 'GetInputPropertiesListPropertyItems') {
+    const items = [{ itemName: 'Default', itemValue: 'default', itemEnabled: true }, { itemName: 'EVO Ch1', itemValue: 'loopback-evo-1', itemEnabled: true }];
+    if (audio.evo) items.push({ itemName: 'EVO8', itemValue: EVO_DEVICE, itemEnabled: true });
+    return { propertyItems: items };
+  }
+  return null;
+}
+
 function createFakeObs(requests, options = {}) {
   const sockets = new Set();
   let outputActive = !!options.outputActive;
+  if (!options.audio) options.audio = healthyAudio();
   const server = net.createServer((socket) => {
     sockets.add(socket);
-    socket.on('close', () => sockets.delete(socket));
+    let subs = 0;
+    let meterTimer = null;
+    let tick = 0;
+    socket.on('close', () => { sockets.delete(socket); clearInterval(meterTimer); });
+    socket.on('error', () => clearInterval(meterTimer));
+    socket.esEvent = (eventType, eventData, bit) => {
+      if ((subs & bit) && !socket.destroyed) socket.write(frame({ op: 5, d: { eventType, eventIntent: bit, eventData } }));
+    };
     let handshake = false;
     let buffer = Buffer.alloc(0);
     socket.on('data', (chunk) => {
@@ -108,15 +189,31 @@ function createFakeObs(requests, options = {}) {
         const mask = buffer.subarray(cursor, cursor + 4);
         const body = Buffer.from(buffer.subarray(offset, offset + size));
         for (let i = 0; i < body.length; i += 1) body[i] ^= mask[i % 4];
+        const opcode = buffer[0] & 0x0f;
         buffer = buffer.subarray(offset + size);
+        // A client closing its socket (the mic check's short-lived client does) sends a close frame.
+        if (opcode === 0x8) { clearInterval(meterTimer); socket.end(); return; }
+        if (opcode !== 0x1) continue;
         const packet = JSON.parse(body.toString('utf8'));
         if (packet.op === 1) {
+          subs = Number(packet.d && packet.d.eventSubscriptions) || 0;
           socket.write(frame({ op: 2, d: { negotiatedRpcVersion: 1 } }));
+          if (subs & METERS_BIT) {
+            meterTimer = setInterval(() => {
+              tick += 1;
+              if (!options.audio.metersOff) socket.esEvent('InputVolumeMeters', { inputs: meterInputs(options.audio, tick) }, METERS_BIT);
+            }, 50);
+          }
           continue;
         }
         if (packet.op !== 6) continue;
-        requests.push({ type: packet.d.requestType, data: packet.d.requestData || {} });
+        // The mic check's own client (meter subscription) is logged apart, so the
+        // shared client's request sequences stay exactly as before.
+        const log = (subs & METERS_BIT) ? (options.audioRequests || []) : requests;
+        log.push({ type: packet.d.requestType, data: packet.d.requestData || {} });
         let reply = { result: true, responseData: {} };
+        const audioData = audioReply(packet.d.requestType, packet.d.requestData || {}, options.audio);
+        if (audioData) reply.responseData = audioData;
         if (packet.d.requestType === 'CallVendorRequest') {
           reply.responseData = { responseData: { success: true } };
         } else if (packet.d.requestType === 'GetRecordStatus') {
@@ -125,6 +222,8 @@ function createFakeObs(requests, options = {}) {
           reply = { result: false, comment: 'start_record_rejected', responseData: {} };
         } else if (packet.d.requestType === 'StartRecord') {
           outputActive = true;
+          // Like OBS: the output STARTED event follows the request, to Outputs subscribers.
+          setTimeout(() => { for (const s2 of sockets) s2.esEvent('RecordStateChanged', { outputActive: true, outputState: 'OBS_WEBSOCKET_OUTPUT_STARTED', outputPath: null }, OUTPUTS_BIT); }, options.recordStartedDelayMs || 15);
         } else if (packet.d.requestType === 'StopRecord') {
           reply.responseData = { outputPath: options.masterOutputPath || '' };
           outputActive = false;
@@ -145,6 +244,7 @@ function createFakeObs(requests, options = {}) {
     });
   });
   server._testSockets = sockets;
+  server.esOptions = options;
   return server;
 }
 
@@ -250,8 +350,8 @@ async function startAgent(t, options = {}) {
   });
   await waitFor(async () => {
     try { return (await fetch(`http://127.0.0.1:${agentPort}/health`)).ok; } catch (_) { return false; }
-  });
-  return { agentPort, obsRequests, relayRequests, recordDir, stderr: () => stderr };
+  }, 10000);
+  return { agentPort, obsRequests, relayRequests, recordDir, stderr: () => stderr, obsOptions: obsServer.esOptions };
 }
 
 test('heartbeat is sent from cached state on the first poll only once per minute and old poll responses still work', { timeout: 8000 }, async (t) => {
@@ -261,7 +361,7 @@ test('heartbeat is sent from cached state on the first poll only once per minute
   const [first, second] = polls;
 
   assert.equal(first.searchParams.get('hb'), '1');
-  assert.equal(first.searchParams.get('v'), '2026.10.03-1');
+  assert.equal(first.searchParams.get('v'), '2026.10.20-1');
   assert.equal(first.searchParams.get('c'), 'unknown');
   const heartbeatState = JSON.parse(Buffer.from(first.searchParams.get('state'), 'base64url').toString('utf8'));
   assert.deepEqual(heartbeatState, {
@@ -271,6 +371,8 @@ test('heartbeat is sent from cached state on the first poll only once per minute
     disk_total_bytes: heartbeatState.disk_total_bytes,
     disk_checked_at: heartbeatState.disk_checked_at,
     power: null,
+    // The first mic check runs 2 s after boot, after this first heartbeat.
+    audio: null,
   });
   assert.equal(typeof heartbeatState.disk_free_bytes, 'number');
   assert.equal(typeof heartbeatState.disk_total_bytes, 'number');
@@ -414,7 +516,7 @@ test('smoke: fake relay and OBS start the three camera recordings', { timeout: 8
   await waitFor(async () => {
     try { return (await fetch(`http://127.0.0.1:${agentPort}/health`)).ok; } catch (_) { return false; }
   });
-  assert.deepEqual(await postAgent(agentPort, 'start'), SOURCE_RECORD_START);
+  assert.deepEqual(withoutAudio(await postAgent(agentPort, 'start')), SOURCE_RECORD_START);
   await waitFor(() => obsRequests.length === 3);
   assert.deepEqual(obsRequests.map((request) => request.data.requestData), [
     { source: 'cam1' }, { source: 'cam2' }, { source: 'cam3' },
@@ -423,7 +525,7 @@ test('smoke: fake relay and OBS start the three camera recordings', { timeout: 8
 
 test('master start follows three camera starts', { timeout: 8000 }, async (t) => {
   const agent = await startAgent(t);
-  assert.deepEqual(await postAgent(agent.agentPort, 'start'), SOURCE_RECORD_START);
+  assert.deepEqual(withoutAudio(await postAgent(agent.agentPort, 'start')), SOURCE_RECORD_START);
   await waitFor(() => agent.obsRequests.length === 5);
   assert.deepEqual(agent.obsRequests.map((request) => request.type), [
     'CallVendorRequest', 'CallVendorRequest', 'CallVendorRequest', 'GetRecordStatus', 'StartRecord',
@@ -516,7 +618,7 @@ test('stop enqueues three camera files plus the returned master output path', { 
 
 test('MASTER_RECORD=0 preserves the camera-only request sequence', { timeout: 8000 }, async (t) => {
   const agent = await startAgent(t, { masterRecord: false });
-  assert.deepEqual(await postAgent(agent.agentPort, 'start'), SOURCE_RECORD_START);
+  assert.deepEqual(withoutAudio(await postAgent(agent.agentPort, 'start')), SOURCE_RECORD_START);
   await waitFor(() => agent.obsRequests.length === 3);
   assert.deepEqual(agent.obsRequests.map((request) => request.type), [
     'CallVendorRequest', 'CallVendorRequest', 'CallVendorRequest',
@@ -554,7 +656,8 @@ test('master uploads retain their recording key and skip proxy generation', { ti
   });
   await waitFor(() => uploads.length === 1, 5000);
   assert.equal(uploads[0].key, 'recordings/bench-1/master/master.mp4');
-  assert.deepEqual(uploads[0].webhookExtra, { kind: 'recording', building_id: 'bench-1', source: 'master', session_ref: null });
+  // Webhook kind is "video" for camera/master/watch files and "audio" for mic/mix (Build 42 contract; was "recording").
+  assert.deepEqual(uploads[0].webhookExtra, { kind: 'video', building_id: 'bench-1', source: 'master', session_ref: null });
 });
 
 test('session_ref is reported while recording and echoed to every stop upload', { timeout: 16000 }, async (t) => {
@@ -645,14 +748,19 @@ test('master confirmation splits four stream-copy mic files and echoes session_r
     restoreEnv('FAKE_AUDIO_STREAMS', previousStreams);
   });
   queue.enqueue({ filePath, source: 'master', sessionRef: 'session_123' });
-  await waitFor(() => uploads.length === 5, 18000);
+  await waitFor(() => uploads.length === 6, 18000);
   await waitFor(() => queue.status().active === null && queue.status().queued === 0, 2000);
+  // Since 2026.10.20-1 the take's mix also uploads, under audio/<building>/ (Build 42 contract).
   assert.deepEqual(uploads.map((input) => input.key).sort(), [
+    'audio/bench-1/master-mix.m4a',
     'recordings/bench-1/audio/master-mic1.m4a', 'recordings/bench-1/audio/master-mic2.m4a',
     'recordings/bench-1/audio/master-mic3.m4a', 'recordings/bench-1/audio/master-mic4.m4a',
     'recordings/bench-1/master/master.mp4',
   ]);
-  assert.deepEqual(uploads.filter((input) => input.webhookExtra.kind === 'audio').map((input) => input.webhookExtra.session_ref), ['session_123', 'session_123', 'session_123', 'session_123']);
+  assert.deepEqual(uploads.filter((input) => input.webhookExtra.kind === 'audio').map((input) => input.webhookExtra.session_ref), ['session_123', 'session_123', 'session_123', 'session_123', 'session_123']);
+  assert.deepEqual(uploads.filter((input) => input.webhookExtra.kind === 'audio').map((input) => [input.webhookExtra.source, input.webhookExtra.rendition]).sort(),
+    [['mic1', 'mic'], ['mic2', 'mic'], ['mic3', 'mic'], ['mic4', 'mic'], ['mix', 'mix']]);
+  assert.equal(fs.existsSync(path.join(tempDir, 'master-mix.m4a')), false, 'the mix file leaves the Mini once uploaded');
   const invocations = fs.readFileSync(logPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
   assert.equal(invocations.filter((args) => args.includes('-show_streams')).length, 1);
   assert.equal(invocations.filter((args) => args.includes('-c') && args.includes('copy')).length, 4);
@@ -700,8 +808,9 @@ test('a two-stream master uploads two audio jobs and logs a warning', { timeout:
     console.warn = previousWarn;
   });
   queue.enqueue({ filePath, source: 'master' });
-  await waitFor(() => uploads.length === 3 && queue.status().active === null && queue.status().queued === 0, 8000);
+  await waitFor(() => uploads.length === 4 && queue.status().active === null && queue.status().queued === 0, 8000);
   assert.deepEqual(uploads.map((input) => input.key).sort(), [
+    'audio/bench-1/master-two-stream-mix.m4a',
     'recordings/bench-1/audio/master-two-stream-mic1.m4a',
     'recordings/bench-1/audio/master-two-stream-mic2.m4a',
     'recordings/bench-1/master/master-two-stream.mp4',
@@ -1006,4 +1115,158 @@ test('DELETE_AFTER_UPLOAD: camera and master originals leave the Mini only after
   queue.enqueue({ filePath: keptPath, source: 'cam2' });
   await new Promise((resolve) => setTimeout(resolve, 500));
   assert.ok(fs.existsSync(keptPath), 'a failed upload keeps the file');
+});
+
+// ---------- Build 42: mic check (A1), post-take audio health (A3), timing + watch copies (B1-B3) ----------
+
+// 700 ms of meters (14 frames: enough to tell two mics carry one signal), in-take every 0.4 s.
+const FAST_AUDIO = { AUDIO_METER_WINDOW_MS: '700', AUDIO_TAKE_EVAL_MS: '400' };
+
+function md5File(file) {
+  return crypto.createHash('md5').update(fs.readFileSync(file)).digest('hex');
+}
+
+test('audio_check: every mic fault is reported, warn only, and each recovers once fixed', { timeout: 60000 }, async (t) => {
+  const audioRequests = [];
+  const agent = await startAgent(t, { obs: { audioRequests }, env: FAST_AUDIO });
+  const audio = agent.obsOptions.audio;
+  const check = async () => (await postAgent(agent.agentPort, 'audio_check')).audio;
+  const healthy = await check();
+  assert.equal(healthy.level, 'ok', JSON.stringify(healthy));
+  assert.equal(healthy.evo_present, true);
+  assert.deepEqual(Object.keys(healthy.mics), ['Mic 1', 'Mic 2', 'Mic 3', 'Mic 4']);
+  assert.deepEqual(healthy.mics['Mic 1'], { muted: false, peak_db: healthy.mics['Mic 1'].peak_db, frozen: false, recorded: true, codes: [] });
+  const faults = [
+    ['EVO unplugged', () => { audio.evo = false; }, () => { audio.evo = true; }, 'fail', ['evo_missing'], null],
+    ['Mic 2 muted', () => { audio.muted = { 'Mic 2': true }; }, () => { audio.muted = {}; }, 'fail', ['mic_muted'], 'Mic 2'],
+    ['Mic 1 digital zero', () => { audio.meters = { 'Mic 1': 'zero' }; }, () => { audio.meters = {}; }, 'fail', ['mic_silent'], 'Mic 1'],
+    ['Mic 1 near-dead', () => { audio.meters = { 'Mic 1': 'low' }; }, () => { audio.meters = {}; }, 'warn', ['mic_silent'], 'Mic 1'],
+    ['Mic 3 frozen', () => { audio.meters = { 'Mic 3': 'frozen' }; }, () => { audio.meters = {}; }, 'fail', ['mics_frozen'], 'Mic 3'],
+    ['Mic 4 no meter', () => { audio.meters = { 'Mic 4': 'absent' }; }, () => { audio.meters = {}; }, 'fail', ['mics_frozen'], 'Mic 4'],
+    ['Mic 2 = Mic 1', () => { audio.meters = { 'Mic 2': 'copy:Mic 1' }; }, () => { audio.meters = {}; }, 'fail', ['mics_identical'], 'Mic 2'],
+    ['Mic 3 off its track', () => { audio.trackOff = { 'Mic 3': true }; }, () => { audio.trackOff = {}; }, 'fail', ['mic_not_recorded'], 'Mic 3'],
+    ['track 4 not recorded', () => { audio.recTracks = '7'; }, () => { audio.recTracks = '15'; }, 'fail', ['mic_not_recorded'], 'Mic 4'],
+    ['Mic 4 deleted', () => { audio.missing = ['Mic 4']; }, () => { audio.missing = []; }, 'fail', ['mic_not_recorded'], 'Mic 4'],
+    ['no meters at all', () => { audio.metersOff = true; }, () => { audio.metersOff = false; }, 'warn', ['meters_unavailable'], null],
+  ];
+  for (const [name, breakIt, fixIt, level, codes, mic] of faults) {
+    breakIt();
+    const bad = await check();
+    assert.equal(bad.level, level, name + ': ' + JSON.stringify(bad));
+    assert.deepEqual(bad.codes, codes, name);
+    if (mic) assert.deepEqual(bad.mics[mic].codes.filter((c) => codes.includes(c)), codes, name + ' on ' + mic);
+    fixIt();
+    const fixed = await check();
+    assert.equal(fixed.level, 'ok', name + ' recovers: ' + JSON.stringify(fixed));
+  }
+  // The check used its own client: none of it reached the shared client's request log.
+  assert.equal(agent.obsRequests.filter((r) => /^Get(Input|Profile)/.test(r.type)).length, 0);
+  assert.ok(audioRequests.some((r) => r.type === 'GetProfileParameter' && r.data.parameterName === 'RecTracks'));
+  assert.ok(audioRequests.some((r) => r.type === 'GetInputPropertiesListPropertyItems'));
+  assert.match(agent.stderr(), /\[audio\] WARN mic check \(op\) fail: evo_missing/);
+});
+
+test('a failing mic check never refuses a take: start records and carries the warning; status raises audio_alert, which clears when fixed', { timeout: 60000 }, async (t) => {
+  const agent = await startAgent(t, { env: FAST_AUDIO });
+  agent.obsOptions.audio.meters = { 'Mic 1': 'zero' };
+  agent.obsOptions.audio.evo = false;
+  assert.equal((await postAgent(agent.agentPort, 'audio_check')).audio.level, 'fail');
+  const started = await postAgent(agent.agentPort, 'start', { session_ref: 'sess_a1' });
+  assert.equal(started.ok, true, 'warn only: the take starts');
+  assert.equal(started.recording, true);
+  assert.equal(started.audio.level, 'fail');
+  assert.deepEqual(started.audio.codes, ['evo_missing', 'mic_silent']);
+  assert.match(agent.stderr(), /\[take\] WARN recording started with mic check fail: evo_missing,mic_silent \(warn only, take not refused\)/);
+  await waitFor(async () => {
+    const s = await postAgent(agent.agentPort, 'status');
+    return s.recording && s.audio_alert && s.audio_alert.level === 'fail';
+  }, 8000);
+  const during = await postAgent(agent.agentPort, 'status');
+  assert.deepEqual(during.audio_alert.mics['Mic 1'].codes, ['mic_silent']);
+  // Robbie plugs the EVO back in and fixes Mic 1 mid-take.
+  agent.obsOptions.audio.meters = {};
+  agent.obsOptions.audio.evo = true;
+  await waitFor(async () => (await postAgent(agent.agentPort, 'status')).audio_alert.level === 'ok', 8000);
+  const stopped = await postAgent(agent.agentPort, 'stop');
+  assert.equal(stopped.audio_alert.level, 'ok');
+  // MASTER_RECORD=1 by default: the take's timing comes from OBS's own STARTED event.
+  assert.equal(stopped.timing.obs_start_basis, 'record_started_event');
+  assert.match(stopped.timing.obs_start_at, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
+  assert.ok(Date.parse(stopped.timing.obs_start_at) >= Date.parse(stopped.timing.obs_start_requested_at));
+  assert.deepEqual(Object.keys(stopped.timing.cameras), ['cam1', 'cam2', 'cam3']);
+  for (const cam of Object.values(stopped.timing.cameras)) {
+    assert.equal(cam.basis, 'record_start');
+    assert.ok(cam.offset_s > -1 && cam.offset_s < 5, 'Source Record offset ' + cam.offset_s);
+  }
+  assert.equal(stopped.recorded_at, stopped.timing.obs_start_at);
+  const idle = await postAgent(agent.agentPort, 'status');
+  assert.equal(idle.audio_alert, undefined, 'audio_alert only while recording');
+  assert.equal(idle.last_take.recorded_at, stopped.recorded_at);
+});
+
+test('heartbeat carries the cached mic check (the contract audio block), from no I/O on the poll path', { timeout: 20000 }, async (t) => {
+  const agent = await startAgent(t, { env: Object.assign({ POLL_IDLE_INTERVAL_MS: '3000' }, FAST_AUDIO), obs: { audio: Object.assign(healthyAudio(), { meters: { 'Mic 3': 'zero' } }) } });
+  await waitFor(() => agent.relayRequests.some((url) => url.searchParams.get('hb') === '1'), 10000);
+  const first = agent.relayRequests.find((url) => url.searchParams.get('hb') === '1');
+  const hb = JSON.parse(Buffer.from(first.searchParams.get('state'), 'base64url').toString('utf8'));
+  assert.equal(hb.audio.level, 'fail');
+  assert.deepEqual(hb.audio.codes, ['mic_silent']);
+  assert.equal(hb.audio.evo_present, true);
+  assert.match(hb.audio.checked_at, /^2026-|^20\d\d-/);
+  assert.deepEqual(Object.keys(hb.audio.mics['Mic 3']).sort(), ['codes', 'frozen', 'muted', 'peak_db', 'recorded']);
+  assert.deepEqual(hb.audio.mics['Mic 3'].codes, ['mic_silent']);
+  assert.ok(Buffer.byteLength(JSON.stringify(hb)) < 1024, 'heartbeat stays under 1 KiB: ' + Buffer.byteLength(JSON.stringify(hb)));
+});
+
+test('an RTSP take: stop reports timing and offsets; the watch copy is made with that offset (sign checked), registered via the webhook, originals byte-identical', { timeout: 90000 }, async (t) => {
+  const webhookBodies = [];
+  const webhookServer = createFakeWebhook(webhookBodies);
+  const webhookPort = await listen(webhookServer);
+  t.after(() => close(webhookServer));
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-watch-log-'));
+  t.after(() => fs.rmSync(logDir, { recursive: true, force: true }));
+  const ffmpegLog = path.join(logDir, 'ffmpeg.log');
+  const agent = await startRtspAgent(t, Object.assign({ FAKE_FFMPEG_LOG: ffmpegLog, UPLOAD_CONFIRMED_WEBHOOK_URL: `http://127.0.0.1:${webhookPort}` }, FAST_AUDIO));
+  // The master as ffprobe sees it: video + the four mic tracks (no duration, so the
+  // fake cameras are not judged short against it).
+  const masterFile = path.join(agent.recordDir, 'master', TAKE + '.mp4');
+  fs.writeFileSync(masterFile + '.probe.json', JSON.stringify({ streams: [{ codec_type: 'video', start_time: '0.000000' }].concat([0, 1, 2, 3].map(() => ({ codec_type: 'audio', start_time: '0.000000' }))), format: { start_time: '0.000000' } }));
+  const cam1File = path.join(agent.recordDir, 'cam1', TAKE + '.mp4');
+  fs.writeFileSync(cam1File + '.watch.mp4.probe.json', JSON.stringify({ streams: [{ codec_type: 'video', duration: '30.4' }, { codec_type: 'audio', duration: '30.4' }], format: { start_time: '0.000000', duration: '30.400000' } }));
+  const started = await postAgent(agent.agentPort, 'start', { session_ref: 'sess_watch' });
+  assert.equal(started.ok, true);
+  touchTakeFiles(agent.recordDir);
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  const before = { cam2: md5File(path.join(agent.recordDir, 'cam2', TAKE + '.mp4')), master: md5File(masterFile) };
+  const result = await postAgent(agent.agentPort, 'stop');
+  assert.equal(result.saved, true);
+  const cam1 = result.timing.cameras.cam1;
+  assert.equal(cam1.basis, 'rtsp_progress');
+  // The RTSP camera is up before StartRecord is sent, so its file starts first: positive offset.
+  assert.ok(cam1.offset_s > 0 && cam1.offset_s < 10, 'cam1 offset ' + cam1.offset_s);
+  assert.equal(cam1.offset_s, Math.round((Date.parse(result.timing.obs_start_at) - Date.parse(cam1.first_packet_at)) / 1) / 1000);
+  assert.equal(result.timing.cameras.cam2.basis, 'record_start');
+  // No real audio in the fake master: the file check says so, it never fails the take.
+  assert.equal(result.audio_health.level, 'unknown');
+  assert.equal(result.audio_health.reason, 'no_audio_tracks');
+  const cam1Original = await (async () => { await waitFor(() => webhookBodies.some((b) => b.source === 'cam1' && b.rendition === 'original'), 30000); return webhookBodies.find((b) => b.source === 'cam1' && b.rendition === 'original'); })();
+  assert.deepEqual([cam1Original.kind, cam1Original.recorded_at], ['video', result.recorded_at]);
+  assert.ok(Number.isFinite(cam1Original.duration_s));
+  await waitFor(() => webhookBodies.some((b) => b.rendition === 'watch' && b.source === 'cam1'), 60000);
+  const watch = webhookBodies.find((b) => b.rendition === 'watch' && b.source === 'cam1');
+  assert.deepEqual(
+    { key: watch.key, kind: watch.kind, recorded_at: watch.recorded_at, duration_s: watch.duration_s, offset_s: watch.offset_s, audio: watch.audio, session_ref: watch.session_ref, original_key: watch.original_key },
+    { key: `stream/bench-1/cam1/${TAKE}.mp4`, kind: 'video', recorded_at: result.recorded_at, duration_s: 30.4, offset_s: cam1.offset_s, audio: 'mix', session_ref: 'sess_watch', original_key: `recordings/bench-1/cam1/${TAKE}.mp4` });
+  const calls = fs.readFileSync(ffmpegLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  const encode = calls.find((a) => a.includes('-force_key_frames') && a.includes(cam1File));
+  assert.ok(encode, 'watch encode for cam1');
+  assert.deepEqual(encode.filter((a, i) => encode[i - 1] === '-i'), [cam1File, masterFile], 'camera video + master mic tracks');
+  const graph = encode[encode.indexOf('-filter_complex') + 1];
+  const samples = Math.round(cam1.offset_s * 48000);
+  assert.ok(graph.includes(`adelay=delays=${samples}S:all=1`), 'the mix is delayed by +offset_s: ' + graph);
+  assert.ok(graph.includes('[1:a:0][1:a:1][1:a:2][1:a:3]amix=inputs=4'));
+  assert.ok(agent.uploads.some((r) => r.method === 'POST' && r.query.has('uploads') && r.path === `/fake-bucket/stream/bench-1/cam1/${TAKE}.mp4`.replace(/ /g, '%20')));
+  // B2: the originals are never rewritten.
+  assert.equal(md5File(path.join(agent.recordDir, 'cam2', TAKE + '.mp4')), before.cam2);
+  assert.equal(md5File(masterFile), before.master);
 });

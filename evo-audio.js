@@ -226,4 +226,4 @@ async function runAudioEvo(client, activeSources, payload) {
   return { ok: false, reason: 'unknown_action', action };
 }
 
-module.exports = { runAudioEvo };
+module.exports = { runAudioEvo, readMicInput };
