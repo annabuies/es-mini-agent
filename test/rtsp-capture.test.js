@@ -358,3 +358,59 @@ test('a join that exits 0 but comes out short keeps every part instead of losing
   for (const p of out.keptParts) assert.ok(fs.existsSync(p));
   assert.equal(fs.existsSync(path.join(dir, 'take.mp4')), false);
 });
+
+// Build 42 (B1/B3): the capture logs when its file's t=0 reached the Mini, which the
+// stop path turns into each camera's offset_s against the master.
+test('stop reports first_packet_at: when the file\'s t=0 arrived, from the progress lines (fake camera, 400 ms to first video)', { timeout: 10000 }, async (t) => {
+  const dir = tempDir(t);
+  withEnv(t, { FAKE_RTSP_VIDEO_DELAY_MS: '400' });
+  const cap = capture();
+  const calledAt = Date.now();
+  const started = await cap.start({ source: 'cam1', url: 'rtsp://10.0.0.5:554/1', dir });
+  assert.equal(started.ok, true);
+  assert.match(started.first_video_at, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
+  await sleep(700);
+  const out = await cap.stop('cam1', { finalBase: 'take' });
+  assert.equal(out.ok, true);
+  assert.equal(out.first_packet_basis, 'progress');
+  assert.equal(out.first_packet_at, new Date(out.first_packet_ms).toISOString());
+  // The fake writes its header 20 ms after spawn, then muxes video from +400 ms at
+  // real time: t=0 of the file is ~420 ms after the start call (plus spawn time).
+  const lag = out.first_packet_ms - calledAt;
+  assert.ok(lag >= 380 && lag < 5000, 'first packet ' + lag + ' ms after the start call (spawning node can be slow on a loaded machine)');
+  assert.ok(out.first_packet_ms <= Date.parse(started.first_video_at) + 5, 'never later than the first video seen');
+});
+
+test('the first-packet estimate takes the earliest of the first progress lines (a late line only adds)', { timeout: 10000 }, async (t) => {
+  // Feed progress lines by hand: out_time 0.5 s read at +600 ms (t=0 at +100), then
+  // 0.8 s read at +1000 ms (a line read late: it would put t=0 at +200).
+  const { PassThrough } = require('node:stream');
+  const { EventEmitter } = require('node:events');
+  const dir = tempDir(t);
+  const children = [];
+  const cap = createRtspCapture({
+    restartDelayMs: 50, stopQuitMs: 500, startProbeMs: 3000,
+    spawnImpl: () => {
+      const child = new EventEmitter();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.stdin = new PassThrough();
+      child.kill = () => { setImmediate(() => child.emit('exit', 0, null)); };
+      child.stdin.on('data', (c) => { if (String(c).includes('q')) setImmediate(() => child.emit('exit', 0, null)); });
+      children.push(child);
+      return child;
+    },
+  });
+  const t0 = Date.now();
+  const startP = cap.start({ source: 'cam9', url: 'rtsp://10.0.0.9:554/1', dir });
+  await sleep(600);
+  children[0].stdout.write('out_time_us=500000\nprogress=continue\n');
+  await sleep(400);
+  children[0].stdout.write('out_time_us=800000\nprogress=continue\n');
+  assert.equal((await startP).ok, true);
+  fs.writeFileSync(path.join(dir, takeStamp(t0) + ' rtsp-part1.mp4'), Buffer.alloc(32 * 1024));
+  const out = await cap.stop('cam9', { finalBase: 'take' });
+  // The earlier, smaller estimate wins.
+  const est = out.first_packet_ms - t0;
+  assert.ok(est >= 60 && est <= 200, 'estimate ' + est + ' ms after start (expected ~100)');
+});
