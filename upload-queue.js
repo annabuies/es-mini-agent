@@ -20,6 +20,11 @@ const EMPTY_CAMERA_FILE_BYTES = 64 * 1024;
 // streams failed to start or dropped mid-take (es-mini-agent #10).
 const PROXY_POLL_MS = 2000;
 const PROXY_HOLD_MS = 30000;
+// A watch copy that fails is tried again (field fix 2026-10-23: one failure used to
+// end it for good, silently). After the last try the cloud is told, so the app says
+// "could not be made" instead of promising it.
+const WATCH_COPY_ATTEMPTS = 3;
+const WATCH_RETRY_MS = 60000;
 const NICE_BIN = '/usr/bin/nice';
 
 function isCameraRecording(job) {
@@ -170,6 +175,7 @@ function createUploadQueue(opts) {
     : STABILITY_POLL_MS;
 
   const proxyPollMs = Number.isFinite(options.proxyPollMs) && options.proxyPollMs >= 0 ? options.proxyPollMs : PROXY_POLL_MS;
+  const watchRetryMs = Number.isFinite(options.watchRetryMs) && options.watchRetryMs >= 0 ? options.watchRetryMs : WATCH_RETRY_MS;
 
   const queue = [];
   const pendingProxyJobs = [];
@@ -686,8 +692,22 @@ function createUploadQueue(opts) {
           await new Promise((resolve) => { const t = setTimeout(resolve, proxyPollMs); if (t.unref) t.unref(); });
           continue;
         }
-        // A copy stopped for a take stays at the head of the line and is redone.
-        if (await makeProxy(pendingProxyJobs[0])) pendingProxyJobs.shift();
+        // A copy waiting to be tried again lets the others go first.
+        const now = Date.now();
+        const job = pendingProxyJobs.find((j) => !(j.watchRetryAt > now));
+        if (!job) {
+          const soonest = Math.min(...pendingProxyJobs.map((j) => j.watchRetryAt));
+          await new Promise((resolve) => { const t = setTimeout(resolve, Math.max(0, Math.min(soonest - now, proxyPollMs))); if (t.unref) t.unref(); });
+          continue;
+        }
+        // A copy stopped for a take stays in the line and is redone.
+        const result = await makeProxy(job);
+        if (!result) continue;
+        pendingProxyJobs.splice(pendingProxyJobs.indexOf(job), 1);
+        if (result === 'retry') {
+          job.watchRetryAt = Date.now() + watchRetryMs * job.watchAttempts;
+          pendingProxyJobs.push(job);
+        }
       }
     } finally {
       proxyWorkerRunning = false;
@@ -720,7 +740,9 @@ function createUploadQueue(opts) {
    * stream/<building>/<camN>/<base>.mp4 WITH the upload_confirmed webhook
    * (rendition "watch"), and, unless PROXY_COPY=0, again as the old proxies/ key
    * without one. The 4K original is only read.
-   * Resolves true when the job is finished (made, failed or skipped), false if a take stopped it.
+   * Resolves true when the job is finished (made, failed for good or skipped), 'retry'
+   * when it failed with tries left (the original and master are kept for it), false if a
+   * take stopped it.
    */
   async function makeProxy(job) {
     const base = path.basename(job.filePath, path.extname(job.filePath));
@@ -729,6 +751,7 @@ function createUploadQueue(opts) {
     const tmpPath = job.filePath + '.watch.mp4';
     const watch = job.watch || {};
     let preempted = false;
+    let retry = false;
 
     try {
       let st;
@@ -764,17 +787,57 @@ function createUploadQueue(opts) {
     } catch (e) {
       preempted = !!(e && e.preempted);
       if (preempted) console.warn('[upload-queue] watch copy stopped for a take, will redo after it key=' + job.key);
-      else console.warn('[upload-queue] watch copy failed key=' + job.key + ' error=' + truncateError(e && (e.message || e.stack || e)));
+      else {
+        job.watchAttempts = (job.watchAttempts || 0) + 1;
+        retry = job.watchAttempts < WATCH_COPY_ATTEMPTS;
+        console.warn('[upload-queue] watch copy failed key=' + job.key + ' attempt=' + job.watchAttempts + '/' + WATCH_COPY_ATTEMPTS
+          + (retry ? ' (will try again)' : ' (giving up)') + ' error=' + truncateError(e && (e.message || e.stack || e)));
+        if (!retry) await postWatchFailed(job, streamKey, e && e.watchError ? e.watchError : 'encode_or_upload_failed');
+      }
     } finally {
       await removeFileIfExists(tmpPath).catch(() => {});
-      // The original is already verified in S3; a failed copy is not a reason to keep it.
-      // A copy stopped for a take still needs the original (and the master).
-      if (!preempted) {
+      // The original is already verified in S3; a copy that failed for good is not a
+      // reason to keep it. A copy stopped for a take, or due another try, still needs the
+      // original (and the master).
+      if (!preempted && !retry) {
         releaseWatchHold(job);
         await removeUploadedOriginal(job);
       }
     }
-    return !preempted;
+    if (preempted) return false;
+    return retry ? 'retry' : true;
+  }
+
+  // The watch copy could not be made: an upload_confirmed for its stream/ key with no
+  // bytes and rendition "watch". The cloud ledgers it without announcing it (a watch copy
+  // is never posted, es-honeybook Build 42) and the app shows the angle as failed. Needs
+  // es-honeybook Build 42 live: an older task would post it as "Camera N recording failed".
+  async function postWatchFailed(job, streamKey, reason) {
+    const url = typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl;
+    if (!url) return;
+    const watch = job.watch || {};
+    try {
+      const res = await fetch(String(url), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(Object.assign({
+          event: 'upload_confirmed',
+          key: streamKey,
+          sizeBytes: 0,
+          confirmedAt: new Date().toISOString(),
+          kind: 'video',
+          rendition: 'watch',
+          original_key: job.key,
+          watch_error: String(reason).slice(0, 64),
+          building_id: buildingId,
+          source: job.source,
+          session_ref: job.sessionRef,
+        }, watch.recordedAt ? { recorded_at: watch.recordedAt } : {})),
+      });
+      if (!res.ok) console.warn('[upload-queue] watch-failed webhook failed status=' + res.status + ' key=' + streamKey);
+    } catch (e) {
+      console.warn('[upload-queue] watch-failed webhook error key=' + streamKey + ':', e && (e.message || e));
+    }
   }
 
   async function ensureWorker() {
