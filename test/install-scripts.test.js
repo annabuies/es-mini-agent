@@ -285,9 +285,9 @@ test('OBS writes no new log, or stops at another prompt: alert, and an old log i
   assert.match(other.out, /ALERT: OBS has not finished starting after 90 s and shows no Safe Mode dialog/);
 });
 
-test('agent release version is 2026.10.20-1', () => {
+test('agent release version is 2026.10.26-1', () => {
   const server = fs.readFileSync(path.join(projectDir, 'server.js'), 'utf8');
-  assert.match(server, /const AGENT_VERSION = '2026\.10\.20-1';/);
+  assert.match(server, /const AGENT_VERSION = '2026\.10\.26-1';/);
 });
 
 test('modules.txt ships the Build 42 modules server.js requires', () => {
