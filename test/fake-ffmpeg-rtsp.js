@@ -26,7 +26,7 @@ if (args.includes('concat')) {
 }
 
 if (!/^rtsps?:\/\//.test(input)) {
-  if (args.includes('-show_streams')) {
+  if (args.includes('-show_streams') || args.includes('-show_entries')) {
     process.stdout.write(JSON.stringify({ streams: [] }));
     process.exit(0);
   }

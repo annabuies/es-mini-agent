@@ -26,11 +26,14 @@ const { sampleDiskUsage } = require('./disk-usage');
 const { describePower, readPowerConfig, runPower } = require('./power');
 const { createRtspCapture, isRtspCamera, killOrphanedCaptures, rtspUrlForCamera } = require('./rtsp-capture');
 const { checkTake } = require('./take-health');
+const { createAudioMonitor, unknownAudio } = require('./audio-check');
+const { describeAudioHealth, startMasterAudioAnalysis } = require('./audio-health');
+const { offsetFromTiming } = require('./watch-rendition');
 
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.10.03-1';
+const AGENT_VERSION = '2026.10.20-1';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -111,7 +114,26 @@ const RTSP_CAPTURE_ENABLED = process.env.RTSP_CAPTURE !== '0';
 // in S3 (Robbie, Sep 29: ~43 GB per recorded hour, 103 GB free). DELETE_AFTER_UPLOAD=0
 // in the LaunchAgent keeps them.
 const DELETE_AFTER_UPLOAD = process.env.DELETE_AFTER_UPLOAD !== '0';
+// Mic check (Build 42, A1): warn only, never refuses a take. AUDIO_CHECK=0 turns
+// it off. Idle checks every AUDIO_CHECK_MS, plus on preview_start (kiosk showing
+// the studio) when the last one is older than AUDIO_PREVIEW_MIN_MS.
+const AUDIO_CHECK_ENABLED = process.env.AUDIO_CHECK !== '0';
+const AUDIO_CHECK_MS = Math.max(5000, Number(process.env.AUDIO_CHECK_MS) || 60000);
+const AUDIO_PREVIEW_MIN_MS = 20000;
+const AUDIO_METER_WINDOW_MS = Math.max(200, Number(process.env.AUDIO_METER_WINDOW_MS) || 1500);
+const AUDIO_TAKE_EVAL_MS = Math.max(500, Number(process.env.AUDIO_TAKE_EVAL_MS) || 10000);
+// Post-take audio health (A3): stop waits at most this long for the file check of
+// the master's mic tracks; a longer take gets it in last_take and on its webhooks.
+const AUDIO_HEALTH_WAIT_MS = Math.max(0, Number.isFinite(Number(process.env.AUDIO_HEALTH_WAIT_MS)) && process.env.AUDIO_HEALTH_WAIT_MS !== '' ? Number(process.env.AUDIO_HEALTH_WAIT_MS) : 3000);
+// A constant correction (ms) added to every camera's logged offset_s, for a bias
+// measured on site with a clap (camera encode/network latency). Default 0.
+const WATCH_AV_ADJUST_MS = Number(process.env.WATCH_AV_ADJUST_MS) || 0;
 const rtspCapture = createRtspCapture({ ffmpegBin: () => resolveFfmpegBin().bin });
+const audioMonitor = OBS_MODE_ACTIVE && AUDIO_CHECK_ENABLED
+  ? createAudioMonitor({ url: OBS_WS_URL, password: OBS_WS_PASSWORD, windowMs: AUDIO_METER_WINDOW_MS, takeEvalMs: AUDIO_TAKE_EVAL_MS })
+  : null;
+// The last take's post-stop audio file check, while it may still be running.
+let audioAnalysis = null;
 process.once('exit', () => rtspCapture.killAll());
 if (killOrphanedCaptures(OBS_RECORD_DIR)) {
   console.warn('[es-mini-agent] [rtsp] ended ffmpeg captures left running by the previous agent; their parts stay in the camera folders');
@@ -144,6 +166,8 @@ const state = {
   cameras: [],
   looks: {},
   default_look: null,
+  // This take's capture timing (wall-clock ms): master StartRecord and each camera's start.
+  timing: null,
 };
 const r2Tests = new Map();
 let obsClient = null;
@@ -994,6 +1018,70 @@ function captureBlock(capture) {
   return out;
 }
 
+/** The newest mic verdict: the in-take alert while recording, else the last check. Null if none yet. */
+function currentAudio() {
+  if (!audioMonitor) return null;
+  return audioMonitor.takeAlert() || audioMonitor.latest() || null;
+}
+
+/** The contract `audio` block only (heartbeat: kept small, no extra fields). */
+function compactAudio(block) {
+  if (!block) return null;
+  const mics = {};
+  for (const [name, m] of Object.entries(block.mics || {})) {
+    mics[name] = { muted: !!m.muted, peak_db: Number.isFinite(m.peak_db) ? m.peak_db : null, frozen: typeof m.frozen === 'boolean' ? m.frozen : null, recorded: typeof m.recorded === 'boolean' ? m.recorded : null, codes: Array.isArray(m.codes) ? m.codes : [] };
+  }
+  const out = { level: block.level, checked_at: block.checked_at || null, evo_present: typeof block.evo_present === 'boolean' ? block.evo_present : null, codes: Array.isArray(block.codes) ? block.codes : [], mics };
+  if (block.error) out.error = String(block.error).slice(0, 80);
+  return out;
+}
+
+/** A mic check on the kiosk's cadence: only when idle and the last one is old. Never awaited. */
+function maybeAudioCheck(context, minAgeMs) {
+  if (!audioMonitor || state.recording || startInFlight || audioMonitor.takeActive()) return;
+  const last = audioMonitor.latest();
+  const age = last && last.checked_at ? Date.now() - Date.parse(last.checked_at) : Infinity;
+  if (age < minAgeMs) return;
+  audioMonitor.check(context).catch(() => {});
+}
+
+/**
+ * The take's timing block (stop result). Every offset_s is seconds to delay the
+ * master's audio so it lines up with that camera's file (watch-rendition.js
+ * explains the sign): master t=0 minus camera t=0, plus WATCH_AV_ADJUST_MS.
+ */
+function buildTiming(timing, rtspBySource, recordStarted) {
+  if (!timing) return null;
+  const iso = (ms) => (Number.isFinite(ms) ? new Date(ms).toISOString() : null);
+  const eventMs = recordStarted && Number.isFinite(recordStarted.recordStartedAtMs) ? recordStarted.recordStartedAtMs : null;
+  const masterMs = eventMs !== null ? eventMs : timing.obs_start_responded_ms;
+  const out = {
+    obs_start_at: iso(masterMs),
+    obs_start_basis: eventMs !== null ? 'record_started_event' : (Number.isFinite(timing.obs_start_responded_ms) ? 'start_record_response' : null),
+    obs_start_requested_at: iso(timing.obs_start_requested_ms),
+    obs_start_responded_at: iso(timing.obs_start_responded_ms),
+    cameras: {},
+  };
+  if (WATCH_AV_ADJUST_MS) out.adjust_ms = WATCH_AV_ADJUST_MS;
+  for (const [source, cam] of Object.entries(timing.cameras || {})) {
+    const rtsp = rtspBySource && rtspBySource.get(source);
+    let firstMs = cam.started_ms;
+    let basis = cam.basis;
+    if (rtsp && Number.isFinite(rtsp.first_packet_ms)) {
+      firstMs = rtsp.first_packet_ms;
+      basis = rtsp.first_packet_basis === 'progress' ? 'rtsp_progress' : 'rtsp_first_video';
+    }
+    const entry = { first_packet_at: iso(firstMs), basis: basis || null, offset_s: Number.isFinite(masterMs) ? offsetFromTiming({ masterStartMs: masterMs, cameraStartMs: firstMs, adjustMs: WATCH_AV_ADJUST_MS }) : null };
+    if (rtsp && Number.isFinite(rtsp.segments) && rtsp.segments > 1) {
+      // Pauses and reconnects join segments without their gaps: the offset holds for the first one.
+      entry.segments = rtsp.segments;
+      entry.sync = 'first_segment';
+    }
+    out.cameras[source] = entry;
+  }
+  return out;
+}
+
 /** This take's Source Record file: the newest in the camera folder, written since the take began. */
 function sourceRecordFile(source, takeStartedAt) {
   let newest = null;
@@ -1151,7 +1239,7 @@ async function handleOp(op, body) {
     if (op === 'audio_bind' || op === 'audio_lavalier') {
       return { ok: false, disabled: true, reason: 'disabled_would_revert_evo_routing', use: 'audio_evo' };
     }
-    if (op === 'audio_evo') {
+    if (op === 'audio_evo' || op === 'audio_check') {
       return { ok: false, demo: true, reason: 'demo_mode' };
     }
     if (op === 'update') {
@@ -1191,12 +1279,25 @@ async function handleOp(op, body) {
       const held = await uploadQueue.holdProxies().catch(() => null);
       if (held && held.stopped) console.warn('[es-mini-agent] [take] WARN stopped a running proxy encode to start this take; it is redone after the take');
     }
+    // So is the last take's audio file check if it is still going (a very long take).
+    if (audioAnalysis) {
+      audioAnalysis.cancel();
+      audioAnalysis = null;
+      console.warn('[es-mini-agent] [take] WARN stopped the last take\'s audio file check to start this take');
+    }
+    // The take's own mic watch (its own OBS client): pre-start verdict, in-take
+    // alert, and the moment OBS says the master started. Warn only: never awaited
+    // on the way to StartRecord, never a reason to refuse.
+    const takeAudio = audioMonitor ? audioMonitor.beginTake() : null;
+    const endTakeAudio = () => (audioMonitor ? audioMonitor.endTake().catch(() => null) : Promise.resolve(null));
 
     // The cam1 park only works around Source Record; RTSP capture does not need it.
     const parkedPreview = rtspUrlForSource('cam1') ? null : await parkPreviewOffCam1();
     const startedAt = Date.now();
     const rtspStarted = [];
     const capture = {};
+    // Wall-clock start of each camera's file: refined at stop from the RTSP progress (see buildTiming).
+    const timing = { obs_start_requested_ms: null, obs_start_responded_ms: null, cameras: {} };
     const startResults = await Promise.all(startingSources.map(async (source) => {
       const configured = captureConfigured(source);
       capture[source] = { capture_mode: 'source_record', configured, fallback: false };
@@ -1209,6 +1310,8 @@ async function handleOp(op, body) {
         if (rtsp.ok) {
           rtspStarted.push(source);
           capture[source] = { capture_mode: 'rtsp', configured, fallback: false, video_after_ms: rtsp.video_after_ms };
+          const firstVideoMs = Date.parse(rtsp.first_video_at || '');
+          timing.cameras[source] = { basis: 'rtsp_first_video', started_ms: Number.isFinite(firstVideoMs) ? firstVideoMs : Date.now() };
           return { source, vendor: { success: true } };
         }
         // Never lose the camera: record it the old way for this take, and never quietly.
@@ -1217,6 +1320,8 @@ async function handleOp(op, body) {
           + ' reason=' + capture[source].fallback_reason + (rtsp.detail ? ' detail=' + rtsp.detail : ''));
       }
       const vendor = await callVendor(client, 'record_start', source);
+      // Source Record: only approximate, the moment its start was acknowledged.
+      if (vendor.success) timing.cameras[source] = { basis: 'record_start', started_ms: Date.now() };
       return { source, vendor };
     }));
     const obsStarted = startingSources.filter((source) => !rtspStarted.includes(source));
@@ -1224,6 +1329,7 @@ async function handleOp(op, body) {
     if (failed) {
       await stopRtspTakes(rtspStarted, null);
       restorePreviewAfterPark(parkedPreview, 0);
+      await endTakeAudio();
       const detail = failed.source + ': ' + (failed.vendor.error || 'unknown_error');
       return { ok: false, reason: 'obs_start_failed', detail: truncateDetail(detail) };
     }
@@ -1234,13 +1340,16 @@ async function handleOp(op, body) {
         if (recordStatus.outputActive) {
           throw new Error('recording_already_active');
         }
+        timing.obs_start_requested_ms = Date.now();
         const started = await client.request('StartRecord');
+        timing.obs_start_responded_ms = Date.now();
         const startError = masterResponseError(started, 'start_record_failed');
         if (startError) throw new Error(startError);
       } catch (e) {
         await stopStartedSources(client, obsStarted);
         await stopRtspTakes(rtspStarted, null);
         restorePreviewAfterPark(parkedPreview, 0);
+        await endTakeAudio();
         const detail = 'master: ' + (e && (e.message || e) || 'start_record_failed');
         return { ok: false, reason: 'obs_start_failed', detail: truncateDetail(detail) };
       }
@@ -1258,10 +1367,19 @@ async function handleOp(op, body) {
     state.masterActive = MASTER_RECORD;
     state.sessionRef = sessionValue(body && body.session_ref);
     state.clientCode = sessionValue(body && body.client_code);
+    state.timing = timing;
     restorePreviewAfterPark(parkedPreview, CAM1_PARK_RESTORE_MS);
     const fellBack = fallbackSources(capture);
     if (fellBack.length) console.warn('[es-mini-agent] [take] WARN take started with Source Record FALLBACK for ' + fellBack.join(',') + ' (configured for RTSP)');
-    return Object.assign({ ok: true, recording: true, feeds_writing: null }, startSessionResponse(), { cameras: captureBlock(capture), fallback_sources: fellBack });
+    const out = Object.assign({ ok: true, recording: true, feeds_writing: null }, startSessionResponse(), { cameras: captureBlock(capture), fallback_sources: fellBack });
+    if (audioMonitor) {
+      // The pre-start mic check if it is in already (it needs ~1.5 s of meters, an
+      // RTSP start takes longer), else the last one; status carries audio_alert next.
+      const preStart = takeAudio ? await Promise.race([takeAudio.preStart, Promise.resolve(null)]) : null;
+      out.audio = compactAudio(preStart || audioMonitor.latest() || unknownAudio('check_pending'));
+      if (out.audio.level === 'fail' || out.audio.level === 'warn') console.warn('[es-mini-agent] [take] WARN recording started with mic check ' + out.audio.level + ': ' + out.audio.codes.join(',') + ' (warn only, take not refused)');
+    }
+    return out;
     })();
     try {
       return await startInFlight;
@@ -1305,6 +1423,8 @@ async function handleOp(op, body) {
       if (!rtspStops) rtspStops = await stopRtspTakes(rtspList, null);
 
       const filesStable = await waitForObsFiles(obsSources, masterWasActive, masterStop.outputPath);
+      // The take's mic watch ends with the take; its last verdict and the master's start time stay.
+      const takeAudio = audioMonitor ? await audioMonitor.endTake().catch(() => null) : null;
 
       const allStopsSucceeded = stopResults.every((entry) => entry.vendor.success) && rtspStops.every((entry) => entry.rtsp.ok);
       const recordingStartedAt = state.recordingStartedAt;
@@ -1323,6 +1443,10 @@ async function handleOp(op, body) {
         return { source, filePath: OBS_RECORD_DIR && takeStartedAt ? sourceRecordFile(source, takeStartedAt) : null, captureError: null, gapS: null, resumeWaitS: null, rtsp: null };
       });
 
+      // The master's mic tracks are checked alongside the camera files (A3). Stop waits
+      // up to AUDIO_HEALTH_WAIT_MS for it; a longer take gets it in last_take and on
+      // the master/mic webhooks once it is done.
+      const analysis = masterPath && OBS_RECORD_DIR ? startMasterAudioAnalysis(masterPath, { ffmpegBin: () => resolveFfmpegBin().bin, ffprobeBin: resolveFfprobeBin }) : null;
       // File health, not capture state, decides what the kiosk and the booking thread say.
       let check = null;
       if (OBS_RECORD_DIR) {
@@ -1332,6 +1456,17 @@ async function handleOp(op, body) {
           console.warn('[es-mini-agent] [take] WARN file check failed:', e && (e.message || e));
         }
       }
+      let audioHealth = null;
+      if (analysis) {
+        let timer = null;
+        const waited = await Promise.race([analysis.promise, new Promise((resolve) => { timer = setTimeout(() => resolve(null), AUDIO_HEALTH_WAIT_MS); })]);
+        clearTimeout(timer);
+        audioHealth = waited || { level: 'unknown', codes: [], tracks: [], identical_pairs: [], pending: true };
+        if (!waited) audioAnalysis = analysis;
+      }
+      const timingBlock = buildTiming(state.timing, rtspBySource, takeAudio);
+      const recordedAt = (timingBlock && timingBlock.obs_start_at) || (takeStartedAt ? new Date(takeStartedAt).toISOString() : null);
+      const audioMeta = audioHealth && !audioHealth.pending ? { audio_health: audioHealth, audio_level: audioHealth.level, audio_codes: audioHealth.codes } : {};
       const verdicts = check ? check.cameras : {};
       const takeHealth = check ? check.health : 'unverified';
       const fellBack = fallbackSources(capture);
@@ -1360,21 +1495,29 @@ async function handleOp(op, body) {
       }
 
       const takeName = masterBase ? path.basename(masterBase, path.extname(masterBase)) : 'take';
+      const audioBad = !!(audioHealth && (audioHealth.level === 'fail' || audioHealth.level === 'warn'));
       const summary = '[es-mini-agent] [take] ' + takeName + ' health=' + takeHealth + ' saved=' + saved
         + (fellBack.length ? ' FALLBACK=' + fellBack.join(',') : '') + (failedSources.length ? ' FAILED=' + failedSources.join(',') : '')
         + ' | ' + takeFiles.map((f) => cameraSummary(f.source, capture, verdicts[f.source] || { health: 'unverified' }, f.rtsp)).join(' | ')
-        + (check && check.master ? ' | master ' + check.master.health + (Number.isFinite(check.master.duration_s) ? ' ' + check.master.duration_s + 's' : '') : '');
-      if (takeHealth === 'ok' && !fellBack.length) console.log(summary);
+        + (check && check.master ? ' | master ' + check.master.health + (Number.isFinite(check.master.duration_s) ? ' ' + check.master.duration_s + 's' : '') : '')
+        + (audioHealth ? ' | ' + (audioHealth.pending ? 'audio check still running' : describeAudioHealth(audioHealth)) : '')
+        + (timingBlock ? ' | offsets ' + Object.entries(timingBlock.cameras).map(([src, c]) => src + '=' + (c.offset_s === null ? '?' : c.offset_s + 's')).join(' ') : '');
+      if (takeHealth === 'ok' && !fellBack.length && !audioBad) console.log(summary);
       else console.warn(summary.replace('[take] ', '[take] WARN '));
 
-      const takeMeta = { take_health: takeHealth, fallback_sources: fellBack, failed_sources: failedSources };
+      const takeMeta = { take_health: takeHealth, fallback_sources: fellBack, failed_sources: failedSources, rendition: 'original' };
+      if (recordedAt) takeMeta.recorded_at = recordedAt;
       if (uploadQueue && OBS_RECORD_DIR) {
         if (!recordingStartedAt) {
           console.warn('[es-mini-agent] upload skipped: unknown recording start');
         } else {
+          const watchMaster = masterWasActive && masterStop.success && masterStop.outputPath ? masterStop.outputPath : null;
           for (const f of takeFiles) {
             const entry = cameras[f.source];
             const meta = Object.assign({}, takeMeta, entry, { health_reason: entry.reason || null });
+            const camTiming = timingBlock && timingBlock.cameras[f.source];
+            // What this camera's watch copy needs: the master (mic tracks) and its offset.
+            const watch = { masterPath: watchMaster, offsetS: camTiming && Number.isFinite(camTiming.offset_s) ? camTiming.offset_s : null, recordedAt };
             if (!f.filePath) {
               console.warn('[es-mini-agent] ' + f.source + ' has no file to upload: ' + (entry.reason || 'unknown'));
               uploadQueue.reportMissingCamera({ source: f.source, sessionRef, fileName: masterBase || (f.source + '.mp4'), meta }).catch(() => {});
@@ -1384,7 +1527,8 @@ async function handleOp(op, body) {
               // A failed RTSP join keeps every part; filePath is the first, and each later one is footage too.
               const extraParts = f.rtsp && Array.isArray(f.rtsp.keptParts) ? f.rtsp.keptParts.filter((p) => p !== f.filePath) : [];
               for (const filePath of [f.filePath, ...extraParts]) {
-                const out = uploadQueue.enqueue({ filePath, source: f.source, sessionRef, meta });
+                // Extra parts of a failed join have their own timeline: no watch copy alignment for them.
+                const out = uploadQueue.enqueue({ filePath, source: f.source, sessionRef, meta, watch: filePath === f.filePath ? watch : { masterPath: watchMaster, offsetS: null, recordedAt } });
                 if (out && out.queued) uploadQueued += 1;
                 else console.warn('[es-mini-agent] upload enqueue skipped source=' + f.source + ' reason=' + (out && out.reason));
               }
@@ -1394,7 +1538,9 @@ async function handleOp(op, body) {
           }
           if (masterWasActive && masterStop.success && masterStop.outputPath) {
             try {
-              const out = uploadQueue.enqueue({ filePath: masterStop.outputPath, source: MASTER_SOURCE, sessionRef, meta: takeMeta });
+              const masterMeta = Object.assign({}, takeMeta, audioMeta, { timing: timingBlock || undefined });
+              if (check && check.master && Number.isFinite(check.master.duration_s)) masterMeta.duration_s = check.master.duration_s;
+              const out = uploadQueue.enqueue({ filePath: masterStop.outputPath, source: MASTER_SOURCE, sessionRef, meta: masterMeta });
               if (out && out.queued) uploadQueued += 1;
             } catch (e) {
               console.warn('[es-mini-agent] upload enqueue failed source=' + MASTER_SOURCE + ':', e && (e.stack || e.message || e));
@@ -1406,7 +1552,26 @@ async function handleOp(op, body) {
       response = { ok: true, saved, health: takeHealth, files, failed_files: failedFiles, cameras, fallback_sources: fellBack };
       if (check && check.master) response.master = check.master;
       if (uploadQueue) response.upload_queued = uploadQueued;
-      state.lastTake = { finished_at: new Date().toISOString(), saved, health: takeHealth, files, failed_files: failedFiles, fallback_sources: fellBack };
+      // Build 42 additions: the mic tracks' file check (warn only: never changes
+      // saved/health), the take's capture timing, and the last in-take mic alert.
+      if (audioHealth) response.audio_health = audioHealth;
+      if (timingBlock) response.timing = timingBlock;
+      if (recordedAt) response.recorded_at = recordedAt;
+      if (takeAudio && takeAudio.alert) response.audio_alert = compactAudio(takeAudio.alert);
+      const lastTake = { finished_at: new Date().toISOString(), saved, health: takeHealth, files, failed_files: failedFiles, fallback_sources: fellBack };
+      if (audioHealth) lastTake.audio_health = audioHealth;
+      if (recordedAt) lastTake.recorded_at = recordedAt;
+      state.lastTake = lastTake;
+      if (audioHealth && audioHealth.pending && analysis) {
+        const masterFile = masterPath;
+        analysis.promise.then((result) => {
+          if (audioAnalysis === analysis) audioAnalysis = null;
+          if (state.lastTake === lastTake) lastTake.audio_health = result;
+          const line = '[es-mini-agent] [take] ' + takeName + ' ' + describeAudioHealth(result) + ' (after stop)';
+          if (result.level === 'fail' || result.level === 'warn') console.warn(line.replace('[take] ', '[take] WARN ')); else console.log(line);
+          if (uploadQueue && result.level !== 'unknown') uploadQueue.annotate(masterFile, { audio_health: result, audio_level: result.level, audio_codes: result.codes });
+        }).catch(() => {});
+      }
     } finally {
       state.recording = false;
       state.paused = false;
@@ -1414,6 +1579,7 @@ async function handleOp(op, body) {
       state.sources = null;
       state.rtspSources = [];
       state.capture = {};
+      state.timing = null;
       state.takeStartedAt = null;
       state.masterActive = false;
       state.sessionRef = null;
@@ -1455,6 +1621,7 @@ async function handleOp(op, body) {
         masterStop = { success: !masterWasActive, outputPath: null };
       }
       await rtspStopCall;
+      if (audioMonitor) await audioMonitor.endTake().catch(() => null);
 
       await waitForObsFiles(obsSources, masterWasActive, masterStop.outputPath);
 
@@ -1472,6 +1639,7 @@ async function handleOp(op, body) {
       state.sources = null;
       state.rtspSources = [];
       state.capture = {};
+      state.timing = null;
       state.takeStartedAt = null;
       state.masterActive = false;
       state.sessionRef = null;
@@ -1488,6 +1656,7 @@ async function handleOp(op, body) {
       const out = { ok: true, recording: false, feeds_writing: 0, preview: previewActive(), sources: sources.slice(), master_active: masterActive, master_enabled: MASTER_RECORD };
       if (state.lastTake) out.last_take = state.lastTake;
       if (uploadQueue) out.uploads = uploadQueue.status();
+      if (audioMonitor) out.audio = compactAudio(audioMonitor.latest());
       return out;
     }
     // RTSP cameras write "<stamp> rtsp-partN.mp4", which the Source Record sampler
@@ -1508,6 +1677,20 @@ async function handleOp(op, body) {
     out.fallback_sources = fallbackSources(state.capture);
     if (state.rtspSources.length) out.rtsp = rtspState;
     if (uploadQueue) out.uploads = uploadQueue.status();
+    if (audioMonitor) {
+      // The latest in-take mic verdict (every AUDIO_TAKE_EVAL_MS): warn only.
+      out.audio_alert = compactAudio(audioMonitor.takeAlert());
+      out.audio = compactAudio(currentAudio());
+    }
+    return out;
+  }
+  if (op === 'audio_check') {
+    // A fresh mic check now (idle: its own OBS client; recording: the take's). Warn only.
+    if (!audioMonitor) return { ok: false, reason: 'audio_check_disabled' };
+    const block = await audioMonitor.check('op');
+    const out = { ok: block.level !== 'unknown', recording: !!state.recording, audio: compactAudio(block) };
+    if (block.level === 'unknown') out.reason = block.error || 'audio_check_failed';
+    if (block.identical_pairs) out.identical_pairs = block.identical_pairs;
     return out;
   }
   if (op === 'diag') {
@@ -1530,6 +1713,7 @@ async function handleOp(op, body) {
     // Sits alongside storage/ffmpeg deliberately: all three are assigned before
     // the OBS call below, so they still come back on a machine whose OBS is down.
     out.version = getVersionBlock({ projectDir: __dirname, agentVersion: AGENT_VERSION });
+    if (audioMonitor) out.audio = currentAudio();
 
     let client;
     try {
@@ -1598,6 +1782,8 @@ async function handleOp(op, body) {
       }
     }
     out.filters = filters;
+    // A fresh mic check when idle (the full block, with volume and identical pairs).
+    if (audioMonitor && !state.recording) out.audio = await audioMonitor.check('diag');
     return out;
   }
   // audio_bind and audio_lavalier are permanently disabled (2026-08-18): both
@@ -1680,6 +1866,8 @@ async function handleOp(op, body) {
     return await selectCloudflarePreviewCamera(previewCameraIndex);
   }
   if (op === 'preview_start') {
+    // The kiosk sends this every 25 s while it shows the studio: keep its mic check fresh.
+    maybeAudioCheck('preview', AUDIO_PREVIEW_MIN_MS);
     previewUntil = Date.now() + PREVIEW_TTL_MS;
     const realtime = await startCloudflarePreview(body && body.cloudflare);
     if (realtime.stream) {
@@ -1687,14 +1875,14 @@ async function handleOp(op, body) {
         clearInterval(previewTimer);
         previewTimer = null;
       }
-      return {
+      return Object.assign({
         ok: true,
         preview: true,
         stream_mode: 'cloudflare',
         stream: realtime.stream,
         cleanup_input_uid: realtime.cleanupInputUid,
         sources: activeSources.slice(),
-      };
+      }, audioMonitor ? { audio: compactAudio(currentAudio()) } : {});
     }
     if (!isStorageConfigured()) {
       return { ok: false, reason: 'r2_unconfigured', cleanup_input_uid: realtime.cleanupInputUid };
@@ -1703,13 +1891,13 @@ async function handleOp(op, body) {
       previewTimer = setInterval(pushPreviewFrames, PREVIEW_INTERVAL_MS);
       console.log('[es-mini-agent] [preview] started');
     }
-    return {
+    return Object.assign({
       ok: true,
       preview: true,
       cleanup_input_uid: realtime.cleanupInputUid,
       stream_error: realtime.error || null,
       sources: activeSources.slice(),
-    };
+    }, audioMonitor ? { audio: compactAudio(currentAudio()) } : {});
   }
   if (op === 'preview_stop') {
     previewUntil = 0;
@@ -1731,7 +1919,7 @@ async function handleOp(op, body) {
   return null;
 }
 
-const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_bind', 'audio_lavalier', 'audio_evo', 'update', 'fetch_docs', 'look', 'cam_snapshot', 'cam_restore', 'power']);
+const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_bind', 'audio_lavalier', 'audio_evo', 'audio_check', 'update', 'fetch_docs', 'look', 'cam_snapshot', 'cam_restore', 'power']);
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -1991,6 +2179,7 @@ let cameraReachabilityBusy = false;
 let diskUsage = null;
 let diskUsageBusy = false;
 let powerCheckTimer = null;
+let audioCheckTimer = null;
 let powerHealth = null;
 let powerHealthBusy = false;
 
@@ -2074,6 +2263,8 @@ function heartbeatQuery(now = Date.now()) {
         ? diskUsage.checked_at : null,
       // Power strip health is sampled on its own timer: never add I/O here. Null when unconfigured.
       power: powerHealth ? { ...powerHealth } : null,
+      // Mic check (cached; idle checks and the take's own watch fill it): never add I/O here.
+      audio: compactAudio(currentAudio()),
     };
     lastHeartbeatAt = now;
     return '&hb=1&v=' + encodeURIComponent(AGENT_VERSION)
@@ -2231,6 +2422,12 @@ server.listen(PORT, () => {
     powerCheckTimer.unref();
     refreshPowerHealth().catch((e) => console.warn('[es-mini-agent] power check failed:', e && (e.message || e)));
   }
+  if (audioMonitor) {
+    // Idle mic check every AUDIO_CHECK_MS (the take keeps its own), the first shortly after boot.
+    audioCheckTimer = setInterval(() => maybeAudioCheck('idle', AUDIO_CHECK_MS / 2), AUDIO_CHECK_MS);
+    audioCheckTimer.unref();
+    setTimeout(() => maybeAudioCheck('boot', 0), 500).unref();
+  }
   refreshSources().catch(() => {});
   refreshCameraReachability().catch((e) => {
     console.warn('[es-mini-agent] camera reachability refresh failed:', e && (e.message || e));
@@ -2267,6 +2464,10 @@ function shutdown(signal) {
   if (powerCheckTimer) {
     clearInterval(powerCheckTimer);
     powerCheckTimer = null;
+  }
+  if (audioCheckTimer) {
+    clearInterval(audioCheckTimer);
+    audioCheckTimer = null;
   }
   if (previewTimer) {
     clearInterval(previewTimer);
