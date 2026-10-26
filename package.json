@@ -1,6 +1,6 @@
 {
   "name": "es-mini-agent",
-  "version": "0.1.0",
+  "version": "2026.10.26-2",
   "private": true,
   "description": "EVRYBDY Studios FLEET — Mini-side HTTP agent. Zero-dependency Node service that the Cloudflare Worker (api.evrybdystudios.com) talks to, with optional OBS Source Record control and demo-mode fallback.",
   "main": "server.js",
