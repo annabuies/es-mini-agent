@@ -841,6 +841,10 @@ function createUploadQueue(opts) {
         queuedFilePaths.delete(job.filePath);
         activeJob = job;
         try {
+          // The queued state is written asynchronously by enqueue(). A very
+          // short or empty file can finish before that write, otherwise its
+          // final state removal is undone by the late queued write.
+          await job.stateReady;
           await runJob(job);
         } catch (e) {
           console.warn('[upload-queue] worker job error:', e && (e.stack || e.message || e));
@@ -903,7 +907,7 @@ function createUploadQueue(opts) {
 
       queuedFilePaths.add(filePath);
       queue.push(job);
-      writeState(stateFilePath, buildBaseState(job, 'queued'));
+      job.stateReady = writeState(stateFilePath, buildBaseState(job, 'queued'));
       ensureWorker().catch((e) => {
         console.warn('[upload-queue] worker start failed:', e && (e.stack || e.message || e));
       });

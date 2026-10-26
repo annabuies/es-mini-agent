@@ -195,7 +195,7 @@ test('A8 give-up: retries follow the schedule until 48 h, then one WARN, and the
   assert.deepEqual(await outbox.post(payload), { delivered: false, queued: true });
   const gaps = [];
   let last = start;
-  while (clock.timers.length) {
+  while (clock.timers.length && !(outbox.entries()[0] || {}).gave_up) {
     const next = clock.timers[0].at;
     gaps.push(Math.round((next - last) / 60000));
     last = next;
@@ -213,7 +213,8 @@ test('A8 give-up: retries follow the schedule until 48 h, then one WARN, and the
   assert.equal(logs.some((l) => l.includes(SECRET) || l.includes('hooks.example.test')), false);
   assert.deepEqual(outbox.pending(), { count: 1, oldest_age_s: 48 * 3600, gave_up: 1 });
   assert.equal(outbox.entries()[0].gave_up, true);
-  // No more tries, and no second WARN, however long it sits.
+  // No more tries or warnings, but a timer remains so a quiet outbox is pruned.
+  assert.equal(clock.timers.length, 1, 'a given-up entry schedules its own expiry');
   clock.advance(24 * 3600 * 1000);
   await outbox.flush();
   assert.equal(sent.length, 1 + gaps.length);
@@ -223,6 +224,10 @@ test('A8 give-up: retries follow the schedule until 48 h, then one WARN, and the
   assert.equal(again.pending().count, 1);
   assert.equal(again.pending().gave_up, 1);
   await again.flush();
+  clock.advance(6 * 24 * 3600 * 1000 + 1);
+  await clock.fireDue();
+  assert.equal(outbox.pending(), null, 'the original process prunes after a week without a new upload');
+  assert.equal(fs.existsSync(outboxFile(dir)), false);
 });
 
 test('A8 dedupe: the same upload_confirmed (event + key + sizeBytes) enqueued twice is one entry, sent as first queued', async (t) => {

@@ -123,6 +123,12 @@ function createWebhookOutbox(opts) {
     if (timer) { clearTimer(timer); timer = null; }
     if (stopped) return;
     const due = entries.filter((e) => !e.gave_up).map((e) => e.next_attempt_at);
+    // Given-up notices remain visible to the cloud for a week, then expire even
+    // when no new upload arrives. Without a timer, only a restart or new post
+    // would ever run flush(), leaving webhook_pending stuck forever.
+    const prune = entries.filter((e) => e.gave_up && Number.isFinite(e.gave_up_at))
+      .map((e) => e.gave_up_at + GAVE_UP_KEEP_MS + 1);
+    due.push(...prune);
     if (!due.length) return;
     const delay = Math.max(0, Math.min(Math.min(...due) - now(), HOURLY_MS));
     timer = setTimer(() => { timer = null; return flush(); }, delay);
@@ -224,25 +230,24 @@ function createWebhookOutbox(opts) {
   /** Tries every due entry once, in order. Resolves when done. */
   function flush() {
     if (flushing) return flushing;
-    flushing = (async () => {
-      try {
-        const t = now();
-        const before = entries.length;
-        entries = entries.filter((e) => !(e.gave_up && Number.isFinite(e.gave_up_at) && t - e.gave_up_at > GAVE_UP_KEEP_MS));
-        let changed = entries.length !== before;
-        for (const entry of entries.slice()) {
-          if (stopped) break;
-          if (entry.gave_up || entry.next_attempt_at > now()) continue;
-          await attempt(entry);
-          changed = true;
-          persist();
-        }
-        if (changed) persist();
-      } finally {
-        flushing = null;
-        schedule();
+    const task = (async () => {
+      const t = now();
+      const before = entries.length;
+      entries = entries.filter((e) => !(e.gave_up && Number.isFinite(e.gave_up_at) && t - e.gave_up_at > GAVE_UP_KEEP_MS));
+      let changed = entries.length !== before;
+      for (const entry of entries.slice()) {
+        if (stopped) break;
+        if (entry.gave_up || entry.next_attempt_at > now()) continue;
+        await attempt(entry);
+        changed = true;
+        persist();
       }
+      if (changed) persist();
     })();
+    // A flush with no due entries can finish synchronously. Attach cleanup to
+    // its promise after assigning `flushing`, or it stays set to a resolved
+    // promise and no later retry/prune runs in this process.
+    flushing = task.finally(() => { flushing = null; schedule(); });
     return flushing;
   }
 
