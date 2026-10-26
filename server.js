@@ -29,6 +29,7 @@ const { checkTake } = require('./take-health');
 const { createAudioMonitor, unknownAudio } = require('./audio-check');
 const { describeAudioHealth, startMasterAudioAnalysis } = require('./audio-health');
 const { offsetFromTiming } = require('./watch-rendition');
+const { compactAudio, heartbeatStateJson } = require('./heartbeat-state');
 
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
@@ -1022,18 +1023,6 @@ function captureBlock(capture) {
 function currentAudio() {
   if (!audioMonitor) return null;
   return audioMonitor.takeAlert() || audioMonitor.latest() || null;
-}
-
-/** The contract `audio` block only (heartbeat: kept small, no extra fields). */
-function compactAudio(block) {
-  if (!block) return null;
-  const mics = {};
-  for (const [name, m] of Object.entries(block.mics || {})) {
-    mics[name] = { muted: !!m.muted, peak_db: Number.isFinite(m.peak_db) ? m.peak_db : null, frozen: typeof m.frozen === 'boolean' ? m.frozen : null, recorded: typeof m.recorded === 'boolean' ? m.recorded : null, codes: Array.isArray(m.codes) ? m.codes : [] };
-  }
-  const out = { level: block.level, checked_at: block.checked_at || null, evo_present: typeof block.evo_present === 'boolean' ? block.evo_present : null, codes: Array.isArray(block.codes) ? block.codes : [], mics };
-  if (block.error) out.error = String(block.error).slice(0, 80);
-  return out;
 }
 
 /** A mic check on the kiosk's cadence: only when idle and the last one is old. Never awaited. */
@@ -2240,36 +2229,20 @@ function heartbeatQuery(now = Date.now()) {
   try {
     const version = getVersionBlock({ projectDir: __dirname, agentVersion: AGENT_VERSION });
     const queue = uploadQueue ? uploadQueue.status() : null;
-    const heartbeatState = {
-      recording: !!state.recording,
-      paused: !!state.paused,
-      // A poll must never do I/O to sample file growth. The next status/diag
-      // remains the authoritative detailed value while this bounded signal
-      // conveys whether a recording is in progress.
-      feeds_writing: state.recording ? null : 0,
-      uploads: queue && Number.isFinite(queue.queued) ? queue.queued : 0,
-      master_active: !!state.masterActive,
-      // Camera reachability is sampled on its own timer: never add I/O here.
-      cameras_down: Array.isArray(cameraReachability && cameraReachability.down)
-        ? cameraReachability.down : [],
-      cameras_checked_at: typeof (cameraReachability && cameraReachability.checked_at) === 'string'
-        ? cameraReachability.checked_at : null,
-      // Disk usage is sampled on its own timer: never add I/O here.
-      disk_free_bytes: Number.isFinite(diskUsage && diskUsage.free_bytes)
-        ? diskUsage.free_bytes : null,
-      disk_total_bytes: Number.isFinite(diskUsage && diskUsage.total_bytes)
-        ? diskUsage.total_bytes : null,
-      disk_checked_at: typeof (diskUsage && diskUsage.checked_at) === 'string'
-        ? diskUsage.checked_at : null,
-      // Power strip health is sampled on its own timer: never add I/O here. Null when unconfigured.
-      power: powerHealth ? { ...powerHealth } : null,
-      // Mic check (cached; idle checks and the take's own watch fill it): never add I/O here.
-      audio: compactAudio(currentAudio()),
-    };
+    const heartbeatJson = heartbeatStateJson({
+      recording: state.recording,
+      paused: state.paused,
+      uploadsQueued: queue && queue.queued,
+      masterActive: state.masterActive,
+      cameraReachability,
+      diskUsage,
+      powerHealth,
+      audio: currentAudio(),
+    });
     lastHeartbeatAt = now;
     return '&hb=1&v=' + encodeURIComponent(AGENT_VERSION)
       + '&c=' + encodeURIComponent(version.commit || 'unknown')
-      + '&state=' + encodeURIComponent(Buffer.from(JSON.stringify(heartbeatState)).toString('base64url'));
+      + '&state=' + encodeURIComponent(Buffer.from(heartbeatJson).toString('base64url'));
   } catch (e) {
     // Heartbeat observability is strictly additive: a local encoding failure
     // must never block or alter the command-poll path.

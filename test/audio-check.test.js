@@ -5,7 +5,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { analyzeMeters, createAudioMonitor, evaluateAudio, meterFrame } = require('../audio-check');
+const { analyzeMeters, createAudioMonitor, evaluateAudio, meterFrame, readAudioSettings } = require('../audio-check');
 
 const MICS = ['Mic 1', 'Mic 2', 'Mic 3', 'Mic 4'];
 
@@ -54,7 +54,7 @@ test('a healthy studio is ok: every mic heard, unmuted, recorded on its own trac
   assert.equal(v.evo_present, true);
   assert.equal(v.checked_at, '2026-10-20T10:00:00.000Z');
   for (const m of MICS) {
-    assert.deepEqual(Object.keys(v.mics[m]).sort(), ['codes', 'frozen', 'muted', 'peak_db', 'recorded', 'volume_db']);
+    assert.deepEqual(Object.keys(v.mics[m]).sort(), ['codes', 'frozen', 'muted', 'peak_db', 'recorded', 'route', 'volume_db']);
     assert.equal(v.mics[m].recorded, true);
     assert.equal(v.mics[m].frozen, false);
     assert.equal(v.mics[m].muted, false);
@@ -220,4 +220,125 @@ test('monitor: a take keeps one client open; pre-start verdict, in-take alert, m
   assert.equal(client.closed, true);
   assert.equal(mon.takeActive(), false);
   assert.equal(obs.clients.length, 1, 'no extra clients during the take');
+});
+
+// Build 45 A6: mic routing. bench-1 since 10-20 said mic_not_recorded on all four
+// mics while the master held four healthy mic tracks. The check now follows each
+// mic's ENABLED tracks, whichever they are, into the recording's RecTracks.
+
+/** Settings where Mic N is routed to `route(N)` (an array of track numbers). */
+function routed(route, recTracks) {
+  const s = settings({ recTracks });
+  MICS.forEach((m, i) => {
+    const on = route(i + 1);
+    for (let t = 1; t <= 6; t += 1) s.mics[m].tracks[String(t)] = on.includes(t);
+  });
+  return s;
+}
+
+test('A6 routing: bench-1 shape (Mic N on track N+1, RecTracks 2-5) is recorded on every mic', () => {
+  const v = evaluateAudio(analyzeMeters(frames(30), MICS), routed((n) => [n + 1], 0b11110), null, MICS);
+  for (const m of MICS) {
+    assert.equal(v.mics[m].recorded, true, m + ' recorded');
+    assert.ok(!v.mics[m].codes.includes('mic_not_recorded'), m + ' has no mic_not_recorded');
+  }
+  assert.ok(!v.codes.includes('mic_not_recorded'));
+  assert.equal(v.level, 'ok');
+});
+
+test('A6 routing: a mic only on a track the recording leaves out is still mic_not_recorded', () => {
+  const v = evaluateAudio(analyzeMeters(frames(30), MICS), routed((n) => (n === 2 ? [6] : [n + 1]), 0b11110), null, MICS);
+  assert.equal(v.mics['Mic 2'].recorded, false);
+  assert.deepEqual(v.mics['Mic 2'].codes, ['mic_not_recorded']);
+  for (const m of ['Mic 1', 'Mic 3', 'Mic 4']) assert.equal(v.mics[m].recorded, true, m);
+  assert.equal(v.level, 'fail');
+  assert.deepEqual(v.codes, ['mic_not_recorded']);
+});
+
+test('A6 routing: a mic on no track at all is mic_not_recorded', () => {
+  const v = evaluateAudio(analyzeMeters(frames(30), MICS), routed((n) => (n === 3 ? [] : [n + 1]), 0b11110), null, MICS);
+  assert.equal(v.mics['Mic 3'].recorded, false);
+  assert.deepEqual(v.codes, ['mic_not_recorded']);
+});
+
+test('A6 routing: unknown RecTracks or a failed track read is recorded null, never mic_not_recorded', () => {
+  const unknownRec = evaluateAudio(analyzeMeters(frames(30), MICS), routed((n) => [n + 1], null), null, MICS);
+  for (const m of MICS) assert.equal(unknownRec.mics[m].recorded, null, m);
+  assert.equal(unknownRec.level, 'ok');
+  assert.deepEqual(unknownRec.codes, []);
+  const s = routed((n) => [n + 1], 0b11110);
+  delete s.mics['Mic 4'].tracks;
+  const unknownTracks = evaluateAudio(analyzeMeters(frames(30), MICS), s, null, MICS);
+  assert.equal(unknownTracks.mics['Mic 4'].recorded, null);
+  assert.deepEqual(unknownTracks.codes, []);
+});
+
+test('A6 routing: each mic carries its route (enabled tracks and the recorded tracks, sorted)', () => {
+  const v = evaluateAudio(analyzeMeters(frames(30), MICS), routed((n) => (n === 1 ? [3, 2] : [n + 1]), 0b11110), null, MICS);
+  assert.deepEqual(v.mics['Mic 1'].route, { tracks: [2, 3], rec_tracks: [2, 3, 4, 5] });
+  assert.deepEqual(v.mics['Mic 4'].route, { tracks: [5], rec_tracks: [2, 3, 4, 5] });
+  const unknown = evaluateAudio(analyzeMeters(frames(30), MICS), routed((n) => [n + 1], null), null, MICS);
+  assert.deepEqual(unknown.mics['Mic 2'].route, { tracks: [3], rec_tracks: null });
+});
+
+/** A fake OBS client answering only the settings reads, with scripted profile parameters. */
+function settingsObs(profile, opts = {}) {
+  return {
+    async request(type, data) {
+      const ok = (responseData) => ({ requestStatus: { result: true }, responseData });
+      if (type === 'GetInputList') return ok({ inputs: MICS.map((inputName) => ({ inputName })) });
+      if (type === 'GetInputMute') return ok({ inputMuted: false });
+      if (type === 'GetInputVolume') return ok({ inputVolumeMul: 1, inputVolumeDb: 0 });
+      if (type === 'GetInputAudioTracks') {
+        if (opts.tracksFail) return { requestStatus: { result: false, code: 600 } };
+        const n = Number(String(data.inputName).slice(-1));
+        const t = {};
+        for (let i = 1; i <= 6; i += 1) t[String(i)] = i === n + 1;
+        return ok({ inputAudioTracks: t });
+      }
+      if (type === 'GetProfileParameter') {
+        const p = profile[data.parameterCategory + '/' + data.parameterName];
+        if (p === 'fail') return { requestStatus: { result: false, code: 600 } };
+        return ok(p || { parameterValue: null, defaultParameterValue: null });
+      }
+      return ok({});
+    },
+  };
+}
+
+test('A6 RecTracks read: an empty parameterValue falls back to defaultParameterValue', async () => {
+  const s = await readAudioSettings(settingsObs({
+    'Output/Mode': { parameterValue: 'Advanced', defaultParameterValue: 'Simple' },
+    'AdvOut/RecTracks': { parameterValue: '', defaultParameterValue: '30' },
+  }), MICS, { evo: false });
+  assert.equal(s.recTracks, 30);
+  const v = evaluateAudio(analyzeMeters(frames(30), MICS), Object.assign(s, { evoPresent: true }), null, MICS);
+  for (const m of MICS) assert.equal(v.mics[m].recorded, true, m);
+});
+
+test('A6 RecTracks read: an unset Mode uses its default (Simple -> SimpleOutput/RecTracks)', async () => {
+  const s = await readAudioSettings(settingsObs({
+    'Output/Mode': { parameterValue: null, defaultParameterValue: 'Simple' },
+    'SimpleOutput/RecTracks': { parameterValue: '30', defaultParameterValue: '1' },
+    'AdvOut/RecTracks': { parameterValue: '1', defaultParameterValue: '1' },
+  }), MICS, { evo: false });
+  assert.equal(s.recTracks, 30);
+});
+
+test('A6 RecTracks read: both values empty, or the read failing, is unknown (recorded null, no mic_not_recorded)', async () => {
+  for (const profile of [
+    { 'Output/Mode': { parameterValue: 'Advanced' }, 'AdvOut/RecTracks': { parameterValue: '', defaultParameterValue: null } },
+    { 'Output/Mode': { parameterValue: 'Advanced' }, 'AdvOut/RecTracks': 'fail' },
+    { 'Output/Mode': 'fail', 'AdvOut/RecTracks': { parameterValue: '30' } },
+  ]) {
+    const s = await readAudioSettings(settingsObs(profile), MICS, { evo: false });
+    assert.equal(s.recTracks, null, JSON.stringify(profile));
+    const v = evaluateAudio(analyzeMeters(frames(30), MICS), Object.assign(s, { evoPresent: true }), null, MICS);
+    for (const m of MICS) assert.equal(v.mics[m].recorded, null, m);
+    assert.ok(!v.codes.includes('mic_not_recorded'));
+  }
+  const failedTracks = await readAudioSettings(settingsObs({ 'Output/Mode': { parameterValue: 'Advanced' }, 'AdvOut/RecTracks': { parameterValue: '30' } }, { tracksFail: true }), MICS, { evo: false });
+  const v = evaluateAudio(analyzeMeters(frames(30), MICS), Object.assign(failedTracks, { evoPresent: true }), null, MICS);
+  for (const m of MICS) assert.equal(v.mics[m].recorded, null, m);
+  assert.deepEqual(v.codes, []);
 });

@@ -1172,7 +1172,7 @@ test('audio_check: every mic fault is reported, warn only, and each recovers onc
   assert.equal(healthy.level, 'ok', JSON.stringify(healthy));
   assert.equal(healthy.evo_present, true);
   assert.deepEqual(Object.keys(healthy.mics), ['Mic 1', 'Mic 2', 'Mic 3', 'Mic 4']);
-  assert.deepEqual(healthy.mics['Mic 1'], { muted: false, peak_db: healthy.mics['Mic 1'].peak_db, frozen: false, recorded: true, codes: [] });
+  assert.deepEqual(healthy.mics['Mic 1'], { muted: false, peak_db: healthy.mics['Mic 1'].peak_db, frozen: false, recorded: true, codes: [], route: { tracks: [1], rec_tracks: [1, 2, 3, 4] } });
   const faults = [
     ['EVO unplugged', () => { audio.evo = false; }, () => { audio.evo = true; }, 'fail', ['evo_missing'], null],
     ['Mic 2 muted', () => { audio.muted = { 'Mic 2': true }; }, () => { audio.muted = {}; }, 'fail', ['mic_muted'], 'Mic 2'],
@@ -1250,9 +1250,11 @@ test('heartbeat carries the cached mic check (the contract audio block), from no
   assert.deepEqual(hb.audio.codes, ['mic_silent']);
   assert.equal(hb.audio.evo_present, true);
   assert.match(hb.audio.checked_at, /^2026-|^20\d\d-/);
-  assert.deepEqual(Object.keys(hb.audio.mics['Mic 3']).sort(), ['codes', 'frozen', 'muted', 'peak_db', 'recorded']);
+  assert.deepEqual(Object.keys(hb.audio.mics['Mic 3']).sort(), ['codes', 'frozen', 'muted', 'peak_db', 'recorded', 'route']);
+  assert.deepEqual(hb.audio.mics['Mic 3'].route, { tracks: [3], rec_tracks: [1, 2, 3, 4] });
   assert.deepEqual(hb.audio.mics['Mic 3'].codes, ['mic_silent']);
-  assert.ok(Buffer.byteLength(JSON.stringify(hb)) < 1024, 'heartbeat stays under 1 KiB: ' + Buffer.byteLength(JSON.stringify(hb)));
+  // The Worker drops a last_state over 2048 bytes (the worst case is pinned in heartbeat-state.test.js).
+  assert.ok(Buffer.byteLength(JSON.stringify(hb)) < 2048, 'heartbeat stays under the 2048-byte cap: ' + Buffer.byteLength(JSON.stringify(hb)));
 });
 
 test('an RTSP take: stop reports timing and offsets; the watch copy is made with that offset (sign checked), registered via the webhook, originals byte-identical', { timeout: 90000 }, async (t) => {

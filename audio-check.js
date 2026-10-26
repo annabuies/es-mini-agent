@@ -8,9 +8,10 @@
 // What one check reads, over its own short-lived obs-websocket client (the shared
 // client keeps eventSubscriptions 0, so its request sequences are unchanged):
 //   - ~1.5 s of InputVolumeMeters events (subscription bit 1<<16, ~20 a second)
-//   - per mic: GetInputMute, GetInputVolume, GetInputAudioTracks
+//   - per mic: GetInputMute, GetInputVolume, GetInputAudioTracks (all six tracks)
 //   - the recording's tracks: GetProfileParameter Output/Mode, then
 //     AdvOut/RecTracks (SimpleOutput/RecTracks in Simple mode), a bitmask string
+//     (bit 0 = track 1); parameterValue, or defaultParameterValue when unset
 //   - EVO 8 presence: Mic N's CoreAudio device list (evo-audio readMicInput). The
 //     "AppleUSBAudioEngine:Audient:EVO8..." entry only exists while the EVO is
 //     plugged in; the Loopback "EVO Ch1-4" devices persist without it.
@@ -18,7 +19,7 @@
 // Verdict codes (the `audio` block contract): evo_missing, mic_muted, mic_silent
 // (digital zero; or peak below -90 dBFS = warn), mics_frozen (no meter updates,
 // or values that never change), mics_identical (two mics carrying one signal),
-// mic_not_recorded (input missing, its track N off, or track N not recorded),
+// mic_not_recorded (input missing, or none of its enabled tracks is recorded),
 // meters_unavailable (no meter events at all).
 
 const { ObsClient, EVENT_SUB_INPUT_VOLUME_METERS, EVENT_SUB_OUTPUTS } = require('./obs-control');
@@ -51,11 +52,6 @@ function data(response) {
 
 function toDb(mul) {
   return Number.isFinite(mul) && mul > 0 ? Math.round(20 * Math.log10(mul) * 10) / 10 : null;
-}
-
-function micNumber(name) {
-  const m = String(name).match(/(\d+)\s*$/);
-  return m ? Number(m[1]) : null;
 }
 
 /** inputLevelsMul for one input: [[magnitude, peak, inputPeak], ...] per channel. */
@@ -133,15 +129,26 @@ function analyzeMeters(frames, micNames) {
   return out;
 }
 
-function trackOn(tracks, n) {
-  if (!tracks || typeof tracks !== 'object' || !n) return null;
-  const v = tracks[String(n)];
-  return typeof v === 'boolean' ? v : null;
+const MAX_TRACKS = 6;
+
+/**
+ * GetInputAudioTracks' inputAudioTracks ({"1": bool, ... "6": bool}; obs-websocket
+ * builds the keys as std::to_string(i + 1) from the source's mixer bits) -> the
+ * enabled track numbers, sorted. Null when the read failed.
+ */
+function enabledTracks(tracks) {
+  if (!tracks || typeof tracks !== 'object') return null;
+  const out = [];
+  for (let t = 1; t <= MAX_TRACKS; t += 1) if (tracks[String(t)] === true) out.push(t);
+  return out;
 }
 
-function recTrackOn(recTracks, n) {
-  if (!Number.isInteger(recTracks) || !n) return null;
-  return (recTracks & (1 << (n - 1))) !== 0;
+/** RecTracks bitmask (bit 0 = track 1, as OBS's `tracks & (1 << i)`) -> track numbers. Null when unknown. */
+function recTrackList(recTracks) {
+  if (!Number.isInteger(recTracks) || recTracks <= 0) return null;
+  const out = [];
+  for (let t = 1; t <= MAX_TRACKS; t += 1) if ((recTracks & (1 << (t - 1))) !== 0) out.push(t);
+  return out;
 }
 
 /**
@@ -156,20 +163,19 @@ function evaluateAudio(meters, info, checkedAt, micNames) {
   let warnOnly = true;
   const identical = new Set();
   for (const [a, b] of (meters && meters.identical_pairs) || []) { identical.add(a); identical.add(b); }
+  const recList = recTrackList(facts.recTracks);
   for (const name of names) {
     const mi = (facts.mics && facts.mics[name]) || {};
     const mm = (meters && meters.mics && meters.mics[name]) || { frames: 0, peak_db: null, zero: null, frozen: null };
     const micCodes = [];
-    const n = micNumber(name);
     const muted = mi.muted === true || mi.volume_mul === 0;
+    // Recorded = any track the mic is ON is a track the recording keeps. Mic N need
+    // not be on track N (bench-1 since 10-20: Mic N on track N+1, RecTracks 2-5).
+    // Unknown (null, no code) when either read failed or RecTracks is unknown.
+    const tracks = mi.exists === false ? null : enabledTracks(mi.tracks);
     let recorded = null;
     if (mi.exists === false) recorded = false;
-    else {
-      const onTrack = trackOn(mi.tracks, n);
-      const recOn = recTrackOn(facts.recTracks, n);
-      if (onTrack === false || recOn === false) recorded = false;
-      else if (onTrack === true && recOn === true) recorded = true;
-    }
+    else if (tracks && recList) recorded = tracks.some((t) => recList.includes(t));
     if (muted) micCodes.push('mic_muted');
     if (recorded === false) micCodes.push('mic_not_recorded');
     // A muted or deleted mic explains its own meter; only the cause is reported.
@@ -185,6 +191,7 @@ function evaluateAudio(meters, info, checkedAt, micNames) {
     const entry = { muted, peak_db: mm.peak_db, frozen: mm.frozen, recorded, codes: micCodes };
     if (mi.exists === false) entry.missing = true;
     if (Number.isFinite(mi.volume_db)) entry.volume_db = Math.round(mi.volume_db * 10) / 10;
+    if (mi.exists !== false) entry.route = { tracks, rec_tracks: recList };
     mics[name] = entry;
   }
   if (meters && !meters.available) codes.add('meters_unavailable');
@@ -209,6 +216,20 @@ function unknownAudio(error, checkedAt) {
 
 async function safeRequest(client, type, payload) {
   try { return await client.request(type, payload); } catch (_) { return null; }
+}
+
+/**
+ * GetProfileParameter -> its value as a string: parameterValue, else
+ * defaultParameterValue when the profile never set it (null/empty). Null when
+ * the read failed or both are empty.
+ */
+function profileValue(response) {
+  if (!ok(response)) return null;
+  const d = data(response);
+  for (const v of [d.parameterValue, d.defaultParameterValue]) {
+    if (v !== null && v !== undefined && String(v).trim() !== '') return String(v).trim();
+  }
+  return null;
 }
 
 /** Mute, volume, tracks per mic; the recording's track mask; EVO presence. Never throws. */
@@ -236,12 +257,15 @@ async function readAudioSettings(client, micNames, options) {
     if (ok(tracks) && data(tracks).inputAudioTracks && typeof data(tracks).inputAudioTracks === 'object') entry.tracks = data(tracks).inputAudioTracks;
     out.mics[name] = entry;
   }
-  const modeRes = await safeRequest(client, 'GetProfileParameter', { parameterCategory: 'Output', parameterName: 'Mode' });
-  const mode = ok(modeRes) ? data(modeRes).parameterValue : null;
-  const category = mode === 'Simple' ? 'SimpleOutput' : 'AdvOut';
-  const recRes = await safeRequest(client, 'GetProfileParameter', { parameterCategory: category, parameterName: 'RecTracks' });
-  const recValue = ok(recRes) ? Number(data(recRes).parameterValue) : NaN;
-  out.recTracks = Number.isInteger(recValue) && recValue > 0 ? recValue : null;
+  // Output/Mode is "Simple" or "Advanced"; an unset value means OBS's default.
+  // A failed or empty Mode read leaves RecTracks unknown rather than guessing AdvOut.
+  const mode = profileValue(await safeRequest(client, 'GetProfileParameter', { parameterCategory: 'Output', parameterName: 'Mode' }));
+  if (mode !== null) {
+    const category = mode === 'Simple' ? 'SimpleOutput' : 'AdvOut';
+    const recValue = Number(profileValue(await safeRequest(client, 'GetProfileParameter', { parameterCategory: category, parameterName: 'RecTracks' })));
+    // 0 / empty / unreadable = unknown (OBS falls back to its legacy TrackIndex at 0).
+    out.recTracks = Number.isInteger(recValue) && recValue > 0 ? recValue : null;
+  }
   if (opts.evo !== false) {
     const firstMic = micNames.find((n) => !out.mics[n] || out.mics[n].exists !== false);
     if (firstMic) {
