@@ -692,6 +692,9 @@ test('session_ref is reported while recording and echoed to every stop upload', 
   assert.equal((await postAgent(agent.agentPort, 'diag')).session_ref, 'session_123');
   touchTakeFiles(recordDir);
   await postAgent(agent.agentPort, 'stop');
+  const finished = await postAgent(agent.agentPort, 'status');
+  assert.equal(finished.last_take.session_ref, 'session_123');
+  assert.equal(finished.last_take.saved, true);
   await waitFor(() => uploads.filter((request) => request.method === 'POST' && request.query.has('uploads')).length === 4, 12000);
   await waitFor(() => webhookBodies.length === 4, 4000);
   await waitFor(() => fs.readdirSync(path.join(recordDir, '.upload-state')).length === 0, 2000);

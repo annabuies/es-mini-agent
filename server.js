@@ -1547,7 +1547,9 @@ async function handleOp(op, body) {
       if (timingBlock) response.timing = timingBlock;
       if (recordedAt) response.recorded_at = recordedAt;
       if (takeAudio && takeAudio.alert) response.audio_alert = compactAudio(takeAudio.alert);
-      const lastTake = { finished_at: new Date().toISOString(), saved, health: takeHealth, files, failed_files: failedFiles, fallback_sources: fellBack };
+      // Preserve the take id after Stop so a phone that lost the Stop answer can
+      // confirm this exact save without confusing it with a previous room take.
+      const lastTake = { finished_at: new Date().toISOString(), session_ref: sessionRef, saved, health: takeHealth, files, failed_files: failedFiles, fallback_sources: fellBack };
       if (audioHealth) lastTake.audio_health = audioHealth;
       if (recordedAt) lastTake.recorded_at = recordedAt;
       state.lastTake = lastTake;
