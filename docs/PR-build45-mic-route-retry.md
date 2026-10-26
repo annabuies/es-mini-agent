@@ -18,10 +18,11 @@ Plan: `ab-wiki/Clients/ES/docs/build45-phone-looks-readiness-mic-build-plan-2026
   - The webhook URL (`?key=`) is never written to disk or logged. The old code logged response bodies that could echo it; that is fixed.
   - Given-up notices now schedule their own 7-day expiry, so `webhook_pending` clears without another upload. A synchronous no-op flush also releases its in-flight guard, allowing later retries and pruning.
 - **Upload state ordering** (`upload-queue.js`): the worker waits for the queued state write before processing a file. A 0-byte master could previously finish and delete its state while that write was still in flight, leaving a stale state file after the take.
+- **Exact-take Stop recovery** (`server.js`): idle status retains the stopped take's `session_ref` with its save and file-health result. The app relay only accepts this as proof of Saved when the phone requests that same take, and it strips local file paths. This does not change the installed mic-only patch.
 - **Version** `2026.10.26-2`. `modules.txt` gains `heartbeat-state.js` and `webhook-outbox.js`, and a new test follows every `require` from `server.js`.
 
 Install **after** the honeybook shim (idempotency key) is live. Never via the `update` op until this and #24 are on `main`.
 
-Audit tests: the initial parallel full suite ran 191 tests: 185 passed, 5 failed, 1 skipped. Four failures were timing-sensitive PTZ/RTSP assertions under concurrent load; PTZ passed 11/11 isolated and RTSP passed 23/23 on five isolated runs. The fifth failure exposed the queued-state write race fixed above. After the fix, the zero-byte upload suite passed 6/6, webhook retry suite 7/7, and adjacent upload/watch-copy suite 5/5. The full parallel suite has not been rerun after this fix; release verification still needs the normal CI gate.
+Audit tests: the initial parallel full suite ran 191 tests: 185 passed, 5 failed, 1 skipped. Four failures were timing-sensitive PTZ/RTSP assertions under concurrent load; PTZ passed 11/11 isolated and RTSP passed 23/23 on five isolated runs. The fifth failure exposed the queued-state write race fixed above. After the fix, the zero-byte upload suite passed 6/6, webhook retry suite 7/7, adjacent upload/watch-copy suite 5/5, and exact-take status test passed. The final serial full suite passed 191 of 192 tests with 1 skip and 0 failures in 268.7 seconds. CI review and a live install still remain.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
