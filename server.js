@@ -2238,6 +2238,8 @@ function heartbeatQuery(now = Date.now()) {
       diskUsage,
       powerHealth,
       audio: currentAudio(),
+      // Undelivered upload_confirmed posts (A8; in memory, no I/O).
+      webhookPending: uploadQueue ? uploadQueue.webhookPending() : null,
     });
     lastHeartbeatAt = now;
     return '&hb=1&v=' + encodeURIComponent(AGENT_VERSION)

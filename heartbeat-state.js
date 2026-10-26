@@ -36,6 +36,8 @@ function compactAudio(block, options) {
  * The heartbeat state object from the agent's cached samples (never I/O).
  * inputs: { recording, paused, uploadsQueued, masterActive, cameraReachability,
  *           diskUsage, powerHealth, audio (full or compact block), webhookPending }
+ * webhook_pending (A8) is omitted when nothing is pending (the cloud alerts on
+ * count > 0 only); else { count, oldest_age_s } plus gave_up when any gave up.
  */
 function buildHeartbeatState(inputs, options) {
   const i = inputs || {};
@@ -68,6 +70,11 @@ function buildHeartbeatState(inputs, options) {
     // Mic check (cached; idle checks and the take's own watch fill it): never add I/O here.
     audio: compactAudio(i.audio, options),
   };
+  const wp = i.webhookPending;
+  if (wp && Number.isFinite(wp.count) && wp.count > 0) {
+    out.webhook_pending = { count: wp.count, oldest_age_s: Number.isFinite(wp.oldest_age_s) ? wp.oldest_age_s : null };
+    if (Number.isFinite(wp.gave_up) && wp.gave_up > 0) out.webhook_pending.gave_up = wp.gave_up;
+  }
   return out;
 }
 

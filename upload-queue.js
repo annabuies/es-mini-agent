@@ -7,6 +7,7 @@ const { spawn } = require('child_process');
 
 const { runMultipartUpload, signS3Request } = require('./storage-upload');
 const { mixArgs, planWatch, probeMedia, watchArgs } = require('./watch-rendition');
+const { createWebhookOutbox } = require('./webhook-outbox');
 
 const STABILITY_POLL_MS = 2000;
 const STABILITY_WARN_MS = 60000;
@@ -176,6 +177,10 @@ function createUploadQueue(opts) {
 
   const proxyPollMs = Number.isFinite(options.proxyPollMs) && options.proxyPollMs >= 0 ? options.proxyPollMs : PROXY_POLL_MS;
   const watchRetryMs = Number.isFinite(options.watchRetryMs) && options.watchRetryMs >= 0 ? options.watchRetryMs : WATCH_RETRY_MS;
+  // Every upload_confirmed (uploads, failed cameras, failed watch copies) goes
+  // through one durable outbox in the state dir: a failed POST is retried
+  // (webhook-outbox.js). Retries use the current webhook URL.
+  const outbox = options.webhookOutbox || createWebhookOutbox(Object.assign({}, options.outboxOptions || {}, { stateDir, webhookUrl: () => (typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl) }));
 
   const queue = [];
   const pendingProxyJobs = [];
@@ -488,26 +493,18 @@ function createUploadQueue(opts) {
   async function postFailedCamera(key, source, sessionRef, meta) {
     const url = typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl;
     if (!url) return;
-    try {
-      const res = await fetch(String(url), {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(Object.assign({}, meta || {}, {
-          event: 'upload_confirmed',
-          key,
-          sizeBytes: 0,
-          confirmedAt: new Date().toISOString(),
-          kind: 'video',
-          rendition: 'original',
-          building_id: buildingId,
-          source,
-          session_ref: sessionRef,
-        })),
-      });
-      if (!res.ok) console.warn('[upload-queue] failed-camera webhook failed status=' + res.status + ' key=' + key);
-    } catch (e) {
-      console.warn('[upload-queue] failed-camera webhook error key=' + key + ':', e && (e.message || e));
-    }
+    const result = await outbox.post(Object.assign({}, meta || {}, {
+      event: 'upload_confirmed',
+      key,
+      sizeBytes: 0,
+      confirmedAt: new Date().toISOString(),
+      kind: 'video',
+      rendition: 'original',
+      building_id: buildingId,
+      source,
+      session_ref: sessionRef,
+    }), { url }).catch(() => ({ delivered: false, queued: false }));
+    if (!result.delivered) console.warn('[upload-queue] failed-camera webhook not delivered' + (result.queued ? ', kept for retry' : '') + ' key=' + key);
   }
 
   async function reportEmptyFile(job, sizeBytes, why) {
@@ -583,6 +580,7 @@ function createUploadQueue(opts) {
         isRecording,
         shouldAbort: () => false,
         webhookUrl: typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl,
+        webhookOutbox: outbox,
         webhookExtra: Object.assign({}, job.meta || {}, { kind: webhookKind(job.kind), building_id: buildingId, source: job.source, session_ref: job.sessionRef }),
         abortOnFailure: false,
         deleteObjectAfterVerify: false,
@@ -726,6 +724,7 @@ function createUploadQueue(opts) {
       isRecording,
       shouldAbort: () => false,
       webhookUrl: url,
+      webhookOutbox: outbox,
       webhookExtra: extra,
       abortOnFailure: false,
       deleteObjectAfterVerify: false,
@@ -816,28 +815,20 @@ function createUploadQueue(opts) {
     const url = typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl;
     if (!url) return;
     const watch = job.watch || {};
-    try {
-      const res = await fetch(String(url), {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(Object.assign({
-          event: 'upload_confirmed',
-          key: streamKey,
-          sizeBytes: 0,
-          confirmedAt: new Date().toISOString(),
-          kind: 'video',
-          rendition: 'watch',
-          original_key: job.key,
-          watch_error: String(reason).slice(0, 64),
-          building_id: buildingId,
-          source: job.source,
-          session_ref: job.sessionRef,
-        }, watch.recordedAt ? { recorded_at: watch.recordedAt } : {})),
-      });
-      if (!res.ok) console.warn('[upload-queue] watch-failed webhook failed status=' + res.status + ' key=' + streamKey);
-    } catch (e) {
-      console.warn('[upload-queue] watch-failed webhook error key=' + streamKey + ':', e && (e.message || e));
-    }
+    const result = await outbox.post(Object.assign({
+      event: 'upload_confirmed',
+      key: streamKey,
+      sizeBytes: 0,
+      confirmedAt: new Date().toISOString(),
+      kind: 'video',
+      rendition: 'watch',
+      original_key: job.key,
+      watch_error: String(reason).slice(0, 64),
+      building_id: buildingId,
+      source: job.source,
+      session_ref: job.sessionRef,
+    }, watch.recordedAt ? { recorded_at: watch.recordedAt } : {}), { url }).catch(() => ({ delivered: false, queued: false }));
+    if (!result.delivered) console.warn('[upload-queue] watch-failed webhook not delivered' + (result.queued ? ', kept for retry' : '') + ' key=' + streamKey);
   }
 
   async function ensureWorker() {
@@ -1040,7 +1031,18 @@ function createUploadQueue(opts) {
     return true;
   }
 
-  return { enqueue, sweep, status, reportMissingCamera, holdProxies, annotate };
+  return {
+    enqueue,
+    sweep,
+    status,
+    reportMissingCamera,
+    holdProxies,
+    annotate,
+    // Heartbeat webhook_pending: null when every upload_confirmed was delivered.
+    webhookPending: () => outbox.pending(),
+    flushWebhooks: () => outbox.flush(),
+    stop: () => outbox.stop(),
+  };
 }
 
 module.exports = { createUploadQueue, resolveFfmpegBin, resolveFfprobeBin, cleanMeta };
