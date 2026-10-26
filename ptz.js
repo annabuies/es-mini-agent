@@ -3,6 +3,11 @@
 const { requestWithDigest } = require('./digest-auth');
 
 const DEFAULT_TIMEOUT_MS = 3000;
+// A look's settle time (Build 45 A5): the recall answers before the camera stops
+// moving. The agent never waits for it (one command at a time; the Worker skips a
+// look after 6.5 s); it reports settled_at so the app knows when the shot is set.
+const DEFAULT_LOOK_SETTLE_MS = 4000;
+const MAX_LOOK_SETTLE_MS = 15000;
 const SAFE_HOST_RE = /^[A-Za-z0-9.-]+(?::[0-9]{1,5})?$/;
 
 function isPlainObject(value) {
@@ -73,6 +78,14 @@ function recall(host, preset, options) {
   }).catch(() => 'error');
 }
 
+/** LOOK_SETTLE_MS -> ms: default 4000, clamped to 0..15000, non-numeric -> default. */
+function lookSettleMs(value) {
+  if (value === undefined || value === null || String(value).trim() === '') return DEFAULT_LOOK_SETTLE_MS;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return DEFAULT_LOOK_SETTLE_MS;
+  return Math.min(MAX_LOOK_SETTLE_MS, Math.max(0, Math.floor(n)));
+}
+
 async function executeLook(config, look, options) {
   const lookKey = (typeof look === 'string' || typeof look === 'number')
     ? String(look).trim()
@@ -102,16 +115,18 @@ async function executeLook(config, look, options) {
   const entries = await Promise.all(Object.entries(looks[lookKey]).map(async ([cameraName, preset]) => {
     const startedAt = now();
     const camera = byName.get(cameraName);
-    if (!camera) return [cameraName, 'error', Math.max(0, now() - startedAt)];
+    if (!camera) return [cameraName, 'error', 0, startedAt];
+    let outcome;
     try {
-      const outcome = await recallFn(camera.host, preset, {
+      outcome = await recallFn(camera.host, preset, {
         timeoutMs: timeoutMs || DEFAULT_TIMEOUT_MS,
         credentials: options && options.credentials,
       });
-      return [cameraName, outcome, Math.max(0, now() - startedAt)];
     } catch (_) {
-      return [cameraName, 'error', Math.max(0, now() - startedAt)];
+      outcome = 'error';
     }
+    const finishedAt = now();
+    return [cameraName, outcome, Math.max(0, finishedAt - startedAt), finishedAt];
   }));
   const results = Object.fromEntries(entries.map(([cameraName, outcome]) => [cameraName, outcome]));
 
@@ -119,16 +134,25 @@ async function executeLook(config, look, options) {
     .map(([cameraName, outcome, elapsedMs]) => `${cameraName} ${outcome} ${elapsedMs}ms`)
     .join(', ')}`);
 
-  return {
-    ok: entries.every((entry) => entry[1] === 'ok'),
-    look: lookKey,
-    cameras: results,
-  };
+  const ok = entries.every((entry) => entry[1] === 'ok');
+  const result = { ok, look: lookKey, cameras: results };
+  if (ok) {
+    // settled_at: when every recall had returned, plus the settle time. A later
+    // look simply reports its own later settled_at; nothing here waits or stacks.
+    const settleMs = options && options.settleMs !== undefined ? lookSettleMs(options.settleMs) : lookSettleMs(process.env.LOOK_SETTLE_MS);
+    const allBackAt = entries.length ? Math.max(...entries.map((entry) => entry[3])) : now();
+    result.elapsed_ms = Object.fromEntries(entries.map(([cameraName, , elapsedMs]) => [cameraName, elapsedMs]));
+    result.settle_ms = settleMs;
+    result.settled_at = new Date(allBackAt + settleMs).toISOString();
+  }
+  return result;
 }
 
 module.exports = {
+  DEFAULT_LOOK_SETTLE_MS,
   DEFAULT_TIMEOUT_MS,
   executeLook,
+  lookSettleMs,
   normalizeCameras,
   normalizeLooks,
   recall,

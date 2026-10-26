@@ -5,6 +5,7 @@ const http = require('node:http');
 const test = require('node:test');
 const {
   executeLook,
+  lookSettleMs,
   normalizeCameras,
   normalizeLooks,
   recall,
@@ -189,4 +190,80 @@ test('remote PTZ config normalization is all-or-nothing', () => {
     '1': { cam1: 0 }, '2': { cam1: 1 },
   });
   assert.equal(normalizeLooks({ '1': { cam1: -1 } }), null);
+});
+
+// Build 45 A5: a look's settle time. The PTZ HTTP recall answers in under a
+// second, before the camera stops moving. The agent does NOT wait (one command
+// at a time, and the Worker skips a look after 6.5 s); it reports when the move
+// should be done: settled_at = the moment every recall returned + settle_ms.
+
+const LOOK_CONFIG = {
+  recording: false,
+  paused: false,
+  cameras: [{ name: 'cam1', host: 'camera-1' }, { name: 'cam2', host: 'camera-2' }],
+  looks: { '2': { cam1: 1, cam2: 2 }, '3': { cam1: 3, cam2: 4 } },
+};
+
+test('A5 look settle: every recall ok -> settle_ms, settled_at (all recalls back + settle) and per-camera elapsed_ms', async () => {
+  const times = [10000, 10000, 10250, 10400];
+  const result = await executeLook(LOOK_CONFIG, '2', {
+    now: () => times.shift(),
+    settleMs: 4000,
+    recallFn: async () => 'ok',
+  });
+  assert.deepEqual(result, {
+    ok: true,
+    look: '2',
+    cameras: { cam1: 'ok', cam2: 'ok' },
+    elapsed_ms: { cam1: 250, cam2: 400 },
+    settle_ms: 4000,
+    settled_at: new Date(10400 + 4000).toISOString(),
+  });
+});
+
+test('A5 look settle: LOOK_SETTLE_MS defaults to 4000 and is clamped to 0..15000', async () => {
+  assert.equal(lookSettleMs(undefined), 4000);
+  assert.equal(lookSettleMs(''), 4000);
+  assert.equal(lookSettleMs('abc'), 4000);
+  assert.equal(lookSettleMs('99999'), 15000);
+  assert.equal(lookSettleMs('-5'), 0);
+  assert.equal(lookSettleMs('2500'), 2500);
+  assert.equal(lookSettleMs('2500.7'), 2500);
+  const prior = process.env.LOOK_SETTLE_MS;
+  process.env.LOOK_SETTLE_MS = '99999';
+  try {
+    const r = await executeLook(LOOK_CONFIG, '2', { recallFn: async () => 'ok' });
+    assert.equal(r.settle_ms, 15000);
+  } finally {
+    if (prior === undefined) delete process.env.LOOK_SETTLE_MS; else process.env.LOOK_SETTLE_MS = prior;
+  }
+});
+
+test('A5 look settle: a camera error is ok:false with no settled_at or settle_ms', async () => {
+  const result = await executeLook(LOOK_CONFIG, '2', {
+    settleMs: 4000,
+    recallFn: async (host) => (host === 'camera-2' ? 'timeout' : 'ok'),
+  });
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.cameras, { cam1: 'ok', cam2: 'timeout' });
+  assert.equal(result.settled_at, undefined);
+  assert.equal(result.settle_ms, undefined);
+});
+
+test('A5 look settle: back-to-back looks both return at once (no settle wait), the second settles later', async () => {
+  const opts = { settleMs: 4000, recallFn: async () => { await new Promise((r) => setTimeout(r, 20)); return 'ok'; } };
+  const t0 = Date.now();
+  const first = await executeLook(LOOK_CONFIG, '2', opts);
+  const second = await executeLook(LOOK_CONFIG, '3', opts);
+  const took = Date.now() - t0;
+  assert.ok(took < 1000, 'two looks took ' + took + ' ms (a settle wait would be >= 8000)');
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  assert.ok(Date.parse(first.settled_at) >= t0 + 4000, 'settled_at is in the future');
+  assert.ok(Date.parse(second.settled_at) > Date.parse(first.settled_at), 'the second look settles later');
+});
+
+test('A5 look settle: a look mapping no cameras still answers (settled_at from now)', async () => {
+  const r = await executeLook({ ...LOOK_CONFIG, looks: { empty: {} } }, 'empty', { settleMs: 0, now: () => 5000 });
+  assert.deepEqual(r, { ok: true, look: 'empty', cameras: {}, elapsed_ms: {}, settle_ms: 0, settled_at: new Date(5000).toISOString() });
 });
