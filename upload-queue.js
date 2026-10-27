@@ -183,6 +183,8 @@ function createUploadQueue(opts) {
   const outbox = options.webhookOutbox || createWebhookOutbox(Object.assign({}, options.outboxOptions || {}, { stateDir, webhookUrl: () => (typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl) }));
 
   const queue = [];
+  // Watch copies have priority over the duplicate legacy proxies/ upload. Both
+  // are low-priority work and stop starting new jobs during a take.
   const pendingProxyJobs = [];
   let proxyWorkerRunning = false;
   let activeProxy = null; // { proc, closed } while a proxy encode runs
@@ -201,6 +203,12 @@ function createUploadQueue(opts) {
 
   function stateFilePathForKey(key) {
     return path.join(stateDir, toSafeFileName(key) + '.state.json');
+  }
+
+  // A legacy proxies/ upload waits behind other cameras' Watch copies, so a restart
+  // in that wait must not orphan its .watch.mp4 or lose the copy: sweep() reloads it.
+  function legacyFilePathForKey(key) {
+    return path.join(stateDir, toSafeFileName(key) + '.legacy.json');
   }
 
   function buildBaseState(job, status) {
@@ -673,6 +681,7 @@ function createUploadQueue(opts) {
   }
 
   function maybeMakeProxy(job) {
+    if (!job.watchQueuedAt) job.watchQueuedAt = Date.now();
     pendingProxyJobs.push(job);
     if (proxiesBlocked()) console.warn('[upload-queue] watch copy deferred (recording active) key=' + job.key);
     ensureProxyWorker().catch((e) => {
@@ -690,16 +699,19 @@ function createUploadQueue(opts) {
           await new Promise((resolve) => { const t = setTimeout(resolve, proxyPollMs); if (t.unref) t.unref(); });
           continue;
         }
-        // A copy waiting to be tried again lets the others go first.
+        // A copy waiting to be tried again lets the others go first. In
+        // particular, never make another camera wait for the prior camera's
+        // second, legacy upload after its stream/ Watch is already ready.
         const now = Date.now();
-        const job = pendingProxyJobs.find((j) => !(j.watchRetryAt > now));
+        const ready = (j) => !(j.watchRetryAt > now);
+        const job = pendingProxyJobs.find((j) => !j.legacyCopy && ready(j)) || pendingProxyJobs.find(ready);
         if (!job) {
           const soonest = Math.min(...pendingProxyJobs.map((j) => j.watchRetryAt));
           await new Promise((resolve) => { const t = setTimeout(resolve, Math.max(0, Math.min(soonest - now, proxyPollMs))); if (t.unref) t.unref(); });
           continue;
         }
         // A copy stopped for a take stays in the line and is redone.
-        const result = await makeProxy(job);
+        const result = job.legacyCopy ? await uploadLegacyProxy(job) : await makeProxy(job);
         if (!result) continue;
         pendingProxyJobs.splice(pendingProxyJobs.indexOf(job), 1);
         if (result === 'retry') {
@@ -732,6 +744,30 @@ function createUploadQueue(opts) {
     await removeFileIfExists(stateFilePath);
   }
 
+  /** Keep the old proxies/ object available, after pending stream/ Watch copies. */
+  async function uploadLegacyProxy(job) {
+    let retry = false;
+    try {
+      await uploadRendition(job, job.filePath, job.key, undefined, {
+        kind: 'proxy', rendition: 'proxy', building_id: buildingId,
+        source: job.source, session_ref: job.sessionRef,
+      });
+      console.log('[upload-queue] proxy confirmed ' + job.key);
+    } catch (e) {
+      job.watchAttempts = (job.watchAttempts || 0) + 1;
+      retry = job.watchAttempts < WATCH_COPY_ATTEMPTS;
+      console.warn('[upload-queue] legacy proxy upload failed key=' + job.key + ' attempt=' + job.watchAttempts + '/' + WATCH_COPY_ATTEMPTS
+        + (retry ? ' (will try again)' : ' (giving up)') + ' error=' + truncateError(e && (e.message || e.stack || e)));
+    } finally {
+      if (!retry) {
+        await removeFileIfExists(job.filePath).catch(() => {});
+        await removeFileIfExists(stateFilePathForKey(job.key)).catch(() => {});
+        await removeFileIfExists(legacyFilePathForKey(job.key)).catch(() => {});
+      }
+    }
+    return retry ? 'retry' : true;
+  }
+
   /**
    * The camera's watch copy (Build 42; this step made the silent "proxy" before):
    * 1080p H.264 ~4 Mbps, a keyframe every 2 s, faststart, with the take's mic mix
@@ -751,6 +787,9 @@ function createUploadQueue(opts) {
     const watch = job.watch || {};
     let preempted = false;
     let retry = false;
+    let legacyQueued = false;
+    // Field timing (Build 45): where Watch readiness time goes, per camera.
+    let encodeStartedAt = null;
 
     try {
       let st;
@@ -764,7 +803,12 @@ function createUploadQueue(opts) {
 
       const plan = await planWatch({ cameraPath: job.filePath, masterPath: watch.masterPath || null, offsetS: Number.isFinite(watch.offsetS) ? watch.offsetS : null }, { ffprobeBin: resolveFfprobeBin });
       if (plan.audio !== 'mix') console.warn('[upload-queue] WARN watch copy without audio key=' + job.key + ' reason=' + (!watch.masterPath ? 'no_master' : (plan.offsetS === null ? 'no_timing' : 'master_unreadable')));
+      encodeStartedAt = Date.now();
+      console.log('[upload-queue] watch encode start key=' + job.key + ' wait_ms=' + (job.watchQueuedAt ? encodeStartedAt - job.watchQueuedAt : -1)
+        + ' pending=' + pendingProxyJobs.length + ' attempt=' + ((job.watchAttempts || 0) + 1) + ' preempts=' + (job.watchPreempts || 0));
       await runProxyFfmpeg(watchArgs({ cameraPath: job.filePath, masterPath: watch.masterPath, masterTracks: plan.masterTracks, delayS: plan.delayS, outPath: tmpPath }));
+      const encodeMs = Date.now() - encodeStartedAt;
+      const uploadStartedAt = Date.now();
 
       const out = await probeMedia(tmpPath, { ffprobeBin: resolveFfprobeBin });
       const extra = Object.assign({}, job.meta || {}, {
@@ -778,14 +822,26 @@ function createUploadQueue(opts) {
       if (watch.recordedAt) extra.recorded_at = watch.recordedAt;
       if (plan.offsetS !== null) extra.offset_s = plan.offsetS;
       await uploadRendition(job, tmpPath, streamKey, typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl, extra);
-      console.log('[upload-queue] watch copy confirmed ' + streamKey + ' audio=' + plan.audio + (plan.delayS !== null ? ' delay=' + plan.delayS.toFixed(3) + 's' : ''));
+      console.log('[upload-queue] watch copy confirmed ' + streamKey + ' audio=' + plan.audio + (plan.delayS !== null ? ' delay=' + plan.delayS.toFixed(3) + 's' : '')
+        + ' encode_ms=' + encodeMs + ' upload_ms=' + (Date.now() - uploadStartedAt)
+        + ' ready_ms=' + (job.watchQueuedAt ? Date.now() - job.watchQueuedAt : -1));
       if (proxyCopy) {
-        await uploadRendition(job, tmpPath, proxyKey, undefined, { kind: 'proxy', rendition: 'proxy', building_id: buildingId, source: job.source, session_ref: job.sessionRef });
-        console.log('[upload-queue] proxy confirmed ' + proxyKey);
+        const legacy = { legacyCopy: true, filePath: tmpPath, key: proxyKey, source: job.source, sessionRef: job.sessionRef };
+        try {
+          await writeJsonFileAtomic(legacyFilePathForKey(proxyKey), { version: 1, filePath: tmpPath, key: proxyKey, source: job.source, sessionRef: job.sessionRef || null });
+        } catch (e) {
+          console.warn('[upload-queue] could not record legacy proxy wait key=' + proxyKey + ':', e && (e.message || e));
+        }
+        pendingProxyJobs.push(legacy);
+        legacyQueued = true;
       }
     } catch (e) {
       preempted = !!(e && e.preempted);
-      if (preempted) console.warn('[upload-queue] watch copy stopped for a take, will redo after it key=' + job.key);
+      if (preempted) {
+        job.watchPreempts = (job.watchPreempts || 0) + 1;
+        console.warn('[upload-queue] watch copy stopped for a take, will redo after it key=' + job.key
+          + ' lost_encode_ms=' + (encodeStartedAt ? Date.now() - encodeStartedAt : 0) + ' preempts=' + job.watchPreempts);
+      }
       else {
         job.watchAttempts = (job.watchAttempts || 0) + 1;
         retry = job.watchAttempts < WATCH_COPY_ATTEMPTS;
@@ -794,7 +850,7 @@ function createUploadQueue(opts) {
         if (!retry) await postWatchFailed(job, streamKey, e && e.watchError ? e.watchError : 'encode_or_upload_failed');
       }
     } finally {
-      await removeFileIfExists(tmpPath).catch(() => {});
+      if (!legacyQueued) await removeFileIfExists(tmpPath).catch(() => {});
       // The original is already verified in S3; a copy that failed for good is not a
       // reason to keep it. A copy stopped for a take, or due another try, still needs the
       // original (and the master).
@@ -929,6 +985,27 @@ function createUploadQueue(opts) {
       }
 
       for (const name of files) {
+        if (name.endsWith('.legacy.json')) {
+          const legacyPath = path.join(stateDir, name);
+          try {
+            const saved = await readJsonFile(legacyPath);
+            const filePath = saved && saved.filePath ? path.resolve(String(saved.filePath)) : '';
+            const key = saved && saved.key ? String(saved.key) : '';
+            let exists = false;
+            if (filePath && key) {
+              try { exists = (await fsp.stat(filePath)).isFile(); } catch (_) { exists = false; }
+            }
+            if (exists && !pendingProxyJobs.some((j) => j.legacyCopy && j.key === key)) {
+              pendingProxyJobs.push({ legacyCopy: true, filePath, key, source: String(saved.source || ''), sessionRef: saved.sessionRef || undefined });
+              console.log('[upload-queue] legacy proxy upload resumed after restart key=' + key);
+            } else if (!exists) {
+              await removeFileIfExists(legacyPath);
+            }
+          } catch (e) {
+            console.warn('[upload-queue] failed reading legacy proxy wait ' + legacyPath + ':', e && (e.message || e));
+          }
+          continue;
+        }
         if (!name.endsWith('.state.json')) continue;
         const stateFilePath = path.join(stateDir, name);
         let stateData;

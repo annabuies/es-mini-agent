@@ -78,3 +78,48 @@ test('a watch copy that fails every try is reported once as failed (stream key, 
   await waitFor(() => !fs.existsSync(camPath), 3000);
   assert.equal(queue.status().proxies_pending, 0);
 });
+
+test('the second camera Watch is uploaded before the first camera legacy proxy copy', { timeout: 15000 }, async (t) => {
+  const { queue, uploads, camPath } = setup(t, 0);
+  const secondPath = path.join(path.dirname(camPath), 'cam2-take.mp4');
+  fs.writeFileSync(secondPath, Buffer.alloc(128 * 1024, 2));
+  queue.enqueue({ filePath: camPath, source: 'cam1', sessionRef: 'take-b' });
+  queue.enqueue({ filePath: secondPath, source: 'cam2', sessionRef: 'take-b' });
+
+  const stream2 = 'stream/bench-1/cam2/cam2-take.mp4';
+  const legacy1 = 'proxies/bench-1/cam1/2026-10-22 12-01-40.mp4';
+  const legacy2 = 'proxies/bench-1/cam2/cam2-take.mp4';
+  await waitFor(() => uploads.includes(stream2) && uploads.includes(legacy1) && uploads.includes(legacy2), 10000);
+  assert.ok(uploads.indexOf(stream2) < uploads.indexOf(legacy1), 'another angle is watchable before the duplicate upload starts');
+  await waitFor(() => queue.status().proxies_pending === 0, 3000);
+  assert.equal(fs.existsSync(camPath + '.watch.mp4'), false, 'legacy copy temp is cleaned after upload');
+  assert.equal(fs.existsSync(secondPath + '.watch.mp4'), false);
+});
+
+test('a legacy proxy copy still waiting at a restart is uploaded by the next sweep, then cleaned', { timeout: 15000 }, async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-legacy-restart-'));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const stateDir = path.join(tempDir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const watchPath = path.join(tempDir, 'cam1-take.mp4.watch.mp4');
+  fs.writeFileSync(watchPath, Buffer.alloc(64 * 1024, 3));
+  const key = 'proxies/bench-1/cam1/cam1-take.mp4';
+  const marker = path.join(stateDir, key.replace(/[^A-Za-z0-9._-]+/g, '_') + '.legacy.json');
+  fs.writeFileSync(marker, JSON.stringify({ version: 1, filePath: watchPath, key, source: 'cam1', sessionRef: 'take-r' }));
+  // A marker whose temp file is already gone is dropped, not retried.
+  const goneMarker = path.join(stateDir, 'gone.legacy.json');
+  fs.writeFileSync(goneMarker, JSON.stringify({ version: 1, filePath: path.join(tempDir, 'gone.watch.mp4'), key: 'proxies/bench-1/cam2/gone.mp4', source: 'cam2' }));
+
+  const uploads = [];
+  const queue = createUploadQueue({
+    stateDir, buildingId: 'bench-1', deleteAfterUpload: true, stabilityPollMs: 5, proxyPollMs: 20, watchRetryMs: 50,
+    webhookUrl: 'https://hooks.test/upload',
+    uploader: async (input) => { uploads.push(input.key); return { key: input.key, sizeBytes: input.sizeBytes, partsUploaded: 1 }; },
+  });
+  const legacyMarkers = () => fs.readdirSync(stateDir).filter((n) => n.endsWith('.legacy.json'));
+  await queue.sweep();
+  await waitFor(() => uploads.includes(key) && queue.status().proxies_pending === 0, 5000);
+  await waitFor(() => legacyMarkers().length === 0, 3000);
+  assert.deepEqual(uploads, [key], 'only the surviving copy uploads');
+  assert.equal(fs.existsSync(watchPath), false, 'the temp copy is removed after its upload');
+});
