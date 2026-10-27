@@ -33,6 +33,12 @@ const WATCH_GOP_S = 2;
 const WATCH_AUDIO_KBPS = 160;
 const MIX_AUDIO_KBPS = 192;
 const MAX_MIX_TRACKS = 4;
+// Hardware path (Build 45): VideoToolbox decode, scale and encode keep the 4K
+// read off the CPU. Only for an unrotated H.264/HEVC camera file, since scale_vt
+// would drop a rotation the software path applies; -g is long so the forced 2 s
+// keyframes are the only ones (VideoToolbox otherwise adds its own).
+const HW_CODECS = ['h264', 'hevc'];
+const HW_GOP_FRAMES = 600;
 
 function round3(n) {
   return Math.round(n * 1000) / 1000;
@@ -89,17 +95,22 @@ function watchArgs(input) {
   const tracks = opts.masterPath ? Math.min(MAX_MIX_TRACKS, Number(opts.masterTracks) || 0) : 0;
   const filters = ['[0:v:0]scale=-2:' + WATCH_HEIGHT + ':flags=bicubic,format=yuv420p[vout]'];
   const maps = ['-map', '[vout]'];
-  const args = ['-y', '-hide_banner', '-loglevel', 'warning', '-nostdin', '-i', opts.cameraPath];
+  const hw = opts.hardware === true;
+  if (hw) filters[0] = '[0:v:0]scale_vt=w=-2:h=' + WATCH_HEIGHT + '[vout]';
+  const args = ['-y', '-hide_banner', '-loglevel', 'warning', '-nostdin'];
+  if (hw) args.push('-hwaccel', 'videotoolbox', '-hwaccel_output_format', 'videotoolbox_vld');
+  args.push('-i', opts.cameraPath);
   if (tracks > 0) {
     args.push('-i', opts.masterPath);
     filters.push(mixChain(1, tracks) + ',' + audioShiftFilter(opts.delayS) + ',apad[aout]');
     maps.push('-map', '[aout]');
   }
   args.push('-filter_complex', filters.join(';'), ...maps,
-    '-c:v', 'libx264', '-preset', 'veryfast', '-profile:v', 'high',
+    ...(hw ? ['-c:v', 'h264_videotoolbox', '-profile:v', 'high', '-g', String(HW_GOP_FRAMES)]
+      : ['-c:v', 'libx264', '-preset', 'veryfast', '-profile:v', 'high']),
     '-b:v', WATCH_VIDEO_KBPS + 'k', '-maxrate', WATCH_MAXRATE_KBPS + 'k', '-bufsize', WATCH_BUFSIZE_KBPS + 'k',
     // A keyframe every 2 s whatever the camera's frame rate, none extra at scene cuts.
-    '-force_key_frames', 'expr:gte(t,n_forced*' + WATCH_GOP_S + ')', '-sc_threshold', '0');
+    '-force_key_frames', 'expr:gte(t,n_forced*' + WATCH_GOP_S + ')', ...(hw ? [] : ['-sc_threshold', '0']));
   if (tracks > 0) {
     // apad + -shortest: the copy is exactly as long as the camera's video.
     args.push('-c:a', 'aac', '-b:a', WATCH_AUDIO_KBPS + 'k', '-ar', String(SAMPLE_RATE), '-ac', '2', '-shortest');
@@ -164,10 +175,32 @@ async function probeMedia(filePath, options) {
   }
 }
 
+/**
+ * Whether the camera file can take the hardware path: one H.264/HEVC video stream
+ * with no rotation. A separate probe, so an ffprobe that cannot answer it only
+ * means "use the software path" and never touches the timing probe.
+ */
+async function hardwareFit(filePath, options) {
+  const opts = options || {};
+  const bin = (typeof opts.ffprobeBin === 'function' ? opts.ffprobeBin() : opts.ffprobeBin) || 'ffprobe';
+  try {
+    const res = await runTool(bin, ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name:stream_tags=rotate:stream_side_data=rotation', '-of', 'json', filePath], opts);
+    if (res.code !== 0) return false;
+    const streams = (JSON.parse(res.stdout || '{}').streams) || [];
+    if (streams.length !== 1 || !HW_CODECS.includes(streams[0].codec_name)) return false;
+    const s = streams[0];
+    const rotations = [Number((s.tags && s.tags.rotate) || 0)].concat((s.side_data_list || []).map((d) => Number(d && d.rotation) || 0));
+    return rotations.every((r) => r === 0);
+  } catch (_) {
+    return false;
+  }
+}
+
 /** Everything a rendition needs from the two files, plus the resolved delay. */
 async function planWatch(input, options) {
   const opts = input || {};
   const camera = await probeMedia(opts.cameraPath, options);
+  const hardware = opts.allowHardware === true && camera.ok ? await hardwareFit(opts.cameraPath, options) : false;
   const master = opts.masterPath && fs.existsSync(opts.masterPath) ? await probeMedia(opts.masterPath, options) : null;
   const masterTracks = master && master.ok ? Math.min(MAX_MIX_TRACKS, master.audioTracks) : 0;
   const offsetS = Number.isFinite(Number(opts.offsetS)) && opts.offsetS !== null ? Number(opts.offsetS) : null;
@@ -184,6 +217,7 @@ async function planWatch(input, options) {
     delayS: delayS === null ? null : Math.round(delayS * SAMPLE_RATE) / SAMPLE_RATE,
     // No timing means no honest alignment: the copy is made without the mix.
     audio: delayS !== null && masterTracks > 0 ? 'mix' : 'none',
+    hardware,
   };
 }
 
@@ -194,6 +228,7 @@ module.exports = {
   WATCH_VIDEO_KBPS,
   audioShiftFilter,
   computeDelayS,
+  hardwareFit,
   mixArgs,
   mixChain,
   offsetFromTiming,

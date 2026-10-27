@@ -167,6 +167,10 @@ function createUploadQueue(opts) {
   // the Slack footage link, ClickUp sync and retention that read proxies/ keep
   // working until they move to stream/. PROXY_COPY=0 drops the second upload.
   const proxyCopy = options.proxyCopy !== false;
+  // Hardware Watch encode (Build 45), on unless WATCH_HW=off. A failed hardware
+  // encode is redone in software at once; two failures in a row turn it off.
+  let watchHardware = options.watchHardware !== undefined ? options.watchHardware !== false : process.env.WATCH_HW !== 'off';
+  let hwWatchFailures = 0;
   // Delete a camera/master original from the Mini once S3 holds a verified copy
   // (the uploader checks size with HeadObject) and the proxy / audio split that
   // read it are done. ~43 GB per recorded hour vs ~100 GB free (Robbie, Sep 29).
@@ -790,6 +794,7 @@ function createUploadQueue(opts) {
     let legacyQueued = false;
     // Field timing (Build 45): where Watch readiness time goes, per camera.
     let encodeStartedAt = null;
+    let encoder = null;
 
     try {
       let st;
@@ -801,12 +806,25 @@ function createUploadQueue(opts) {
       }
       if (!st.isFile()) return true;
 
-      const plan = await planWatch({ cameraPath: job.filePath, masterPath: watch.masterPath || null, offsetS: Number.isFinite(watch.offsetS) ? watch.offsetS : null }, { ffprobeBin: resolveFfprobeBin });
+      const plan = await planWatch({ cameraPath: job.filePath, masterPath: watch.masterPath || null, offsetS: Number.isFinite(watch.offsetS) ? watch.offsetS : null, allowHardware: watchHardware }, { ffprobeBin: resolveFfprobeBin });
       if (plan.audio !== 'mix') console.warn('[upload-queue] WARN watch copy without audio key=' + job.key + ' reason=' + (!watch.masterPath ? 'no_master' : (plan.offsetS === null ? 'no_timing' : 'master_unreadable')));
       encodeStartedAt = Date.now();
       console.log('[upload-queue] watch encode start key=' + job.key + ' wait_ms=' + (job.watchQueuedAt ? encodeStartedAt - job.watchQueuedAt : -1)
         + ' pending=' + pendingProxyJobs.length + ' attempt=' + ((job.watchAttempts || 0) + 1) + ' preempts=' + (job.watchPreempts || 0));
-      await runProxyFfmpeg(watchArgs({ cameraPath: job.filePath, masterPath: watch.masterPath, masterTracks: plan.masterTracks, delayS: plan.delayS, outPath: tmpPath }));
+      const encodeArgs = (hardware) => watchArgs({ cameraPath: job.filePath, masterPath: watch.masterPath, masterTracks: plan.masterTracks, delayS: plan.delayS, outPath: tmpPath, hardware });
+      encoder = plan.hardware ? 'hw' : 'sw';
+      try {
+        await runProxyFfmpeg(encodeArgs(plan.hardware));
+        if (plan.hardware) hwWatchFailures = 0;
+      } catch (e) {
+        if (!plan.hardware || (e && e.preempted)) throw e;
+        hwWatchFailures += 1;
+        if (hwWatchFailures >= 2) watchHardware = false;
+        console.warn('[upload-queue] hardware watch encode failed, redoing in software key=' + job.key + ' failures=' + hwWatchFailures
+          + (watchHardware ? '' : ' (hardware off until restart)') + ' error=' + truncateError(e && (e.message || e)));
+        encoder = 'sw';
+        await runProxyFfmpeg(encodeArgs(false));
+      }
       const encodeMs = Date.now() - encodeStartedAt;
       const uploadStartedAt = Date.now();
 
@@ -823,7 +841,7 @@ function createUploadQueue(opts) {
       if (plan.offsetS !== null) extra.offset_s = plan.offsetS;
       await uploadRendition(job, tmpPath, streamKey, typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl, extra);
       console.log('[upload-queue] watch copy confirmed ' + streamKey + ' audio=' + plan.audio + (plan.delayS !== null ? ' delay=' + plan.delayS.toFixed(3) + 's' : '')
-        + ' encode_ms=' + encodeMs + ' upload_ms=' + (Date.now() - uploadStartedAt)
+        + ' encoder=' + encoder + ' encode_ms=' + encodeMs + ' upload_ms=' + (Date.now() - uploadStartedAt)
         + ' ready_ms=' + (job.watchQueuedAt ? Date.now() - job.watchQueuedAt : -1));
       if (proxyCopy) {
         const legacy = { legacyCopy: true, filePath: tmpPath, key: proxyKey, source: job.source, sessionRef: job.sessionRef };

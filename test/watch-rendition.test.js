@@ -11,7 +11,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
 const test = require('node:test');
-const { audioShiftFilter, computeDelayS, mixArgs, offsetFromTiming, planWatch, watchArgs } = require('../watch-rendition');
+const { audioShiftFilter, computeDelayS, hardwareFit, mixArgs, offsetFromTiming, planWatch, watchArgs } = require('../watch-rendition');
 const { measureFlash } = require('../scripts/sync-measure');
 const { createUploadQueue } = require('../upload-queue');
 
@@ -193,3 +193,65 @@ test('upload queue: a camera upload makes its watch copy (stream/ with webhook, 
   assert.ok(Math.abs(m.error_frames) <= 1, 'uploaded watch copy: ' + m.error_frames + ' frames');
   assert.equal(queue.status().proxies_pending, 0);
 });
+
+// Build 45: the hardware (VideoToolbox) path for faster Watch copies.
+const HAVE_VT = HAVE_FFMPEG && /h264_videotoolbox/.test(spawnSync('ffmpeg', ['-hide_banner', '-encoders']).stdout.toString());
+const NEEDS_VT = { skip: !HAVE_VT && 'needs ffmpeg with h264_videotoolbox' };
+
+test('hardware watch args: GPU decode on the camera only, scale_vt, VideoToolbox H.264, forced 2 s keyframes; software args unchanged', () => {
+  const input = { cameraPath: '/r/cam1/a.mp4', masterPath: '/r/master/a.mp4', masterTracks: 4, delayS: 1.08, outPath: '/o.mp4' };
+  const hw = watchArgs(Object.assign({ hardware: true }, input));
+  const at = (flag) => hw[hw.indexOf(flag) + 1];
+  assert.ok(hw.indexOf('-hwaccel') < hw.indexOf('/r/cam1/a.mp4') && hw.lastIndexOf('-hwaccel') === hw.indexOf('-hwaccel'), 'hwaccel applies to the camera input only');
+  assert.equal(at('-hwaccel_output_format'), 'videotoolbox_vld');
+  assert.match(at('-filter_complex'), /^\[0:v:0\]scale_vt=w=-2:h=1080\[vout\];\[1:a:0\]/);
+  assert.equal(at('-c:v'), 'h264_videotoolbox');
+  assert.equal(at('-g'), '600');
+  assert.equal(at('-b:v'), '4000k');
+  assert.equal(at('-force_key_frames'), 'expr:gte(t,n_forced*2)');
+  assert.ok(!hw.includes('-preset') && !hw.includes('-sc_threshold'));
+  assert.deepEqual(watchArgs(Object.assign({ hardware: false }, input)), watchArgs(input), 'software path is the Build 42 args');
+});
+
+test('hardware fit: unrotated H.264 yes; rotated or another codec no', NEEDS_FFMPEG, async (t) => {
+  const dir = tmp(t);
+  const plain = path.join(dir, 'plain.mp4');
+  const rotated = path.join(dir, 'rotated.mp4');
+  const mpeg4 = path.join(dir, 'mpeg4.mp4');
+  execFileSync('ffmpeg', ['-nostdin', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=s=320x180:r=30:d=1', '-c:v', 'libx264', '-preset', 'ultrafast', plain]);
+  execFileSync('ffmpeg', ['-nostdin', '-v', 'error', '-y', '-display_rotation', '90', '-i', plain, '-c', 'copy', rotated]);
+  execFileSync('ffmpeg', ['-nostdin', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=s=320x180:r=30:d=1', '-c:v', 'mpeg4', mpeg4]);
+  assert.equal(await hardwareFit(plain, { ffprobeBin: 'ffprobe' }), true);
+  assert.equal(await hardwareFit(rotated, { ffprobeBin: 'ffprobe' }), false, 'scale_vt would drop the rotation');
+  assert.equal(await hardwareFit(mpeg4, { ffprobeBin: 'ffprobe' }), false);
+  assert.equal(await hardwareFit(path.join(dir, 'missing.mp4'), { ffprobeBin: 'ffprobe' }), false);
+  const plan = await planWatch({ cameraPath: plain, allowHardware: true }, { ffprobeBin: 'ffprobe' });
+  assert.equal(plan.hardware, true);
+  assert.equal((await planWatch({ cameraPath: plain }, { ffprobeBin: 'ffprobe' })).hardware, false, 'off unless allowed');
+});
+
+for (const [label, offsetS, cameraStartS] of [['+1.08 s', 1.08, 0], ['-0.50 s', -0.5, 0], ['+0.80 s, camera first pts 0.5 s', 0.8, 0.5], ['+3.25 s', 3.25, 0]]) {
+  test('hardware path keeps sync, offset ' + label + ': flash and beep within one frame, 2 s keyframes, originals untouched', NEEDS_VT, async (t) => {
+    const dir = tmp(t);
+    const { cam, master } = makeTake(dir, offsetS, cameraStartS);
+    const before = [md5(cam), md5(master)];
+    const plan = await planWatch({ cameraPath: cam, masterPath: master, offsetS, allowHardware: true }, { ffprobeBin: 'ffprobe' });
+    assert.equal(plan.hardware, true);
+    const out = path.join(dir, 'watch-hw.mp4');
+    execFileSync('ffmpeg', watchArgs({ cameraPath: cam, masterPath: master, masterTracks: plan.masterTracks, delayS: plan.delayS, outPath: out, hardware: true }));
+    const m = await measureFlash(out);
+    assert.equal(m.flash_frame, FLASH_FRAME, 'the video timeline is the camera\'s');
+    assert.ok(Math.abs(m.error_frames) <= 1, 'beep vs flash ' + m.error_frames + ' frames (' + m.error_s + ' s)');
+    assert.deepEqual([md5(cam), md5(master)], before);
+    const probe = JSON.parse(execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,codec_name,height,pix_fmt:format=duration', '-of', 'json', out]).toString());
+    assert.deepEqual(probe.streams.map((s) => [s.codec_type, s.codec_name]), [['video', 'h264'], ['audio', 'aac']]);
+    assert.equal(probe.streams[0].height, 1080);
+    assert.equal(probe.streams[0].pix_fmt, 'yuv420p');
+    assert.ok(Math.abs(Number(probe.format.duration) - 10) < 0.1, 'as long as the camera: ' + probe.format.duration);
+    const keys = execFileSync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-skip_frame', 'nokey', '-show_entries', 'frame=pts_time', '-of', 'csv=p=0', out]).toString()
+      .split('\n').filter(Boolean).map((v) => Number(v.replace(/,/g, ''))); // the copy's own timeline starts at 0
+    assert.deepEqual(keys.map((k) => Math.round(k * 10) / 10), [0, 2, 4, 6, 8], 'a keyframe every 2 s and no others');
+    const head = fs.readFileSync(out).subarray(0, 4096).toString('latin1');
+    assert.ok(head.indexOf('moov') > 0 && (head.indexOf('mdat') < 0 || head.indexOf('moov') < head.indexOf('mdat')), 'moov first');
+  });
+}

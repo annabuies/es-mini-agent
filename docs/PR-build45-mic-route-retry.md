@@ -1,4 +1,4 @@
-## Build 45 part 1 (Mini, agent 2026.10.26-2): mic route check, look settle time, durable upload-notice retry
+## Build 45 part 1 (Mini, agent 2026.10.27-1): mic route check, look settle time, durable upload-notice retry, faster Watch copies
 
 Plan: `ab-wiki/Clients/ES/docs/build45-phone-looks-readiness-mic-build-plan-2026-10-26.md` (A5, A6, A8). Based on `947a060` (watch-copy retry), which is based on #24 `9ba2f22`. The live Mini reports agent version `2026.10.20-1`, but its `agent_commit` comes from a persistent update-state file and does not prove the installed source SHA. Merge #24 first.
 
@@ -19,7 +19,12 @@ Plan: `ab-wiki/Clients/ES/docs/build45-phone-looks-readiness-mic-build-plan-2026
   - Given-up notices now schedule their own 7-day expiry, so `webhook_pending` clears without another upload. A synchronous no-op flush also releases its in-flight guard, allowing later retries and pruning.
 - **Upload state ordering** (`upload-queue.js`): the worker waits for the queued state write before processing a file. A 0-byte master could previously finish and delete its state while that write was still in flight, leaving a stale state file after the take.
 - **Exact-take Stop recovery** (`server.js`): idle status retains the stopped take's `session_ref` with its save and file-health result. The app relay only accepts this as proof of Saved when the phone requests that same take, and it strips local file paths. This does not change the installed mic-only patch.
-- **Version** `2026.10.26-2`. `modules.txt` gains `heartbeat-state.js` and `webhook-outbox.js`, and a new test follows every `require` from `server.js`.
+- **Watch latency (10-27)** (`watch-rendition.js`, `upload-queue.js`): field takes on 10-26 had Watch copies 8–35 min after Stop. Cause: each camera's 1080p copy is a software libx264 encode at `nice 15`, one camera at a time, and a new take kills the running encode, which restarts from zero.
+  - Hardware path: VideoToolbox decode, `scale_vt` and `h264_videotoolbox`, same 4 Mbps, forced 2 s keyframes (`-g 600` so they are the only ones), faststart, same mic mix and delay. Used only for an unrotated H.264/HEVC camera file (a separate probe; `scale_vt` would drop a rotation the software path applies). A failed hardware encode is redone in software at once; two in a row turn hardware off until restart. `WATCH_HW=off` restores the Build 42 args exactly.
+  - Bench, 60 s 4K, Apple M2, both at `nice 15`: idle 25.9 s software vs 14.0 s hardware (CPU 113 s vs ~3 s); with all cores busy 32.0 s vs 12.8 s. A/V sync within one frame at all four synthetic offsets on the hardware path. SSIM vs a lanczos 1080p reference on noisy synthetic video: 0.969 hardware vs 0.976 software.
+  - The duplicate `proxies/` upload now waits behind pending `stream/` Watch copies; a restart resumes it from `*.legacy.json` in the state dir.
+  - Logs: `watch encode start … wait_ms`, `watch copy confirmed … encoder=hw|sw encode_ms upload_ms ready_ms`, preemption `lost_encode_ms`.
+- **Version** `2026.10.27-1` (was `2026.10.26-2`). `modules.txt` gains `heartbeat-state.js` and `webhook-outbox.js`, and a new test follows every `require` from `server.js`.
 
 Install **after** the honeybook shim (idempotency key) is live. Never via the `update` op until this and #24 are on `main`.
 

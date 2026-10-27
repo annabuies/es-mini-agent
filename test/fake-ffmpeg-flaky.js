@@ -6,6 +6,12 @@
 const fs = require('node:fs');
 
 const args = process.argv.slice(2);
+if (process.env.FAKE_FFMPEG_LOG) fs.appendFileSync(process.env.FAKE_FFMPEG_LOG, (args.includes('h264_videotoolbox') ? 'hw' : 'sw') + '\n');
+// FAKE_FFMPEG_HW_FAIL=1: a machine whose VideoToolbox encode fails.
+if (process.env.FAKE_FFMPEG_HW_FAIL === '1' && args.includes('h264_videotoolbox')) {
+  process.stderr.write('fake hardware encoder unavailable\n');
+  process.exit(1);
+}
 const countPath = process.env.FAKE_FFMPEG_COUNT;
 const runs = (countPath && fs.existsSync(countPath) ? Number(fs.readFileSync(countPath, 'utf8')) : 0) + 1;
 if (countPath) fs.writeFileSync(countPath, String(runs));

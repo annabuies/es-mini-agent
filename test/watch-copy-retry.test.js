@@ -123,3 +123,27 @@ test('a legacy proxy copy still waiting at a restart is uploaded by the next swe
   assert.deepEqual(uploads, [key], 'only the surviving copy uploads');
   assert.equal(fs.existsSync(watchPath), false, 'the temp copy is removed after its upload');
 });
+
+test('a failed hardware encode is redone in software at once; two in a row turn hardware off', { timeout: 20000 }, async (t) => {
+  const { queue, uploads, posts, camPath } = setup(t, 0);
+  const dir = path.dirname(camPath);
+  const logPath = path.join(dir, 'encoders.log');
+  const previous = { FFPROBE_BIN: process.env.FFPROBE_BIN, FAKE_FFMPEG_HW_FAIL: process.env.FAKE_FFMPEG_HW_FAIL, FAKE_FFMPEG_LOG: process.env.FAKE_FFMPEG_LOG };
+  process.env.FFPROBE_BIN = path.join(__dirname, 'fake-ffprobe-h264.js');
+  process.env.FAKE_FFMPEG_HW_FAIL = '1';
+  process.env.FAKE_FFMPEG_LOG = logPath;
+  t.after(() => { for (const [k, v] of Object.entries(previous)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
+
+  const cams = [camPath];
+  for (const name of ['cam2-take.mp4', 'cam3-take.mp4']) {
+    const p = path.join(dir, name);
+    fs.writeFileSync(p, Buffer.alloc(128 * 1024, 2));
+    cams.push(p);
+  }
+  cams.forEach((filePath, i) => queue.enqueue({ filePath, source: 'cam' + (i + 1), sessionRef: 'take-hw' }));
+  const streams = ['stream/bench-1/cam1/2026-10-22 12-01-40.mp4', 'stream/bench-1/cam2/cam2-take.mp4', 'stream/bench-1/cam3/cam3-take.mp4'];
+  await waitFor(() => streams.every((k) => uploads.includes(k)) && queue.status().proxies_pending === 0, 15000);
+  assert.deepEqual(fs.readFileSync(logPath, 'utf8').trim().split('\n'), ['hw', 'sw', 'hw', 'sw', 'sw'],
+    'cam1 and cam2 fall back; after two failures cam3 goes straight to software');
+  assert.equal(posts.filter((p) => p.body && p.body.rendition === 'watch' && p.body.sizeBytes === 0).length, 0, 'no Watch copy reported failed');
+});
