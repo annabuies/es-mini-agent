@@ -213,7 +213,7 @@ test('hardware watch args: GPU decode on the camera only, scale_vt, VideoToolbox
   assert.deepEqual(watchArgs(Object.assign({ hardware: false }, input)), watchArgs(input), 'software path is the Build 42 args');
 });
 
-test('hardware fit: unrotated H.264 yes; rotated or another codec no', NEEDS_FFMPEG, async (t) => {
+test('hardware fit: one unrotated H.264 stream yes; rotated, another codec or two video streams no', NEEDS_FFMPEG, async (t) => {
   const dir = tmp(t);
   const plain = path.join(dir, 'plain.mp4');
   const rotated = path.join(dir, 'rotated.mp4');
@@ -224,6 +224,10 @@ test('hardware fit: unrotated H.264 yes; rotated or another codec no', NEEDS_FFM
   assert.equal(await hardwareFit(plain, { ffprobeBin: 'ffprobe' }), true);
   assert.equal(await hardwareFit(rotated, { ffprobeBin: 'ffprobe' }), false, 'scale_vt would drop the rotation');
   assert.equal(await hardwareFit(mpeg4, { ffprobeBin: 'ffprobe' }), false);
+  // Every video stream is counted, not just the first (round-2 audit).
+  const twoVideo = path.join(dir, 'two-video.mp4');
+  execFileSync('ffmpeg', ['-nostdin', '-v', 'error', '-y', '-i', plain, '-i', plain, '-map', '0:v', '-map', '1:v', '-c', 'copy', twoVideo]);
+  assert.equal(await hardwareFit(twoVideo, { ffprobeBin: 'ffprobe' }), false, 'two video streams use software');
   assert.equal(await hardwareFit(path.join(dir, 'missing.mp4'), { ffprobeBin: 'ffprobe' }), false);
   const plan = await planWatch({ cameraPath: plain, allowHardware: true }, { ffprobeBin: 'ffprobe' });
   assert.equal(plan.hardware, true);

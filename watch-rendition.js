@@ -184,7 +184,7 @@ async function hardwareFit(filePath, options) {
   const opts = options || {};
   const bin = (typeof opts.ffprobeBin === 'function' ? opts.ffprobeBin() : opts.ffprobeBin) || 'ffprobe';
   try {
-    const res = await runTool(bin, ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name:stream_tags=rotate:stream_side_data=rotation', '-of', 'json', filePath], opts);
+    const res = await runTool(bin, ['-v', 'error', '-select_streams', 'v', '-show_entries', 'stream=codec_name:stream_tags=rotate:stream_side_data=rotation', '-of', 'json', filePath], opts);
     if (res.code !== 0) return false;
     const streams = (JSON.parse(res.stdout || '{}').streams) || [];
     if (streams.length !== 1 || !HW_CODECS.includes(streams[0].codec_name)) return false;

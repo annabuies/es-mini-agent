@@ -58,7 +58,8 @@ test('a watch copy that fails twice is made on the third try; the original waits
   assert.equal(runs(), 3);
   await waitFor(() => !fs.existsSync(camPath), 3000);
   assert.equal(posts.filter((p) => p.body.rendition === 'watch').length, 0, 'the made copy is announced by the uploader, not as a failure');
-  assert.equal(queue.status().proxies_pending, 0);
+  // The legacy proxies/ copy may still be queued when the original is released.
+  await waitFor(() => queue.status().proxies_pending === 0, 3000);
 });
 
 test('a watch copy that fails every try is reported once as failed (stream key, no bytes, rendition watch), then the original is released', { timeout: 15000 }, async (t) => {
@@ -76,7 +77,7 @@ test('a watch copy that fails every try is reported once as failed (stream key, 
   });
   assert.equal(uploads.some((k) => k.startsWith('stream/')), false, 'nothing uploaded as a watch copy');
   await waitFor(() => !fs.existsSync(camPath), 3000);
-  assert.equal(queue.status().proxies_pending, 0);
+  await waitFor(() => queue.status().proxies_pending === 0, 3000);
 });
 
 test('the second camera Watch is uploaded before the first camera legacy proxy copy', { timeout: 15000 }, async (t) => {
@@ -124,6 +125,39 @@ test('a legacy proxy copy still waiting at a restart is uploaded by the next swe
   assert.equal(fs.existsSync(watchPath), false, 'the temp copy is removed after its upload');
 });
 
+test('a legacy proxy retry count survives a restart: the resumed upload keeps the limit', { timeout: 15000 }, async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-legacy-attempts-'));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const stateDir = path.join(tempDir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const watchPath = path.join(tempDir, 'cam3-take.mp4.watch.mp4');
+  fs.writeFileSync(watchPath, Buffer.alloc(64 * 1024, 5));
+  const key = 'proxies/bench-1/cam3/cam3-take.mp4';
+  const marker = path.join(stateDir, key.replace(/[^A-Za-z0-9._-]+/g, '_') + '.legacy.json');
+  const make = (failing, retryMs) => {
+    const tries = [];
+    const queue = createUploadQueue({
+      stateDir, buildingId: 'bench-1', deleteAfterUpload: true, stabilityPollMs: 5, proxyPollMs: 20, watchRetryMs: retryMs,
+      webhookUrl: 'https://hooks.test/upload',
+      uploader: async (input) => { tries.push(input.key); if (failing) throw new Error('bucket unreachable'); return { key: input.key, sizeBytes: input.sizeBytes, partsUploaded: 1 }; },
+    });
+    return { queue, tries };
+  };
+  // Before the restart: two failed tries were recorded with the marker.
+  fs.writeFileSync(marker, JSON.stringify({ version: 1, filePath: watchPath, key, source: 'cam3', sessionRef: 'take-n', attempts: 1 }));
+  const first = make(true, 60000); // its own retry would come long after the test
+  await first.queue.sweep();
+  await waitFor(() => first.tries.length >= 1 && JSON.parse(fs.readFileSync(marker, 'utf8')).attempts === 2, 5000);
+  // "Restart": a new queue reads the marker; one more failure is the last of three.
+  const second = make(true, 50);
+  const firstTries = first.tries.length;
+  await second.queue.sweep();
+  await waitFor(() => !fs.existsSync(marker) && second.queue.status().proxies_pending === 0, 5000);
+  assert.equal(firstTries, 1);
+  assert.equal(second.tries.length, 1, 'the restart resumed at attempt 3 of 3, not 1 of 3');
+  assert.equal(fs.existsSync(watchPath), false, 'the temp copy is released at give-up');
+});
+
 test('a failed hardware encode is redone in software at once; two in a row turn hardware off', { timeout: 20000 }, async (t) => {
   const { queue, uploads, posts, camPath } = setup(t, 0);
   const dir = path.dirname(camPath);
@@ -140,10 +174,12 @@ test('a failed hardware encode is redone in software at once; two in a row turn 
     fs.writeFileSync(p, Buffer.alloc(128 * 1024, 2));
     cams.push(p);
   }
+  assert.equal(queue.status().watch_hw, true);
   cams.forEach((filePath, i) => queue.enqueue({ filePath, source: 'cam' + (i + 1), sessionRef: 'take-hw' }));
   const streams = ['stream/bench-1/cam1/2026-10-22 12-01-40.mp4', 'stream/bench-1/cam2/cam2-take.mp4', 'stream/bench-1/cam3/cam3-take.mp4'];
   await waitFor(() => streams.every((k) => uploads.includes(k)) && queue.status().proxies_pending === 0, 15000);
   assert.deepEqual(fs.readFileSync(logPath, 'utf8').trim().split('\n'), ['hw', 'sw', 'hw', 'sw', 'sw'],
     'cam1 and cam2 fall back; after two failures cam3 goes straight to software');
   assert.equal(posts.filter((p) => p.body && p.body.rendition === 'watch' && p.body.sizeBytes === 0).length, 0, 'no Watch copy reported failed');
+  assert.equal(queue.status().watch_hw, false, 'status shows hardware is off');
 });

@@ -214,6 +214,13 @@ function createUploadQueue(opts) {
   function legacyFilePathForKey(key) {
     return path.join(stateDir, toSafeFileName(key) + '.legacy.json');
   }
+  // The marker carries the failed-attempt count, so a restart keeps the retry limit.
+  function writeLegacyMarker(job) {
+    return writeJsonFileAtomic(legacyFilePathForKey(job.key), {
+      version: 1, filePath: job.filePath, key: job.key, source: job.source,
+      sessionRef: job.sessionRef || null, attempts: job.watchAttempts || 0,
+    });
+  }
 
   function buildBaseState(job, status) {
     return {
@@ -762,6 +769,11 @@ function createUploadQueue(opts) {
       retry = job.watchAttempts < WATCH_COPY_ATTEMPTS;
       console.warn('[upload-queue] legacy proxy upload failed key=' + job.key + ' attempt=' + job.watchAttempts + '/' + WATCH_COPY_ATTEMPTS
         + (retry ? ' (will try again)' : ' (giving up)') + ' error=' + truncateError(e && (e.message || e.stack || e)));
+      if (retry) {
+        await writeLegacyMarker(job).catch((err) => {
+          console.warn('[upload-queue] could not record legacy proxy attempt key=' + job.key + ':', err && (err.message || err));
+        });
+      }
     } finally {
       if (!retry) {
         await removeFileIfExists(job.filePath).catch(() => {});
@@ -846,7 +858,7 @@ function createUploadQueue(opts) {
       if (proxyCopy) {
         const legacy = { legacyCopy: true, filePath: tmpPath, key: proxyKey, source: job.source, sessionRef: job.sessionRef };
         try {
-          await writeJsonFileAtomic(legacyFilePathForKey(proxyKey), { version: 1, filePath: tmpPath, key: proxyKey, source: job.source, sessionRef: job.sessionRef || null });
+          await writeLegacyMarker(legacy);
         } catch (e) {
           console.warn('[upload-queue] could not record legacy proxy wait key=' + proxyKey + ':', e && (e.message || e));
         }
@@ -1014,8 +1026,9 @@ function createUploadQueue(opts) {
               try { exists = (await fsp.stat(filePath)).isFile(); } catch (_) { exists = false; }
             }
             if (exists && !pendingProxyJobs.some((j) => j.legacyCopy && j.key === key)) {
-              pendingProxyJobs.push({ legacyCopy: true, filePath, key, source: String(saved.source || ''), sessionRef: saved.sessionRef || undefined });
-              console.log('[upload-queue] legacy proxy upload resumed after restart key=' + key);
+              const attempts = Math.max(0, Math.floor(Number(saved.attempts) || 0));
+              pendingProxyJobs.push({ legacyCopy: true, filePath, key, source: String(saved.source || ''), sessionRef: saved.sessionRef || undefined, watchAttempts: attempts });
+              console.log('[upload-queue] legacy proxy upload resumed after restart key=' + key + ' attempts=' + attempts);
             } else if (!exists) {
               await removeFileIfExists(legacyPath);
             }
@@ -1108,6 +1121,8 @@ function createUploadQueue(opts) {
         queued: queue.length,
         // Watch copies still to make (the step that made proxies; name kept for the kiosk/diag readers).
         proxies_pending: pendingProxyJobs.length,
+        // false once WATCH_HW=off or two hardware failures in a row turned the VideoToolbox path off.
+        watch_hw: watchHardware,
         active: activeSnapshot ? Object.assign({}, activeSnapshot) : null,
         last_confirmed: lastConfirmed ? Object.assign({}, lastConfirmed) : null,
       };

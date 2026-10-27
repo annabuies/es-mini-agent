@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
-// fake-ffprobe.js, except that the hardware-fit probe (-select_streams v:0) sees
+// fake-ffprobe.js, except that the hardware-fit probe (-select_streams v) sees
 // one unrotated H.264 video stream, so the Watch copy tries the hardware path.
 const args = process.argv.slice(2);
 if (args.includes('-select_streams')) {

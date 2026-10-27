@@ -361,7 +361,7 @@ test('heartbeat is sent from cached state on the first poll only once per minute
   const [first, second] = polls;
 
   assert.equal(first.searchParams.get('hb'), '1');
-  assert.equal(first.searchParams.get('v'), '2026.10.27-1');
+  assert.equal(first.searchParams.get('v'), '2026.10.27-2');
   assert.equal(first.searchParams.get('c'), 'unknown');
   const heartbeatState = JSON.parse(Buffer.from(first.searchParams.get('state'), 'base64url').toString('utf8'));
   assert.deepEqual(heartbeatState, {
@@ -401,7 +401,7 @@ test('heartbeat reports cached disk usage without filesystem I/O from the poll p
   assert.equal((await fs.promises.readFile(statfsLog, 'utf8')).trim().split('\n').length, 1);
 });
 
-test('heartbeat reports cached camera reachability without probing from the poll path', { timeout: 8000 }, async (t) => {
+test('heartbeat reports cached camera reachability without probing from the poll path', { timeout: 15000 }, async (t) => {
   const cameraRequests = [];
   const cameraServer = http.createServer((req, res) => {
     cameraRequests.push(req.url);
@@ -415,6 +415,9 @@ test('heartbeat reports cached camera reachability without probing from the poll
   const closedPort = await listen(closedServer);
   await close(closedServer);
   const agent = await startAgent(t, {
+    // Source config arrives before the first idle poll. Give its bounded 2 s
+    // reachability probe time to finish so this test checks the cached sample.
+    env: { POLL_IDLE_INTERVAL_MS: '4000' },
     relayResponse: {
       command: null,
       cameras: [
@@ -424,7 +427,7 @@ test('heartbeat reports cached camera reachability without probing from the poll
     },
   });
   await waitFor(() => cameraRequests.length === 1);
-  await waitFor(() => agent.relayRequests.filter((url) => !url.searchParams.has('want_sources')).length >= 2);
+  await waitFor(() => agent.relayRequests.filter((url) => !url.searchParams.has('want_sources')).length >= 2, 10000);
   const first = agent.relayRequests.find((url) => !url.searchParams.has('want_sources'));
   const heartbeatState = JSON.parse(Buffer.from(first.searchParams.get('state'), 'base64url').toString('utf8'));
 
