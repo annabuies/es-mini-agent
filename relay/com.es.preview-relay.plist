@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- ES room preview relay (S5 L0). Per-user LaunchAgent: runs only in the logged-in
+     session, like OBS and the ES agent. Replace __APP_DIR__ and __HOME__ before use. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.es.preview-relay</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__APP_DIR__/mediamtx</string>
+    <string>__APP_DIR__/mediamtx.yml</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>__HOME__/Library/Logs/es-preview-relay.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/Library/Logs/es-preview-relay.log</string>
+</dict>
+</plist>
