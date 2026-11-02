@@ -34,7 +34,7 @@ const { compactAudio, heartbeatStateJson } = require('./heartbeat-state');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.10.27-2';
+const AGENT_VERSION = '2026.11.02-s5-1';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -355,6 +355,27 @@ async function getObsClient() {
 
 function previewActive() {
   return !!((previewTimer || cloudflarePreviewOwnsStream) && Date.now() <= previewUntil);
+}
+
+// S5 (Robbie 10-31, black kiosk preview): one OBS stream serves every viewer (kiosk,
+// phones, desktop), and any viewer's preview_stop used to stop it for all of them.
+// Each viewer now holds a lease (the Worker derives its id from the signed-in
+// principal); the stream stops when the last lease is released or expires. A command
+// with no viewer id (an older Worker) is one shared lease: the old behaviour.
+const PREVIEW_SHARED_VIEWER = 'shared';
+const previewLeases = new Map();
+function previewViewerId(body) {
+  const viewer = body && typeof body.viewer === 'string' ? body.viewer : '';
+  return /^[0-9a-f]{16}$/.test(viewer) ? viewer : PREVIEW_SHARED_VIEWER;
+}
+function refreshPreviewUntil(now = Date.now()) {
+  let until = 0;
+  for (const [viewer, expires] of previewLeases) {
+    if (expires <= now) previewLeases.delete(viewer);
+    else if (expires > until) until = expires;
+  }
+  previewUntil = until;
+  return until;
 }
 
 function maybeWarnPreview(detail) {
@@ -1859,7 +1880,8 @@ async function handleOp(op, body) {
   if (op === 'preview_start') {
     // The kiosk sends this every 25 s while it shows the studio: keep its mic check fresh.
     maybeAudioCheck('preview', AUDIO_PREVIEW_MIN_MS);
-    previewUntil = Date.now() + PREVIEW_TTL_MS;
+    previewLeases.set(previewViewerId(body), Date.now() + PREVIEW_TTL_MS);
+    refreshPreviewUntil();
     const realtime = await startCloudflarePreview(body && body.cloudflare);
     if (realtime.stream) {
       if (previewTimer) {
@@ -1891,6 +1913,13 @@ async function handleOp(op, body) {
     }, audioMonitor ? { audio: compactAudio(currentAudio()) } : {});
   }
   if (op === 'preview_stop') {
+    const viewer = previewViewerId(body);
+    previewLeases.delete(viewer);
+    if (viewer !== PREVIEW_SHARED_VIEWER && refreshPreviewUntil() > Date.now()) {
+      // Another viewer is still watching: release only this one.
+      return { ok: true, preview: true, viewers: previewLeases.size };
+    }
+    previewLeases.clear();
     previewUntil = 0;
     const cleanupInputUid = await stopCloudflarePreview();
     cloudflarePreviewCameraIndex = 0;
