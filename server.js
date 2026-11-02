@@ -35,7 +35,7 @@ const { compactAudio, heartbeatStateJson } = require('./heartbeat-state');
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.11.02-s3';
+const AGENT_VERSION = '2026.11.02-1';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -79,6 +79,11 @@ const PREVIEW_INTERVAL_MS = 500;
 const PREVIEW_TTL_MS = 60000;
 const PREVIEW_WIDTH = 640;
 const PREVIEW_JPEG_QUALITY = 60;
+// S5 L0 (ships dark): the room's local preview relay (MediaMTX) control API. Only
+// used when the Worker sends `local` with preview_start (LOCAL_PREVIEW_ROOMS).
+const PREVIEW_RELAY_API = (process.env.PREVIEW_RELAY_API || 'http://127.0.0.1:9997').replace(/\/$/, '');
+const PREVIEW_RELAY_TIMEOUT_MS = 2000;
+const PREVIEW_RELAY_START_CHECK_MS = Number(process.env.PREVIEW_RELAY_START_CHECK_MS || 3000);
 const OBS_WS_URL = process.env.OBS_WS_URL || 'ws://127.0.0.1:4455';
 const OBS_WS_PASSWORD = process.env.OBS_WS_PASSWORD || '';
 const OBS_SOURCES_RAW = process.env.OBS_SOURCES || '';
@@ -185,6 +190,7 @@ let cloudflarePreviewInputUid = null;
 let cloudflarePreviewPlaybackUrl = null;
 let cloudflarePreviewCameraIndex = 0;
 let cloudflarePreviewOverlay = null;
+let cloudflarePreviewRelayPath = null; // set while OBS publishes through the local relay
 let startInFlight = null;
 let pendingSources = null;
 
@@ -356,6 +362,27 @@ async function getObsClient() {
 
 function previewActive() {
   return !!((previewTimer || cloudflarePreviewOwnsStream) && Date.now() <= previewUntil);
+}
+
+// S5 (Robbie 10-31, black kiosk preview): one OBS stream serves every viewer (kiosk,
+// phones, desktop), and any viewer's preview_stop used to stop it for all of them.
+// Each viewer now holds a lease (the Worker derives its id from the signed-in
+// principal); the stream stops when the last lease is released or expires. A command
+// with no viewer id (an older Worker) is one shared lease: the old behaviour.
+const PREVIEW_SHARED_VIEWER = 'shared';
+const previewLeases = new Map();
+function previewViewerId(body) {
+  const viewer = body && typeof body.viewer === 'string' ? body.viewer : '';
+  return /^[0-9a-f]{16}$/.test(viewer) ? viewer : PREVIEW_SHARED_VIEWER;
+}
+function refreshPreviewUntil(now = Date.now()) {
+  let until = 0;
+  for (const [viewer, expires] of previewLeases) {
+    if (expires <= now) previewLeases.delete(viewer);
+    else if (expires > until) until = expires;
+  }
+  previewUntil = until;
+  return until;
 }
 
 function maybeWarnPreview(detail) {
@@ -678,6 +705,54 @@ async function requestCloudflareCleanup(inputUid) {
   }
 }
 
+// { whipUrl: https://<relay>/<room>/whip, publishToken } from the Worker, or null.
+function validLocalRelay(local) {
+  if (!local || typeof local.whipUrl !== 'string' || typeof local.publishToken !== 'string') return null;
+  if (!/^pv1\.publish\./.test(local.publishToken) || local.publishToken.length > 256) return null;
+  try {
+    const url = new URL(local.whipUrl);
+    const match = url.pathname.match(/^\/([A-Za-z0-9_-]{1,64})\/whip$/);
+    if (url.protocol !== 'https:' || !match || url.search || url.username) return null;
+    return { whipUrl: url.toString(), publishToken: local.publishToken, path: match[1] };
+  } catch (_) {
+    return null;
+  }
+}
+
+// The Cloudflare WHIP URL as a MediaMTX forward target (whips:// = WHIP over HTTPS).
+function relayForwardDest(publishUrl) {
+  const url = new URL(publishUrl);
+  return 'whips://' + url.hostname + ':' + (url.port || '443') + url.pathname;
+}
+
+// Sets (or clears) where the relay forwards the room's stream. Never logs the URL:
+// the Cloudflare publish URL embeds its secret.
+async function setRelayForward(path, dest) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), PREVIEW_RELAY_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${PREVIEW_RELAY_API}/v3/config/paths/patch/${encodeURIComponent(path)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ forward: dest ? [{ dest }] : [] }),
+      signal: ctrl.signal,
+    });
+    if (!response.ok) throw new Error('relay_api_' + response.status);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function waitForStreamOutput(client, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const status = await client.request('GetStreamStatus');
+    if (obsRequestSucceeded(status) && status.responseData && status.responseData.outputActive) return true;
+    if (Date.now() >= deadline) return false;
+    await sleep(250);
+  }
+}
+
 async function stopCloudflarePreview() {
   if (cloudflarePreviewTimer) {
     clearInterval(cloudflarePreviewTimer);
@@ -702,6 +777,11 @@ async function stopCloudflarePreview() {
       maybeWarnPreview('Cloudflare preview stop failed: ' + (e && (e.message || e)));
     }
     if (client) await removeCloudflarePreviewOverlay(client);
+    if (cloudflarePreviewRelayPath) {
+      const path = cloudflarePreviewRelayPath;
+      cloudflarePreviewRelayPath = null;
+      try { await setRelayForward(path, null); } catch (_) { maybeWarnPreview('preview relay forward clear failed'); }
+    }
   } else if (cloudflarePreviewOverlay) {
     try {
       const client = await getObsClient();
@@ -714,7 +794,7 @@ async function stopCloudflarePreview() {
   return inputUid;
 }
 
-async function startCloudflarePreview(config) {
+async function startCloudflarePreview(config, localConfig) {
   const inputUid = config && typeof config.inputUid === 'string' ? config.inputUid.trim() : '';
   const publishUrl = config && typeof config.publishUrl === 'string' ? config.publishUrl.trim() : '';
   const playbackUrl = config && typeof config.playbackUrl === 'string' ? config.playbackUrl.trim() : '';
@@ -732,6 +812,7 @@ async function startCloudflarePreview(config) {
         return {
           stream: { inputUid: cloudflarePreviewInputUid, playbackUrl: cloudflarePreviewPlaybackUrl },
           cleanupInputUid: validIdentity && inputUid !== cloudflarePreviewInputUid ? inputUid : null,
+          localRelay: !!cloudflarePreviewRelayPath,
         };
       }
     } catch (_) { /* clear the stale state and start again below */ }
@@ -739,8 +820,10 @@ async function startCloudflarePreview(config) {
     cloudflarePreviewOwnsStream = false;
     cloudflarePreviewInputUid = null;
     cloudflarePreviewPlaybackUrl = null;
+    cloudflarePreviewRelayPath = null;
     if (staleInputUid) await requestCloudflareCleanup(staleInputUid);
   }
+  const relay = validLocalRelay(localConfig);
 
   if (!validIdentity || reuse || !validCloudflareWebRtcUrl(publishUrl, '/webRTC/publish')) {
     return { stream: null, cleanupInputUid: !reuse && validIdentity ? inputUid : null };
@@ -759,7 +842,7 @@ async function startCloudflarePreview(config) {
       const server = service.streamServiceSettings && service.streamServiceSettings.server;
       const staleCloudflareWhip = obsRequestSucceeded(serviceRes)
         && service.streamServiceType === 'whip_custom'
-        && validCloudflareWebRtcUrl(server, '/webRTC/publish');
+        && (validCloudflareWebRtcUrl(server, '/webRTC/publish') || !!(relay && server === relay.whipUrl));
       if (!staleCloudflareWhip) throw new Error('obs_stream_already_active');
 
       const stopped = await client.request('StopStream');
@@ -779,29 +862,56 @@ async function startCloudflarePreview(config) {
     cloudflarePreviewCameraIndex = Math.min(cloudflarePreviewCameraIndex, activeSources.length - 1);
     await createCloudflarePreviewOverlay(client);
 
-    const configured = await client.request('SetStreamServiceSettings', {
-      streamServiceType: 'whip_custom',
-      streamServiceSettings: {
+    const publish = async (settings) => {
+      const configured = await client.request('SetStreamServiceSettings', {
+        streamServiceType: 'whip_custom',
+        streamServiceSettings: settings,
+      });
+      if (!obsRequestSucceeded(configured)) throw new Error('obs_whip_config_rejected');
+      const started = await client.request('StartStream');
+      if (!obsRequestSucceeded(started)) throw new Error('obs_stream_start_rejected');
+    };
+    // S5 L0: with a local relay offered, OBS publishes to the relay and the relay
+    // forwards the same stream to Cloudflare for phones. Any relay failure falls back
+    // to publishing straight to Cloudflare (the path below, unchanged).
+    let localRelay = false;
+    let localError = null;
+    if (relay) {
+      try {
+        await setRelayForward(relay.path, relayForwardDest(publishUrl));
+        await publish({ server: relay.whipUrl, bearer_token: relay.publishToken });
+        if (!(await waitForStreamOutput(client, PREVIEW_RELAY_START_CHECK_MS))) {
+          try { await client.request('StopStream'); } catch (_) {}
+          throw new Error('relay_publish_not_active');
+        }
+        localRelay = true;
+      } catch (e) {
+        localError = /^relay_publish|^obs_/.test(String(e && e.message)) ? 'relay_publish_failed' : 'relay_unreachable';
+        maybeWarnPreview('preview relay unavailable (' + localError + '); publishing to Cloudflare directly');
+        try { await setRelayForward(relay.path, null); } catch (_) {}
+      }
+    } else if (localConfig) {
+      localError = 'relay_config_invalid';
+    }
+    if (!localRelay) {
+      await publish({
         server: publishUrl,
         // Cloudflare authenticates with the secret embedded in the WHIP URL.
         // Clear any bearer left by a previous IVS configuration.
         bearer_token: '',
-      },
-    });
-    if (!obsRequestSucceeded(configured)) throw new Error('obs_whip_config_rejected');
-
-    const started = await client.request('StartStream');
-    if (!obsRequestSucceeded(started)) throw new Error('obs_stream_start_rejected');
+      });
+    }
     cloudflarePreviewOwnsStream = true;
     cloudflarePreviewInputUid = inputUid;
     cloudflarePreviewPlaybackUrl = playbackUrl;
-    console.log('[es-mini-agent] [preview] Cloudflare WebRTC stream started');
+    cloudflarePreviewRelayPath = localRelay ? relay.path : null;
+    console.log('[es-mini-agent] [preview] Cloudflare WebRTC stream started' + (localRelay ? ' (through the room relay)' : ''));
     if (!cloudflarePreviewTimer) {
       cloudflarePreviewTimer = setInterval(() => {
         if (Date.now() > previewUntil) void stopCloudflarePreview();
       }, 5000);
     }
-    return { stream: { inputUid, playbackUrl }, cleanupInputUid: null };
+    return { stream: { inputUid, playbackUrl }, cleanupInputUid: null, localRelay, localError };
   } catch (e) {
     const error = truncateDetail(e && (e.message || e));
     if (cloudflarePreviewOverlay) {
@@ -810,6 +920,7 @@ async function startCloudflarePreview(config) {
         await removeCloudflarePreviewOverlay(client);
       } catch (_) {}
     }
+    if (relay) { try { await setRelayForward(relay.path, null); } catch (_) {} }
     maybeWarnPreview('Cloudflare preview start failed: ' + error);
     return { stream: null, cleanupInputUid: inputUid, error };
   }
@@ -1886,8 +1997,13 @@ async function handleOpCore(op, body) {
   if (op === 'preview_start') {
     // The kiosk sends this every 25 s while it shows the studio: keep its mic check fresh.
     maybeAudioCheck('preview', AUDIO_PREVIEW_MIN_MS);
-    previewUntil = Date.now() + PREVIEW_TTL_MS;
-    const realtime = await startCloudflarePreview(body && body.cloudflare);
+    previewLeases.set(previewViewerId(body), Date.now() + PREVIEW_TTL_MS);
+    refreshPreviewUntil();
+    const realtime = await startCloudflarePreview(body && body.cloudflare, body && body.local);
+    // Only when the Worker offered a relay: flag off leaves the result unchanged.
+    const relayFields = body && body.local
+      ? Object.assign({ local_relay: !!realtime.localRelay }, realtime.localError ? { local_error: realtime.localError } : {})
+      : {};
     if (realtime.stream) {
       if (previewTimer) {
         clearInterval(previewTimer);
@@ -1900,7 +2016,7 @@ async function handleOpCore(op, body) {
         stream: realtime.stream,
         cleanup_input_uid: realtime.cleanupInputUid,
         sources: activeSources.slice(),
-      }, audioMonitor ? { audio: compactAudio(currentAudio()) } : {});
+      }, relayFields, audioMonitor ? { audio: compactAudio(currentAudio()) } : {});
     }
     if (!isStorageConfigured()) {
       return { ok: false, reason: 'r2_unconfigured', cleanup_input_uid: realtime.cleanupInputUid };
@@ -1915,9 +2031,16 @@ async function handleOpCore(op, body) {
       cleanup_input_uid: realtime.cleanupInputUid,
       stream_error: realtime.error || null,
       sources: activeSources.slice(),
-    }, audioMonitor ? { audio: compactAudio(currentAudio()) } : {});
+    }, relayFields, audioMonitor ? { audio: compactAudio(currentAudio()) } : {});
   }
   if (op === 'preview_stop') {
+    const viewer = previewViewerId(body);
+    previewLeases.delete(viewer);
+    if (viewer !== PREVIEW_SHARED_VIEWER && refreshPreviewUntil() > Date.now()) {
+      // Another viewer is still watching: release only this one.
+      return { ok: true, preview: true, viewers: previewLeases.size };
+    }
+    previewLeases.clear();
     previewUntil = 0;
     const cleanupInputUid = await stopCloudflarePreview();
     cloudflarePreviewCameraIndex = 0;

@@ -1,0 +1,50 @@
+# ES room preview relay (S5 L0, Build 46): MediaMTX v1.21.3 on the room's Mac mini.
+# NOT installed by install.sh or self-update (not in modules.txt). Installed only by
+# Anna's runbook (ab-wiki RELEASE-STEPS-LOCAL-PREVIEW.md, step L2) as a per-user
+# LaunchAgent in the logged-in session, after OBS. Every key below exists in the
+# v1.21.3 mediamtx.yml (checked by test/preview-relay-config.test.js).
+#
+# Before installing replace __APP_DIR__ with
+#   $HOME/Library/Application Support/es-preview-relay
+# and __ROOM_HOST__ / __ROOM_PATH__ with the room's relay hostname and building id
+# (bench-1: preview-bench1.evrybdystudios.com / bench-1).
+
+logLevel: info
+logDestinations: [stdout]
+
+# Every read (the kiosk) and publish (OBS on this Mini) is checked by the ES Worker
+# with a short-lived, room-bound pass. The control API is excluded because it only
+# listens on 127.0.0.1 (the agent uses it to set the Cloudflare forward).
+authMethod: http
+authHTTPAddress: https://api.evrybdystudios.com/api/preview-auth
+authHTTPExclude:
+  - action: api
+
+api: true
+apiAddress: 127.0.0.1:9997
+metrics: false
+pprof: false
+playback: false
+
+# Only WebRTC (WHIP in from OBS, WHEP out to the kiosk) is served.
+rtsp: false
+rtmp: false
+hls: false
+srt: false
+moq: false
+
+webrtc: true
+webrtcAddress: :8889
+webrtcEncryption: true
+webrtcServerKey: __APP_DIR__/certs/certificates/__ROOM_HOST__.key
+webrtcServerCert: __APP_DIR__/certs/certificates/__ROOM_HOST__.crt
+webrtcAllowOrigins: ['capacitor://localhost']
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: ''
+webrtcIPsFromInterfaces: true
+
+paths:
+  __ROOM_PATH__:
+    source: publisher
+    # forward: set at run time by the ES agent through the control API (the
+    # Cloudflare WHIP URL changes per preview session and embeds its secret).
