@@ -103,13 +103,16 @@ test('unset POWER_STRIP_URL answers power_unconfigured without any request', asy
   assert.equal(fake.calls.length, 0);
 });
 
-test('refuses off while recording or uploading; on is still allowed', async () => {
+test('refuses off while recording (uploads alone no longer hold the lights, Build 46); on is still allowed', async () => {
   const fake = fakeRequest();
   assert.deepEqual(await runPower(CONFIGURED, { action: 'off', outlets: ['lights'] }, { recording: true, uploading: false }, { request: fake.request }),
     { ok: false, action: 'off', reason: 'busy_recording' });
-  assert.deepEqual(await runPower(CONFIGURED, { action: 'off', outlets: 'all' }, { recording: false, uploading: true }, { request: fake.request }),
-    { ok: false, action: 'off', reason: 'busy_uploading' });
+  assert.deepEqual(await runPower(CONFIGURED, { action: 'off', outlets: ['lights'] }, { recording: true, uploading: true }, { request: fake.request }),
+    { ok: false, action: 'off', reason: 'busy_recording' });
   assert.equal(fake.calls.length, 0);
+  const uploading = await runPower(CONFIGURED, { action: 'off', outlets: ['lights'] }, { recording: false, uploading: true }, { request: fake.request });
+  assert.equal(uploading.ok, true, JSON.stringify(uploading));
+  assert.ok(fake.calls.length > 0, 'the strip is switched while uploads run');
   const on = await runPower(CONFIGURED, { action: 'on', outlets: ['lights'] }, { recording: true, uploading: true }, { request: fake.request });
   assert.equal(on.ok, true);
 });
