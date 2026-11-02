@@ -21,6 +21,7 @@ const { fetchDocs } = require('./fetch-docs');
 const { runAudioEvo } = require('./evo-audio');
 const { executeLook, normalizeCameras, normalizeLooks } = require('./ptz');
 const { probeCameras } = require('./cam-reach');
+const { createAutoStop } = require('./auto-stop');
 const { readGolden, restoreCameras, snapshotCameras, writeGolden } = require('./cam-settings');
 const { sampleDiskUsage } = require('./disk-usage');
 const { describePower, readPowerConfig, runPower } = require('./power');
@@ -1140,7 +1141,33 @@ function startSessionResponse() {
   return state.sessionRef === null ? {} : { session_ref: state.sessionRef };
 }
 
+// Build 46 booked-session auto-stop (auto-stop.js). Created at listen time.
+let autoStop = null;
+
+// Every op goes through here (relay poll and HTTP route alike):
+//   - a Stop tagged auto_stop_for runs only on that exact take; anything else is refused
+//     without touching the recording (never stop a later take);
+//   - a successful Start arms the take's deadline, a Stop or Cancel clears it.
 async function handleOp(op, body) {
+  const ref = state.sessionRef;
+  const tagged = op === 'stop' && body && typeof body.auto_stop_for === 'string' ? body.auto_stop_for : null;
+  if (tagged !== null && (!(state.recording || state.paused) || ref !== tagged)) {
+    console.warn(`[es-mini-agent] auto-stop: refused a Stop for ${tagged} (recording ${state.sessionRef || 'nothing'})`);
+    return { ok: false, reason: 'stale_auto_stop', recording: !!(state.recording || state.paused) };
+  }
+  const result = await handleOpCore(op, body);
+  if (autoStop && result && result.ok === true) {
+    if (op === 'start') autoStop.arm(state.sessionRef, body && body.auto_stop_at);
+    else if (op === 'stop' || op === 'cancel') autoStop.disarm(ref);
+  }
+  // Only when armed, so a status with no deadline is unchanged for older readers.
+  const armed = autoStop && op === 'status' && result && result.ok === true ? autoStop.status() : null;
+  if (armed) result.auto_stop = armed;
+  if (tagged !== null && result) result.auto_stop_for = tagged;
+  return result;
+}
+
+async function handleOpCore(op, body) {
   if (op === 'cam_snapshot') {
     if (!state.cameras.length) return { ok: false, reason: 'no_cameras' };
     if (!PTZ_CREDENTIALS) return { ok: false, reason: 'auth_required' };
@@ -2381,8 +2408,21 @@ async function pollLoop() {
   pollTimer = setTimeout(pollLoop, outcome === 'error' ? delay : Math.max(0, delay - (Date.now() - startedAt)));
 }
 
+autoStop = createAutoStop({
+  file: process.env.AUTO_STOP_STATE_FILE || path.join(UPLOAD_STATE_DIR, 'auto-stop.json'),
+  relayUrl: RECORD_POLL_URL,
+  key: RECORD_CONTROL_KEY,
+  buildingId: BUILDING_ID,
+  isTakeLive: (ref) => !!(state.recording || state.paused) && state.sessionRef === ref,
+  localStop: (ref) => handleOp('stop', { auto_stop_for: ref, local: true }),
+  requestRetryMs: Number(process.env.AUTO_STOP_RETRY_MS) || undefined,
+  localAfterMs: Number(process.env.AUTO_STOP_LOCAL_AFTER_MS) || undefined,
+  log: (level, line) => (level === 'warn' ? console.warn : console.log)('[es-mini-agent] ' + line),
+});
+
 server.listen(PORT, () => {
   console.log(`[es-mini-agent] listening on :${PORT} building_id=${BUILDING_ID}`);
+  setInterval(() => { autoStop.tick().catch(() => {}); }, 1000).unref();
   console.log(`[es-mini-agent] relay: polling ${RECORD_POLL_URL}/api/record every ${POLL_INTERVAL_MS}ms while the room is in use, ${POLL_IDLE_INTERVAL_MS}ms when idle`);
   console.log('[es-mini-agent] sources (env): ' + activeSources.join(','));
   // First poll after one idle interval, as before: its heartbeat carries the disk and
