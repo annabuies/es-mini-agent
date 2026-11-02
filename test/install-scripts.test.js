@@ -287,7 +287,7 @@ test('OBS writes no new log, or stops at another prompt: alert, and an old log i
 
 test('agent release version is 2026.11.02-s5 (server.js and package.json)', () => {
   const server = fs.readFileSync(path.join(projectDir, 'server.js'), 'utf8');
-  assert.match(server, /const AGENT_VERSION = '2026\.10\.27-2';/);
+  assert.match(server, /const AGENT_VERSION = '2026\.11\.02-s5';/);
   assert.equal(JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf8')).version, '2026.11.02-s5');
 });
 
