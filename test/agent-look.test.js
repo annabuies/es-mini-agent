@@ -117,6 +117,7 @@ test('demo-mode agent pulls PTZ config and executes a queued look', { timeout: 8
       RECORD_POLL_URL: `http://127.0.0.1:${relayPort}`,
       PORT: String(agentPort),
       OBS_SOURCES: '',
+      LOOK_SETTLE_MS: '',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -126,6 +127,11 @@ test('demo-mode agent pulls PTZ config and executes a queued look', { timeout: 8
   t.after(() => { if (!child.killed) child.kill('SIGTERM'); });
 
   const result = await resultPromise;
+  // Build 45 A5: an ok look also says when the cameras should have stopped moving.
+  const settledAt = Date.parse(result.result && result.result.settled_at);
+  assert.ok(Number.isFinite(settledAt) && settledAt > Date.now() + 2000, 'settled_at ~4 s ahead: ' + (result.result && result.result.settled_at));
+  assert.deepEqual(Object.keys(result.result.elapsed_ms).sort(), ['cam1', 'cam2', 'cam3']);
+  assert.ok(Object.values(result.result.elapsed_ms).every((ms) => Number.isInteger(ms) && ms >= 0));
   assert.deepEqual(result, {
     mini_result: true,
     id: 'fake-look-1',
@@ -134,6 +140,9 @@ test('demo-mode agent pulls PTZ config and executes a queued look', { timeout: 8
       ok: true,
       look: '2',
       cameras: { cam1: 'ok', cam2: 'ok', cam3: 'ok' },
+      elapsed_ms: result.result.elapsed_ms,
+      settle_ms: 4000,
+      settled_at: result.result.settled_at,
     },
   });
   const ptzRequests = () => cameraRequests.filter((url) => url.includes('?ptzcmd&poscall&'));

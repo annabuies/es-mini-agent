@@ -3,6 +3,7 @@
 const crypto = require('crypto');
 const fsp = require('fs/promises');
 const path = require('path');
+const { redact } = require('./webhook-outbox');
 
 const DEFAULT_SIZE_BYTES = 300 * 1024 * 1024;
 const PART_SIZE_BYTES = 25 * 1024 * 1024;
@@ -509,7 +510,16 @@ async function runMultipartUpload(opts) {
       confirmedAt: new Date().toISOString(),
     }, webhookExtra);
     console.log('[upload] upload_confirmed:', JSON.stringify(payload));
-    if (options.webhookUrl) {
+    if (options.webhookUrl && options.webhookOutbox && typeof options.webhookOutbox.post === 'function') {
+      // Durable: a failed POST is kept in the outbox and retried (webhook-outbox.js).
+      try {
+        await options.webhookOutbox.post(payload, { url: String(options.webhookUrl) });
+      } catch (e) {
+        console.warn('[upload] upload_confirmed outbox error: ' + redact(e && (e.code || e.name)));
+      }
+    } else if (options.webhookUrl) {
+      // No outbox (the r2_test op): one try, as before. Never log the response body
+      // or the error message: either can carry the webhook URL and its key.
       try {
         const webhookRes = await fetch(String(options.webhookUrl), {
           method: 'POST',
@@ -517,11 +527,11 @@ async function runMultipartUpload(opts) {
           body: JSON.stringify(payload),
         });
         if (!webhookRes.ok) {
-          const detail = truncateDetail(await readResponseTextSafe(webhookRes));
-          console.warn('[upload] upload_confirmed webhook failed status=' + webhookRes.status + ' detail=' + detail);
+          await readResponseTextSafe(webhookRes);
+          console.warn('[upload] upload_confirmed webhook failed status=' + webhookRes.status);
         }
       } catch (e) {
-        console.warn('[upload] upload_confirmed webhook error:', e && (e.stack || e.message || e));
+        console.warn('[upload] upload_confirmed webhook error: ' + redact(e && (e.cause && e.cause.code || e.code || e.name)));
       }
     } else {
       console.log('[upload] UPLOAD_CONFIRMED_WEBHOOK_URL not set - this is the exact hook point for the future Trigger.dev "master upload confirmed" task (see Clients/ES/app/15-camera-mac-mini-capture-handoff.md section 5.4)');

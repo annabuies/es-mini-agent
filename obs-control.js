@@ -7,6 +7,11 @@ const path = require('path');
 const OBS_RPC_VERSION = 1;
 const CONNECT_TIMEOUT_MS = 5000;
 const REQUEST_TIMEOUT_MS = 5000;
+// obs-websocket v5 EventSubscription bits this agent uses. The shared client
+// subscribes to nothing (0); only the audio check's own short-lived client asks
+// for the high-volume InputVolumeMeters events (~20 a second).
+const EVENT_SUB_OUTPUTS = 1 << 6;
+const EVENT_SUB_INPUT_VOLUME_METERS = 1 << 16;
 
 function makeError(message) {
   return new Error(message || 'obs_error');
@@ -36,6 +41,10 @@ class ObsClient {
     this.url = options.url || 'ws://127.0.0.1:4455';
     this.password = options.password || '';
     this.requestTimeoutMs = options.requestTimeoutMs || REQUEST_TIMEOUT_MS;
+    // Opt-in events (default none, as before). onEvent(eventType, eventData) is
+    // called for each op 5 event; a throwing handler never breaks the socket.
+    this.eventSubscriptions = Number.isInteger(options.eventSubscriptions) ? options.eventSubscriptions : 0;
+    this.onEvent = typeof options.onEvent === 'function' ? options.onEvent : null;
 
     this.ws = null;
     this.connected = false;
@@ -173,6 +182,14 @@ class ObsClient {
       return;
     }
 
+    if (packet.op === 5) {
+      const data = packet.d || {};
+      if (this.onEvent && typeof data.eventType === 'string') {
+        try { this.onEvent(data.eventType, data.eventData || {}); } catch (_) { /* never break the socket */ }
+      }
+      return;
+    }
+
     if (packet.op === 7) {
       const data = packet.d || {};
       const requestId = data.requestId;
@@ -189,7 +206,7 @@ class ObsClient {
       op: 1,
       d: {
         rpcVersion: OBS_RPC_VERSION,
-        eventSubscriptions: 0,
+        eventSubscriptions: this.eventSubscriptions,
       },
     };
 
@@ -319,7 +336,8 @@ function getNewestFileSample(sourceDir) {
     // vanish between readdir and stat) and RTSP capture's in-progress parts.
     // Likely cause of take 07-53-36 losing its cam2/cam3 files on Sep 29
     // (es-mini-agent #10, third defect): take 1's proxy was still being written.
-    if (entry.name.endsWith('.proxy.mp4') || / rtsp-part\d+\.mp4$/.test(entry.name) || entry.name.endsWith(' rtsp-parts.txt')) continue;
+    // The watch rendition's temp (`.watch.mp4`, since 2026.10.20-1) is skipped the same way.
+    if (entry.name.endsWith('.proxy.mp4') || entry.name.endsWith('.watch.mp4') || / rtsp-part\d+\.mp4$/.test(entry.name) || entry.name.endsWith(' rtsp-parts.txt')) continue;
     const absPath = path.join(sourceDir, entry.name);
     let stat;
     try {
@@ -439,6 +457,8 @@ async function getSourceScreenshot(client, source, width, quality) {
 }
 
 module.exports = {
+  EVENT_SUB_INPUT_VOLUME_METERS,
+  EVENT_SUB_OUTPUTS,
   ObsClient,
   callVendor,
   getSourceScreenshot,
