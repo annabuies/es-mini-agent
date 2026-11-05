@@ -434,7 +434,8 @@ test('heartbeat reports cached camera reachability without probing from the poll
 
   assert.deepEqual(heartbeatState.cameras_down, ['cam2']);
   assert.match(heartbeatState.cameras_checked_at, /^2026-/);
-  assert.ok(Buffer.byteLength(JSON.stringify(heartbeatState)) < 1024);
+  // A typical state (all four mics with routes, plus the C2 signal) is about 1.2 KB; the Worker's cap is 2048.
+  assert.ok(Buffer.byteLength(JSON.stringify(heartbeatState)) < 1536);
   assert.equal(cameraRequests.length, 1);
 });
 
@@ -1343,7 +1344,7 @@ test('an RTSP take: stop reports timing and offsets; the watch copy is made with
   const graph = encode[encode.indexOf('-filter_complex') + 1];
   const samples = Math.round(cam1.offset_s * 48000);
   assert.ok(graph.includes(`adelay=delays=${samples}S:all=1`), 'the mix is delayed by +offset_s: ' + graph);
-  assert.ok(graph.includes('[1:a:0][1:a:1][1:a:2][1:a:3]amix=inputs=4'));
+  assert.ok(graph.includes('[g0][g1][g2][g3]amix=inputs=4') && /\[1:a:3\]agate=/.test(graph), 'the four mic tracks are gated, then mixed: ' + graph);
   assert.ok(agent.uploads.some((r) => r.method === 'POST' && r.query.has('uploads') && r.path === `/fake-bucket/stream/bench-1/cam1/${TAKE}.mp4`.replace(/ /g, '%20')));
   // B2: the originals are never rewritten.
   assert.equal(md5File(path.join(agent.recordDir, 'cam2', TAKE + '.mp4')), before.cam2);
