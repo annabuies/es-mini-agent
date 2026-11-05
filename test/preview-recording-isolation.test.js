@@ -50,7 +50,11 @@ test('preview stop, viewer loss, stream failure and restarts during a take leave
   await waitFor(() => /ev=stream_restart ok=false/.test(agent.output()) || /ev=stream_gave_up/.test(agent.output()), 8000, 'failing restarts');
   await agent.op('preview_start', { viewer: VIEWER_KIOSK, cloudflare: CF2 });
   await assertTakeUntouched(agent, baseline);
-  await waitFor(() => /ev=stream_gave_up/.test(agent.output()), 8000, 'the watchdog giving up').catch(() => {});
+  // Pinned (audit): here the keepalive's own fresh start fails and drops the stream before the
+  // watchdog's third failure, so the give-up path is pinned in preview-recovery.test.js instead.
+  await waitFor(() => /ev=stream_start_failed reason=new_input/.test(agent.output()), 8000, 'the failing keepalive start');
+  assert.match(agent.output(), /ev=keepalive viewer=\w+ ms=\d+ stream=no error=start_failed/);
+  await assertTakeUntouched(agent, baseline);
 
   // 4. The last viewer stops the preview altogether, and a lapsed lease does the same.
   await agent.op('preview_stop', { viewer: VIEWER_KIOSK });

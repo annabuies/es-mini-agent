@@ -2172,6 +2172,12 @@ async function handleOpCore(op, body) {
     return { ok: true, paused: true };
   }
   if (op === 'resume') {
+    // Post-TF48 audit: resume used to set recording=true even with no take, so a stray
+    // resume (now possible while a look moves the cameras) faked a recording.
+    if (!state.recording && !state.paused) {
+      console.warn('[es-mini-agent] WARN: resume called with no take (demo-safe: returning ok, nothing started).');
+      return { ok: true, recording: false, feeds_writing: null };
+    }
     const resumeSources = sessionSources();
     for (const r of await Promise.all(resumeSources.filter(isRtspSession).map((source) => rtspCapture.resume(source)))) {
       if (!r.ok) console.warn('[es-mini-agent] WARN: rtsp resume failed:', r.reason || 'unknown');
@@ -2731,7 +2737,7 @@ async function postCommandResult(cmd, result, opStartedAt) {
 let lookTail = Promise.resolve();
 let lookPending = 0;
 // Ops that may run while a look is still waiting on the cameras.
-const LOOK_CONCURRENT_OPS = new Set(['status', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_check', 'stop', 'cancel', 'pause', 'resume']);
+const LOOK_CONCURRENT_OPS = new Set(['status', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_check', 'mic_check', 'stop', 'cancel', 'pause', 'resume']);
 function dispatchLookOffLoop(cmd, payload) {
   const claimedAt = Date.now();
   lookPending += 1;

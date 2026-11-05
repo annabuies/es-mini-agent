@@ -695,6 +695,14 @@ test('pause and resume also control the active master', { timeout: 8000 }, async
   ]);
 });
 
+test('a resume with no take starts nothing and does not fake a recording (post-TF48 audit)', { timeout: 8000 }, async (t) => {
+  const agent = await startAgent(t);
+  const before = agent.obsRequests.length;
+  assert.deepEqual(await postAgent(agent.agentPort, 'resume'), { ok: true, recording: false, feeds_writing: null });
+  assert.equal((await postAgent(agent.agentPort, 'status')).recording, false);
+  assert.equal(agent.obsRequests.slice(before).some((r) => r.type === 'CallVendorRequest' || r.type === 'ResumeRecord'), false);
+});
+
 test('master uploads retain their recording key and skip proxy generation', { timeout: 8000 }, async (t) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-master-upload-'));
   const filePath = path.join(tempDir, 'master.mp4');

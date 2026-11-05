@@ -65,7 +65,7 @@ test('the watchdog gives up after three failed restarts and the next keepalive s
   agent.obsControl.streaming = false;
   agent.obsControl.refuseStart = true;
   await waitFor(() => /ev=stream_gave_up/.test(agent.output()), 8000, 'watchdog giving up');
-  assert.equal(count(agent.obsRequests, 'StartStream') >= 2, true);
+  assert.equal(count(agent.obsRequests, 'StartStream'), 4, 'the first start plus exactly three failed restarts');
   await waitFor(() => /ev=stream_stop reason=restart_failed/.test(agent.output()), 5000, 'stream_stop log');
   // The next keepalive (the Worker hands out a fresh input) starts the preview from scratch.
   agent.obsControl.refuseStart = false;
