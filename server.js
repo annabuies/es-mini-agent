@@ -30,7 +30,7 @@ const { checkTake } = require('./take-health');
 const { createAudioMonitor, unknownAudio } = require('./audio-check');
 const { describeAudioHealth, startMasterAudioAnalysis } = require('./audio-health');
 const { offsetFromTiming } = require('./watch-rendition');
-const { compactAudio, heartbeatStateJson } = require('./heartbeat-state');
+const { compactAudio, createHeartbeatSlot, heartbeatStateJson } = require('./heartbeat-state');
 
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
@@ -1366,7 +1366,7 @@ async function handleOpCore(op, body) {
     if (op === 'audio_bind' || op === 'audio_lavalier') {
       return { ok: false, disabled: true, reason: 'disabled_would_revert_evo_routing', use: 'audio_evo' };
     }
-    if (op === 'audio_evo' || op === 'audio_check') {
+    if (op === 'audio_evo' || op === 'audio_check' || op === 'mic_check') {
       return { ok: false, demo: true, reason: 'demo_mode' };
     }
     if (op === 'update') {
@@ -1822,6 +1822,15 @@ async function handleOpCore(op, body) {
     if (block.identical_pairs) out.identical_pairs = block.identical_pairs;
     return out;
   }
+  if (op === 'mic_check') {
+    // Contract C2: ~3 s of the four mic meters while people speak into them. Read-only: its own
+    // OBS client, no OBS setting, scene or recording call. Refused whenever a take is, or is
+    // about to be, recording (the take's own meters and OBS requests are never shared with it).
+    if (state.recording || state.paused || startInFlight || (audioMonitor && audioMonitor.takeActive())) return { ok: false, reason: 'recording_active', recording: true };
+    if (!audioMonitor) return { ok: false, reason: 'audio_check_disabled' };
+    const out = await audioMonitor.micCheck();
+    return Object.assign(out, { recording: false });
+  }
   if (op === 'diag') {
     const out = Object.assign({ ok: true, demo: false, recording: state.recording, stats: null, filters: null, master_active: false, master_enabled: MASTER_RECORD }, activeSessionResponse());
     out.storage = {
@@ -2060,7 +2069,7 @@ async function handleOpCore(op, body) {
   return null;
 }
 
-const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_bind', 'audio_lavalier', 'audio_evo', 'audio_check', 'update', 'fetch_docs', 'look', 'cam_snapshot', 'cam_restore', 'power']);
+const VALID_OPS = new Set(['start', 'stop', 'cancel', 'status', 'pause', 'resume', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_bind', 'audio_lavalier', 'audio_evo', 'audio_check', 'mic_check', 'update', 'fetch_docs', 'look', 'cam_snapshot', 'cam_restore', 'power']);
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -2314,7 +2323,13 @@ let lastCommandAt = 0;
 let sourcesTimer = null;
 let camReachTimer = null;
 let diskUsageTimer = null;
-let lastHeartbeatAt = 0;
+// The heartbeat rides on the command poll, once a minute, and only counts as sent once the relay
+// answered that poll (heartbeat-state.js createHeartbeatSlot): a failed or hung poll used to burn the
+// slot, so two bad polls left the Worker without one for 3 min and the kiosk said "Studio offline".
+const heartbeatSlot = createHeartbeatSlot();
+// A poll that gets no answer is abandoned after this long (undici's own wait is 5 min, so one
+// stalled connection silenced the heartbeat for the whole time).
+const POLL_TIMEOUT_MS = Math.max(1000, Number(process.env.POLL_TIMEOUT_MS) || 20000);
 let cameraReachability = null;
 let cameraReachabilityBusy = false;
 let diskUsage = null;
@@ -2377,7 +2392,7 @@ async function refreshPowerHealth() {
 }
 
 function heartbeatQuery(now = Date.now()) {
-  if (now - lastHeartbeatAt < 60000) return '';
+  if (!heartbeatSlot.due(now)) return '';
   try {
     const version = getVersionBlock({ projectDir: __dirname, agentVersion: AGENT_VERSION });
     const queue = uploadQueue ? uploadQueue.status() : null;
@@ -2393,13 +2408,13 @@ function heartbeatQuery(now = Date.now()) {
       // Undelivered upload_confirmed posts (A8; in memory, no I/O).
       webhookPending: uploadQueue ? uploadQueue.webhookPending() : null,
     });
-    lastHeartbeatAt = now;
     return '&hb=1&v=' + encodeURIComponent(AGENT_VERSION)
       + '&c=' + encodeURIComponent(version.commit || 'unknown')
       + '&state=' + encodeURIComponent(Buffer.from(heartbeatJson).toString('base64url'));
   } catch (e) {
     // Heartbeat observability is strictly additive: a local encoding failure
     // must never block or alter the command-poll path.
+    heartbeatSlot.abandoned();
     console.warn('[es-mini-agent] relay: heartbeat build failed:', e && (e.message || e));
     return '';
   }
@@ -2464,6 +2479,7 @@ async function pollOnce() {
     const getRes = await fetch(url, {
       method: 'GET',
       headers: { 'Authorization': 'Bearer ' + RECORD_CONTROL_KEY },
+      signal: AbortSignal.timeout(POLL_TIMEOUT_MS),
     });
     if (!getRes.ok) {
       // 401/5xx from the relay — log once per tick and move on. Do not crash.
@@ -2472,8 +2488,12 @@ async function pollOnce() {
     }
     const data = await getRes.json().catch(() => ({}));
     // The Worker answers 200 { ok: false, reason: 'exception' } when Supabase fails:
-    // back off like a 5xx, but stay quiet in the log as before.
+    // back off like a 5xx, but stay quiet in the log as before. The heartbeat on that poll was
+    // probably not stored either, so it rides on the retry.
     if (data && data.ok === false) return 'error';
+    // The relay answered properly: the heartbeat riding on this poll counts as delivered (the Worker
+    // records it without awaiting it, so this is as sure as the agent can be).
+    heartbeatSlot.delivered();
     const cmd = data && data.command;
     if (!cmd || !cmd.id || !cmd.op) return 'idle'; // nothing to do — stay quiet to keep agent.log readable
 

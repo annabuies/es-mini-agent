@@ -12,6 +12,36 @@ function sortedTrackList(value) {
   return value.filter((t) => Number.isInteger(t) && t >= 1 && t <= 6).sort((a, b) => a - b);
 }
 
+const num = (v) => (Number.isFinite(v) ? v : null);
+
+/**
+ * Contract C2 `signal` block, compact. Levels are what the Worker/app show; floor_dbfs stays on
+ * the Mini (diag). The heartbeat passes { signal: 'min' } (ch, peak_dbfs, active per channel, no
+ * window or labels) to stay under the Worker's 2048-byte cap; { channels: false } keeps only counts.
+ */
+function compactSignal(signal, options) {
+  if (!signal || typeof signal !== 'object') return null;
+  const min = !!(options && options.signal === 'min');
+  const out = {
+    checked_at: typeof signal.checked_at === 'string' ? signal.checked_at : null,
+    expected_count: num(signal.expected_count),
+    active_count: num(signal.active_count),
+    source: typeof signal.source === 'string' ? signal.source.slice(0, 16) : null,
+  };
+  if (!min) out.window_ms = num(signal.window_ms);
+  if (!(options && options.channels === false)) {
+    out.channels = (Array.isArray(signal.channels) ? signal.channels : []).slice(0, 8).map((c) => {
+      const ch = { ch: num(c && c.ch) };
+      if (!min) ch.label = typeof (c && c.label) === 'string' ? c.label.slice(0, 12) : null;
+      ch.peak_dbfs = num(c && c.peak_dbfs);
+      if (!min) ch.rms_dbfs = num(c && c.rms_dbfs);
+      ch.active = !!(c && c.active);
+      return ch;
+    });
+  }
+  return out;
+}
+
 /**
  * The contract `audio` block, compact (status, start, audio_check, heartbeat):
  * no extra fields beyond the contract's. `route` (A6) is each mic's enabled OBS
@@ -27,7 +57,9 @@ function compactAudio(block, options) {
       mics[name].route = { tracks: sortedTrackList(m.route.tracks), rec_tracks: sortedTrackList(m.route.rec_tracks) };
     }
   }
-  const out = { level: block.level, checked_at: block.checked_at || null, evo_present: typeof block.evo_present === 'boolean' ? block.evo_present : null, codes: Array.isArray(block.codes) ? block.codes : [], mics };
+  const out = { level: block.level, checked_at: block.checked_at || null, evo_present: typeof block.evo_present === 'boolean' ? block.evo_present : null, interface_present: typeof block.interface_present === 'boolean' ? block.interface_present : null, codes: Array.isArray(block.codes) ? block.codes : [], mics };
+  const signal = compactSignal(block.signal, options);
+  if (signal) out.signal = signal;
   if (block.error) out.error = String(block.error).slice(0, 80);
   return out;
 }
@@ -68,7 +100,7 @@ function buildHeartbeatState(inputs, options) {
     // Power strip health is sampled on its own timer: never add I/O here. Null when unconfigured.
     power: powerHealth ? { ...powerHealth } : null,
     // Mic check (cached; idle checks and the take's own watch fill it): never add I/O here.
-    audio: compactAudio(i.audio, options),
+    audio: compactAudio(i.audio, Object.assign({ signal: 'min' }, options)),
   };
   const wp = i.webhookPending;
   if (wp && Number.isFinite(wp.count) && wp.count > 0) {
@@ -90,13 +122,46 @@ function heartbeatStateJson(inputs, maxBytes) {
   const noRoute = buildHeartbeatState(inputs, { route: false });
   json = JSON.stringify(noRoute);
   if (Buffer.byteLength(json) <= cap) return json;
-  if (noRoute.audio) noRoute.audio.mics = {};
-  return JSON.stringify(noRoute);
+  const noChannels = buildHeartbeatState(inputs, { route: false, channels: false });
+  json = JSON.stringify(noChannels);
+  if (Buffer.byteLength(json) <= cap) return json;
+  if (noChannels.audio) noChannels.audio.mics = {};
+  return JSON.stringify(noChannels);
+}
+
+const HEARTBEAT_EVERY_MS = 60000;
+
+/**
+ * When the poll carries a heartbeat. due(now) hands out a slot at most every everyMs; the slot is
+ * only spent once the relay answered that poll (delivered()). A poll that failed or hung leaves
+ * it open, so the next poll (1-2 s later) carries the heartbeat again: before, one failed poll
+ * burned the 60 s slot and two bad polls in a row left the Worker without a heartbeat for 3 min,
+ * past its 150 s "Mini offline" limit (es-os-app api/membership.js MINI_HEARTBEAT_STALE_MS).
+ */
+function createHeartbeatSlot(everyMs) {
+  const every = Number.isFinite(everyMs) ? everyMs : HEARTBEAT_EVERY_MS;
+  let sentAt = 0;
+  let pendingAt = null;
+  return {
+    due(now) {
+      if (now - sentAt < every) return false;
+      pendingAt = now;
+      return true;
+    },
+    delivered() {
+      if (pendingAt !== null) { sentAt = pendingAt; pendingAt = null; }
+    },
+    abandoned() { pendingAt = null; },
+    lastSentAt: () => sentAt,
+  };
 }
 
 module.exports = {
+  HEARTBEAT_EVERY_MS,
   HEARTBEAT_STATE_MAX_BYTES,
+  createHeartbeatSlot,
   buildHeartbeatState,
   compactAudio,
+  compactSignal,
   heartbeatStateJson,
 };

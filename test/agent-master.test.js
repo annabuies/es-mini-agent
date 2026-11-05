@@ -312,6 +312,7 @@ async function startAgent(t, options = {}) {
     relayRequests.push(url);
     // options.relay(req, url) may answer instead: { status?, body }.
     const custom = typeof options.relay === 'function' ? options.relay(req, url) : null;
+    if (custom && custom.hang) return; // never answers (a stalled connection)
     res.statusCode = (custom && custom.status) || 200;
     res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify(custom ? custom.body : (options.relayResponse || { command: null })));
@@ -478,6 +479,39 @@ test('a failing relay is retried after 1 s then 2 s, never at the fast interval,
   assert.ok(gaps[1] >= 1900 && gaps[1] < 2600, 'after the second failure: ' + gaps[1] + ' ms');
   for (const gap of gaps.slice(2, 6)) assert.ok(gap < 500, 'recovered poll gap ' + gap + ' ms');
   assert.equal((agent.stderr().match(/relay: poll GET 503/g) || []).length, 2);
+});
+
+// Post-TF48 slice 4: "Studio offline" at the kiosk = the Worker saw no heartbeat for 150 s. The
+// heartbeat rides on the poll, once a minute; a failed or hung poll must not use up that slot.
+test('a heartbeat that did not get through rides on the retry, then goes back to once a minute', { timeout: 15000 }, async (t) => {
+  const polls = [];
+  await startAgent(t, {
+    env: { POLL_INTERVAL_MS: '100', POLL_IDLE_INTERVAL_MS: '100' },
+    relay(req, url) {
+      if (req.method !== 'GET' || url.searchParams.has('want_sources')) return null;
+      polls.push(url.searchParams.get('hb'));
+      return polls.length <= 2 ? { status: 503, body: { ok: false } } : { body: { ok: true, command: null } };
+    },
+  });
+  await waitFor(() => polls.length >= 6, 10000);
+  assert.deepEqual(polls.slice(0, 6), ['1', '1', '1', null, null, null], 'two failed polls, then the delivered one, then no repeat');
+});
+
+test('a poll the relay never answers is abandoned after POLL_TIMEOUT_MS and the heartbeat is sent again', { timeout: 15000 }, async (t) => {
+  const polls = [];
+  const agent = await startAgent(t, {
+    env: { POLL_INTERVAL_MS: '100', POLL_IDLE_INTERVAL_MS: '100', POLL_TIMEOUT_MS: '1000' },
+    relay(req, url) {
+      if (req.method !== 'GET' || url.searchParams.has('want_sources')) return null;
+      polls.push({ at: Date.now(), hb: url.searchParams.get('hb') });
+      return polls.length === 1 ? { hang: true } : { body: { ok: true, command: null } };
+    },
+  });
+  await waitFor(() => polls.length >= 3, 8000);
+  assert.equal(polls[1].hb, '1', 'the abandoned poll\'s heartbeat is sent again');
+  assert.ok(polls[1].at - polls[0].at < 4000, 'gap after the hang ' + (polls[1].at - polls[0].at) + ' ms (not the 5 min undici wait)');
+  assert.equal(polls[2].hb, null);
+  assert.match(agent.stderr(), /relay: poll error/);
 });
 
 test('smoke: fake relay and OBS start the three camera recordings', { timeout: 8000 }, async (t) => {
