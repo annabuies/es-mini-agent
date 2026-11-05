@@ -49,9 +49,9 @@ test('heartbeat: the worst-case last_state, mic routes and webhook_pending inclu
 });
 
 test('heartbeat: a state that would overflow drops the mic routes first, then the per-mic detail', () => {
-  const json = heartbeatStateJson(worstCaseInputs(), 1450);
+  const json = heartbeatStateJson(worstCaseInputs(), 1500);
   const state = JSON.parse(json);
-  assert.ok(Buffer.byteLength(json) <= 1450);
+  assert.ok(Buffer.byteLength(json) <= 1500);
   assert.equal(state.audio.mics['Mic 1'].route, undefined);
   assert.deepEqual(state.audio.mics['Mic 1'].codes, MIC_CODES);
   const tiny = JSON.parse(heartbeatStateJson(worstCaseInputs(), 800));

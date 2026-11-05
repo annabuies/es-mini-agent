@@ -35,7 +35,8 @@ function compactAudio(block, options) {
 /**
  * The heartbeat state object from the agent's cached samples (never I/O).
  * inputs: { recording, paused, uploadsQueued, masterActive, cameraReachability,
- *           diskUsage, powerHealth, audio (full or compact block), webhookPending }
+ *           diskUsage, powerHealth, audio (full or compact block), webhookPending,
+ *           previewCamera }
  * webhook_pending (A8) is omitted when nothing is pending (the cloud alerts on
  * count > 0 only); else { count, oldest_age_s } plus gave_up when any gave up.
  */
@@ -69,6 +70,9 @@ function buildHeartbeatState(inputs, options) {
     power: powerHealth ? { ...powerHealth } : null,
     // Mic check (cached; idle checks and the take's own watch fill it): never add I/O here.
     audio: compactAudio(i.audio, options),
+    // The angle in the room's one shared preview stream (contract C1): 1-3, or null
+    // when no preview overlay is active. Pure: the agent hands in its cached value.
+    preview_camera: Number.isInteger(i.previewCamera) && i.previewCamera >= 1 && i.previewCamera <= 3 ? i.previewCamera : null,
   };
   const wp = i.webhookPending;
   if (wp && Number.isFinite(wp.count) && wp.count > 0) {

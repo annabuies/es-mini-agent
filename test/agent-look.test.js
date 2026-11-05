@@ -162,7 +162,7 @@ test('demo-mode agent pulls PTZ config and executes a queued look', { timeout: 8
   assert.deepEqual(await postAgent(agentPort, 'resume'), { ok: true, recording: true, feeds_writing: null });
   assert.deepEqual(await postAgent(agentPort, 'stop'), { ok: true, saved: true });
   assert.deepEqual(await postAgent(agentPort, 'status'), {
-    ok: true, recording: false, feeds_writing: null, preview: false,
+    ok: true, recording: false, feeds_writing: null, preview: false, preview_camera: null,
     master_active: false, master_enabled: false,
   });
   assert.equal(ptzRequests().length, 3);
