@@ -5,7 +5,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { analyzeMeters, createAudioMonitor, evaluateAudio, meterFrame, readAudioSettings } = require('../audio-check');
+const { analyzeMeters, createAudioMonitor, evaluateAudio, meterFrame, readAudioSettings, signalFromFrames } = require('../audio-check');
 
 const MICS = ['Mic 1', 'Mic 2', 'Mic 3', 'Mic 4'];
 
@@ -341,4 +341,104 @@ test('A6 RecTracks read: both values empty, or the read failing, is unknown (rec
   const v = evaluateAudio(analyzeMeters(frames(30), MICS), Object.assign(failedTracks, { evoPresent: true }), null, MICS);
   for (const m of MICS) assert.equal(v.mics[m].recorded, null, m);
   assert.deepEqual(v.codes, []);
+});
+
+// Post-TF48 slice 6 / contract C2: the interface is not a mic. interface_present is reported apart
+// from per-channel signal, and "active" means speech over the channel's own floor.
+
+/** Meter frames, 50 ms apart: per mic a floor (dBFS RMS) and, when speaking, a burst pattern. */
+function signalFrames(spec, n = 60) {
+  const out = [];
+  for (let k = 0; k < n; k += 1) {
+    const levels = {};
+    MICS.forEach((m, i) => {
+      const s = spec[m] || { floor: -78 };
+      // Speech-like level: swings 20 dB around s.speech between syllables; else the floor with a little noise.
+      const db = s.speech === undefined ? s.floor + 2 * Math.sin(k * 1.3 + i) : (k % 6 < 4 ? s.speech + 6 * Math.sin(k) : s.floor);
+      const mag = Math.pow(10, db / 20);
+      levels[m] = [[mag, mag * 2.2, mag * 2.2], [mag, mag * 2.0, mag * 2.0]];
+    });
+    out.push({ at: k * 50, levels });
+  }
+  return out;
+}
+
+test('C2 signal: no mic speaking (interface plugged, empty XLR inputs) is 0 of 4 active, whatever the floor', () => {
+  for (const floor of [-95, -78, -60]) {
+    const spec = Object.fromEntries(MICS.map((m) => [m, { floor }]));
+    const sig = signalFromFrames(signalFrames(spec), MICS, { source: 'mic_check', checkedAt: 'T' });
+    assert.equal(sig.expected_count, 4);
+    assert.equal(sig.active_count, 0, 'floor ' + floor);
+    assert.equal(sig.source, 'mic_check');
+    assert.equal(sig.window_ms, 59 * 50);
+    assert.deepEqual(sig.channels.map((c) => [c.ch, c.label, c.active]), MICS.map((m, i) => [i + 1, m, false]));
+    for (const c of sig.channels) assert.ok(Number.isFinite(c.peak_dbfs) && Number.isFinite(c.rms_dbfs));
+  }
+});
+
+test('C2 signal: one, then four speakers are counted per channel; bleed under the margin is not a mic', () => {
+  const speak = { speech: -28, floor: -78 };
+  const one = signalFromFrames(signalFrames({ 'Mic 2': speak, 'Mic 1': { floor: -78 }, 'Mic 3': { floor: -78 }, 'Mic 4': { floor: -78 } }), MICS);
+  assert.deepEqual(one.channels.map((c) => c.active), [false, true, false, false]);
+  assert.equal(one.active_count, 1);
+  const four = signalFromFrames(signalFrames(Object.fromEntries(MICS.map((m) => [m, speak]))), MICS);
+  assert.equal(four.active_count, 4);
+  // Mic 2 speaks; the other three hear it 25 dB down (still above their floor, under the speech threshold).
+  const bleed = signalFromFrames(signalFrames({ 'Mic 2': speak, 'Mic 1': { speech: -55, floor: -78 }, 'Mic 3': { speech: -55, floor: -78 }, 'Mic 4': { speech: -55, floor: -78 } }), MICS);
+  assert.deepEqual(bleed.channels.map((c) => c.active), [false, true, false, false]);
+});
+
+test('C2 signal: a hot noise floor needs a clear speech margin; a frozen or absent meter is never active', () => {
+  const hotNoise = Object.fromEntries(MICS.map((m) => [m, { floor: -38 }]));
+  assert.equal(signalFromFrames(signalFrames(hotNoise), MICS).active_count, 0, 'noise at -38 is not speech');
+  const f = frames(30, { 'Mic 1': 'frozen', 'Mic 2': 'absent' });
+  const frozen = signalFromFrames(f.map((x) => ({ at: x.at, levels: Object.assign({}, x.levels, { 'Mic 1': [[0.2, 0.4, 0.4]] }) })), MICS);
+  assert.equal(frozen.channels[0].active, false);
+  assert.deepEqual([frozen.channels[1].peak_dbfs, frozen.channels[1].active], [null, false]);
+  assert.equal(signalFromFrames([], MICS).active_count, 0);
+});
+
+test('C2: the verdict carries interface_present (the EVO) apart from the signal; "ok" never implies a mic', async () => {
+  const unplugged = evaluateAudio(analyzeMeters(frames(30), MICS), settings({ evoPresent: false }), 'T', MICS);
+  assert.equal(unplugged.interface_present, false);
+  const plugged = evaluateAudio(analyzeMeters(frames(30), MICS), settings({ evoPresent: true }), 'T', MICS);
+  assert.equal(plugged.interface_present, true);
+  assert.equal(plugged.level, 'ok', 'the verdict is unchanged: the app must not read ok as Mics ready');
+  assert.equal(evaluateAudio(analyzeMeters(frames(30), MICS), settings({ evoPresent: null }), 'T', MICS).interface_present, null);
+  // The idle check attaches its own signal (source idle), and mic_check's replaces it for a while.
+  const obs = scriptedObs({});
+  const mon = createAudioMonitor({ createClient: obs.createClient, windowMs: 200, micCheckMs: 300, log: () => {}, warn: () => {} });
+  const idle = await mon.check('idle');
+  assert.equal(idle.signal.source, 'idle');
+  assert.equal(idle.signal.expected_count, 4);
+  assert.equal(idle.interface_present, true);
+  const out = await mon.micCheck();
+  assert.equal(out.ok, true);
+  assert.equal(out.interface_present, true);
+  assert.equal(out.signal.source, 'mic_check');
+  assert.equal(mon.latest().signal.source, 'mic_check', 'the cached verdict carries the explicit check');
+  assert.equal((await mon.check('idle')).signal.source, 'mic_check', 'and an idle check a moment later does not overwrite it with an empty one');
+});
+
+test('C2 mic_check: read-only on its own client, closed after; refused while a take owns the meters; OBS down and no meters are reasons', async () => {
+  const obs = scriptedObs({});
+  const mon = createAudioMonitor({ createClient: obs.createClient, windowMs: 100, micCheckMs: 250, log: () => {}, warn: () => {} });
+  const out = await mon.micCheck();
+  assert.equal(out.ok, true);
+  assert.equal(obs.clients.length, 1);
+  assert.equal(obs.clients[0].subs, 1 << 16, 'meters only');
+  assert.equal(obs.clients[0].closed, true);
+  const writes = obs.clients[0].requests.filter((r) => !/^Get/.test(r));
+  assert.deepEqual(writes, [], 'never writes to OBS (no Set*/Start*/Stop*)');
+  assert.ok(!obs.clients[0].requests.some((r) => /Record|Stream|Scene/.test(r)));
+  // A take open in this monitor: refused, and no client is opened for it.
+  const take = mon.beginTake();
+  await take.connected;
+  const before = obs.clients.length;
+  assert.deepEqual(await mon.micCheck(), { ok: false, reason: 'recording_active' });
+  assert.equal(obs.clients.length, before);
+  await mon.endTake();
+  assert.equal((await createAudioMonitor({ createClient: scriptedObs({ down: true }).createClient, micCheckMs: 50, log: () => {}, warn: () => {} }).micCheck()).reason, 'obs_unreachable');
+  const noMeters = await createAudioMonitor({ createClient: scriptedObs({ metersOff: true }).createClient, micCheckMs: 100, log: () => {}, warn: () => {} }).micCheck();
+  assert.deepEqual([noMeters.ok, noMeters.reason], [false, 'meters_unavailable']);
 });
