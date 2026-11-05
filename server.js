@@ -76,7 +76,17 @@ const DISK_USAGE_MS = 5 * 60 * 1000;
 // Power strip health: one read-only GET of the relay states, only when POWER_STRIP_URL is set.
 const POWER_CHECK_MS = 5 * 60 * 1000;
 const PREVIEW_INTERVAL_MS = 500;
-const PREVIEW_TTL_MS = 60000;
+// A viewer's lease lasts this long past its last preview_start (the app sends one every
+// 25 s). Overridable (floor 500 ms) so tests can watch a lease lapse.
+const PREVIEW_TTL_MS = Math.max(500, Number(process.env.PREVIEW_TTL_MS) || 60000);
+// The preview watchdog: every tick it drops lapsed leases, stops a stream nobody holds a
+// lease for, and re-publishes an output that died while a viewer is still watching.
+const PREVIEW_SWEEP_MS = Math.max(50, Number(process.env.PREVIEW_SWEEP_MS) || 5000);
+// At most one automatic re-publish per this long, and three failures in a row end the
+// attempts (the next keepalive starts the preview from scratch).
+const PREVIEW_RESTART_MIN_MS = Number.isFinite(Number(process.env.PREVIEW_RESTART_MIN_MS)) && process.env.PREVIEW_RESTART_MIN_MS !== ''
+  ? Math.max(0, Number(process.env.PREVIEW_RESTART_MIN_MS)) : 10000;
+const PREVIEW_RESTART_MAX_FAILURES = 3;
 const PREVIEW_WIDTH = 640;
 const PREVIEW_JPEG_QUALITY = 60;
 // S5 L0 (ships dark): the room's local preview relay (MediaMTX) control API. Only
@@ -191,6 +201,13 @@ let cloudflarePreviewPlaybackUrl = null;
 let cloudflarePreviewCameraIndex = 0;
 let cloudflarePreviewOverlay = null;
 let cloudflarePreviewRelayPath = null; // set while OBS publishes through the local relay
+// What the running output publishes to, kept IN MEMORY ONLY (the publish URL embeds a
+// secret and is never logged), so a dropped output can be re-published to the same
+// Cloudflare input without waiting for the Worker to hand out another one.
+let cloudflarePreviewPublish = null; // { inputUid, publishUrl, relay, localOffered }
+let cloudflarePreviewStartedAt = 0;
+let previewRestartAttemptAt = 0;
+let previewRestartFailures = 0;
 let startInFlight = null;
 let pendingSources = null;
 
@@ -378,11 +395,49 @@ function previewViewerId(body) {
 function refreshPreviewUntil(now = Date.now()) {
   let until = 0;
   for (const [viewer, expires] of previewLeases) {
-    if (expires <= now) previewLeases.delete(viewer);
-    else if (expires > until) until = expires;
+    if (expires <= now) {
+      previewLeases.delete(viewer);
+      previewLog('lease_expired', { viewer, viewers: previewLeases.size });
+    } else if (expires > until) until = expires;
   }
   previewUntil = until;
   return until;
+}
+
+// Structured preview log (Nov 5): one line per lifecycle event, key=value, so the field
+// comparison can count blackouts and measure recovery from agent.log. Only short scalar
+// values: anything that looks like a URL or a token is dropped, never printed.
+function previewLog(event, fields) {
+  const parts = ['[es-mini-agent] [preview] ev=' + event];
+  for (const [key, value] of Object.entries(fields || {})) {
+    if (value === undefined || value === null || value === '') continue;
+    const text = String(value).replace(/\s+/g, '_').slice(0, 60);
+    if (/:\/\/|pv1\.|token|bearer/i.test(text)) continue;
+    parts.push(key + '=' + text);
+  }
+  console.log(parts.join(' '));
+}
+
+/** The angle in the shared preview stream (1-3), or null with no overlay active. Contract C1. */
+function previewCameraNumber() {
+  if (!cloudflarePreviewOverlay) return null;
+  const camera = cloudflarePreviewCameraIndex + 1;
+  return camera >= 1 && camera <= 3 ? camera : null;
+}
+
+/** 'local' (OBS publishes through the room relay), 'cloudflare' (straight to Cloudflare) or null. */
+function previewRoute() {
+  if (!cloudflarePreviewOwnsStream) return null;
+  return cloudflarePreviewRelayPath ? 'local' : 'cloudflare';
+}
+
+// One preview operation at a time on the shared OBS stream: the poll loop's start/stop/
+// camera ops and the watchdog timer must not interleave their OBS requests.
+let previewLockTail = Promise.resolve();
+function withPreviewLock(fn) {
+  const run = previewLockTail.then(fn, fn);
+  previewLockTail = run.then(() => {}, () => {});
+  return run;
 }
 
 function maybeWarnPreview(detail) {
@@ -400,6 +455,7 @@ async function pushPreviewFrames() {
       clearInterval(previewTimer);
       previewTimer = null;
       console.log('[es-mini-agent] [preview] stopped (ttl)');
+      previewLog('jpeg_stop', { reason: 'ttl_expired' });
     }
     return;
   }
@@ -457,6 +513,7 @@ async function pushPreviewFrames() {
       clearInterval(previewTimer);
       previewTimer = null;
       console.log('[es-mini-agent] [preview] stopped (ttl)');
+      previewLog('jpeg_stop', { reason: 'ttl_expired' });
     }
   } catch (e) {
     maybeWarnPreview('preview tick failed: ' + (e && (e.message || e)));
@@ -595,13 +652,16 @@ async function removeStaleCloudflarePreviewScenes(client) {
 }
 
 async function selectCloudflarePreviewCamera(index) {
+  // Every answer carries `camera`: the angle actually in the stream (contract C1).
   if (!Number.isInteger(index) || index < 0 || index >= activeSources.length) {
-    return { ok: false, reason: 'camera_unavailable' };
+    return { ok: false, reason: 'camera_unavailable', camera: previewCameraNumber() };
   }
   if (!cloudflarePreviewOwnsStream || !cloudflarePreviewOverlay) {
-    return { ok: false, reason: 'preview_not_active' };
+    return { ok: false, reason: 'preview_not_active', camera: previewCameraNumber() };
   }
 
+  const startedAt = Date.now();
+  const previous = previewCameraNumber();
   try {
     const client = await getObsClient();
     const overlay = cloudflarePreviewOverlay;
@@ -617,9 +677,11 @@ async function selectCloudflarePreviewCamera(index) {
     }
     cloudflarePreviewCameraIndex = index;
     console.log('[es-mini-agent] [preview] camera selected source=' + activeSources[index]);
+    previewLog('camera', { from: previous, camera: index + 1, ms: Date.now() - startedAt, route: previewRoute() });
     return { ok: true, preview: true, source: activeSources[index], camera: index + 1 };
   } catch (e) {
-    return { ok: false, reason: 'camera_switch_failed', detail: truncateDetail(e && (e.message || e)) };
+    previewLog('camera_failed', { camera: previewCameraNumber(), wanted: index + 1, ms: Date.now() - startedAt });
+    return { ok: false, reason: 'camera_switch_failed', detail: truncateDetail(e && (e.message || e)), camera: previewCameraNumber() };
   }
 }
 
@@ -753,16 +815,20 @@ async function waitForStreamOutput(client, timeoutMs) {
   }
 }
 
-async function stopCloudflarePreview() {
+async function stopCloudflarePreview(reason) {
   if (cloudflarePreviewTimer) {
     clearInterval(cloudflarePreviewTimer);
     cloudflarePreviewTimer = null;
   }
   const inputUid = cloudflarePreviewInputUid;
   const owned = cloudflarePreviewOwnsStream;
+  const stoppedFrom = { route: previewRoute(), camera: previewCameraNumber(), startedAt: cloudflarePreviewStartedAt };
   cloudflarePreviewOwnsStream = false;
   cloudflarePreviewInputUid = null;
   cloudflarePreviewPlaybackUrl = null;
+  cloudflarePreviewPublish = null;
+  cloudflarePreviewStartedAt = 0;
+  previewRestartFailures = 0;
   if (owned) {
     let client = null;
     try {
@@ -782,6 +848,15 @@ async function stopCloudflarePreview() {
       cloudflarePreviewRelayPath = null;
       try { await setRelayForward(path, null); } catch (_) { maybeWarnPreview('preview relay forward clear failed'); }
     }
+    const now = Date.now();
+    previewLog('stream_stop', {
+      reason: reason || 'unknown',
+      route: stoppedFrom.route,
+      camera: stoppedFrom.camera,
+      viewers: previewLeases.size,
+      up_ms: stoppedFrom.startedAt ? now - stoppedFrom.startedAt : null,
+      stopped_at: new Date(now).toISOString(),
+    });
   } else if (cloudflarePreviewOverlay) {
     try {
       const client = await getObsClient();
@@ -794,6 +869,137 @@ async function stopCloudflarePreview() {
   return inputUid;
 }
 
+// Publishes the preview output. With a local relay offered: through the room relay, and
+// any relay failure falls back to publishing straight to Cloudflare. Returns which one.
+async function publishPreviewOutput(client, publishUrl, relay, localOffered) {
+  const publish = async (settings) => {
+    const configured = await client.request('SetStreamServiceSettings', {
+      streamServiceType: 'whip_custom',
+      streamServiceSettings: settings,
+    });
+    if (!obsRequestSucceeded(configured)) throw new Error('obs_whip_config_rejected');
+    const started = await client.request('StartStream');
+    if (!obsRequestSucceeded(started)) throw new Error('obs_stream_start_rejected');
+  };
+  // S5 L0: with a local relay offered, OBS publishes to the relay and the relay
+  // forwards the same stream to Cloudflare for phones. Any relay failure falls back
+  // to publishing straight to Cloudflare (the path below, unchanged).
+  let localRelay = false;
+  let localError = null;
+  if (relay) {
+    try {
+      await setRelayForward(relay.path, relayForwardDest(publishUrl));
+      await publish({ server: relay.whipUrl, bearer_token: relay.publishToken });
+      if (!(await waitForStreamOutput(client, PREVIEW_RELAY_START_CHECK_MS))) {
+        try { await client.request('StopStream'); } catch (_) {}
+        throw new Error('relay_publish_not_active');
+      }
+      localRelay = true;
+    } catch (e) {
+      localError = /^relay_publish|^obs_/.test(String(e && e.message)) ? 'relay_publish_failed' : 'relay_unreachable';
+      maybeWarnPreview('preview relay unavailable (' + localError + '); publishing to Cloudflare directly');
+      try { await setRelayForward(relay.path, null); } catch (_) {}
+    }
+  } else if (localOffered) {
+    localError = 'relay_config_invalid';
+  }
+  if (!localRelay) {
+    await publish({
+      server: publishUrl,
+      // Cloudflare authenticates with the secret embedded in the WHIP URL.
+      // Clear any bearer left by a previous IVS configuration.
+      bearer_token: '',
+    });
+  }
+  return { localRelay, localError };
+}
+
+// The overlay scene must still be in OBS (an OBS restart loses it); rebuild it if not.
+async function ensurePreviewOverlay(client) {
+  if (cloudflarePreviewOverlay) {
+    const list = await client.request('GetSceneList');
+    const scenes = obsRequestSucceeded(list) && Array.isArray(obsResponseData(list).scenes) ? obsResponseData(list).scenes : null;
+    const present = !!(scenes && scenes.some((scene) => scene && scene.sceneName === cloudflarePreviewOverlay.sceneName));
+    if (present) return cloudflarePreviewOverlay;
+    cloudflarePreviewOverlay = null;
+    await removeStaleCloudflarePreviewScenes(client);
+  }
+  return createCloudflarePreviewOverlay(client);
+}
+
+// The output stopped while a viewer still holds a lease (Cloudflare or the network
+// dropped it). Publish to the SAME Cloudflare input again from the saved settings: the
+// viewers' playback URL does not change and no new input is needed. Recording is not
+// touched: this only talks to OBS's stream output and the preview overlay scene.
+async function restorePreviewOutput(client, reason) {
+  const saved = cloudflarePreviewPublish;
+  if (!saved || !cloudflarePreviewOwnsStream) return false;
+  const startedAt = Date.now();
+  const lostAfterMs = cloudflarePreviewStartedAt ? startedAt - cloudflarePreviewStartedAt : null;
+  previewLog('stream_lost', { reason, route: previewRoute(), camera: previewCameraNumber(), viewers: previewLeases.size, up_ms: lostAfterMs });
+  try {
+    await ensurePreviewOverlay(client);
+    const published = await publishPreviewOutput(client, saved.publishUrl, saved.relay, saved.localOffered);
+    cloudflarePreviewRelayPath = published.localRelay && saved.relay ? saved.relay.path : null;
+    cloudflarePreviewStartedAt = Date.now();
+    previewLog('stream_restart', {
+      ok: true, reason, route: previewRoute(), camera: previewCameraNumber(), viewers: previewLeases.size,
+      ms: Date.now() - startedAt, started_at: new Date(cloudflarePreviewStartedAt).toISOString(),
+      local_error: published.localError,
+    });
+    return true;
+  } catch (e) {
+    previewLog('stream_restart', {
+      ok: false, reason, route: previewRoute(), camera: previewCameraNumber(), viewers: previewLeases.size,
+      ms: Date.now() - startedAt, error: /^[a-z_]+/.test(String(e && e.message)) ? String(e.message).match(/^[a-z_]+/)[0] : 'error',
+      failures: previewRestartFailures,
+    });
+    return false;
+  }
+}
+
+// Runs every PREVIEW_SWEEP_MS while this agent owns the stream. Drops lapsed leases,
+// stops the stream when no lease is left, and re-publishes an output that died while a
+// viewer is still watching (so recovery needs no viewer to reopen anything).
+async function previewTick() {
+  refreshPreviewUntil();
+  if (Date.now() > previewUntil) {
+    await withPreviewLock(async () => {
+      // A keepalive may have renewed a lease while this waited for the lock.
+      refreshPreviewUntil();
+      if (Date.now() > previewUntil) await stopCloudflarePreview('ttl_expired');
+    });
+    return;
+  }
+  if (!cloudflarePreviewOwnsStream) return;
+  await withPreviewLock(async () => {
+    if (!cloudflarePreviewOwnsStream || Date.now() > previewUntil) return;
+    let status;
+    let client;
+    try {
+      client = await getObsClient();
+      status = await client.request('GetStreamStatus');
+    } catch (_) { return; } // OBS did not answer: not the same as the output being down
+    if (!obsRequestSucceeded(status)) return;
+    const data = obsResponseData(status);
+    if (data.outputActive || data.outputReconnecting) {
+      previewRestartFailures = 0; // a restart only counts as good once the output is seen up
+      return;
+    }
+    if (previewRestartFailures >= PREVIEW_RESTART_MAX_FAILURES) {
+      // Every re-publish came back down: give the input up. The next keepalive hands out a
+      // fresh one and starts over.
+      previewLog('stream_gave_up', { reason: 'restart_failed', viewers: previewLeases.size });
+      await stopCloudflarePreview('restart_failed');
+      return;
+    }
+    if (Date.now() - previewRestartAttemptAt < PREVIEW_RESTART_MIN_MS) return;
+    previewRestartAttemptAt = Date.now();
+    previewRestartFailures += 1;
+    await restorePreviewOutput(client, 'watchdog');
+  });
+}
+
 async function startCloudflarePreview(config, localConfig) {
   const inputUid = config && typeof config.inputUid === 'string' ? config.inputUid.trim() : '';
   const publishUrl = config && typeof config.publishUrl === 'string' ? config.publishUrl.trim() : '';
@@ -803,32 +1009,54 @@ async function startCloudflarePreview(config, localConfig) {
     && validCloudflareWebRtcUrl(playbackUrl, '/webRTC/play');
 
   if (cloudflarePreviewOwnsStream) {
+    const keepCurrent = (extra) => Object.assign({
+      stream: { inputUid: cloudflarePreviewInputUid, playbackUrl: cloudflarePreviewPlaybackUrl },
+      // A keepalive can race with creation of a replacement input. Keep the
+      // stream we own and ask the relay to delete the unused candidate.
+      cleanupInputUid: validIdentity && inputUid !== cloudflarePreviewInputUid ? inputUid : null,
+      localRelay: !!cloudflarePreviewRelayPath,
+    }, extra || {});
+    let client = null;
+    let data = null;
     try {
-      const client = await getObsClient();
+      client = await getObsClient();
       const current = await client.request('GetStreamStatus');
-      if (obsRequestSucceeded(current) && current.responseData && current.responseData.outputActive) {
-        // A keepalive can race with creation of a replacement input. Keep the
-        // stream we own and ask the relay to delete the unused candidate.
-        return {
-          stream: { inputUid: cloudflarePreviewInputUid, playbackUrl: cloudflarePreviewPlaybackUrl },
-          cleanupInputUid: validIdentity && inputUid !== cloudflarePreviewInputUid ? inputUid : null,
-          localRelay: !!cloudflarePreviewRelayPath,
-        };
-      }
-    } catch (_) { /* clear the stale state and start again below */ }
+      if (obsRequestSucceeded(current)) data = obsResponseData(current);
+    } catch (_) { /* data stays null */ }
+    if (!data) {
+      // OBS did not answer. That is not "the output stopped": the old code cleared its
+      // state here and deleted the live Cloudflare input while OBS kept publishing to it,
+      // which orphaned the stream and cost a 7-8 s stale-output recovery on the next
+      // keepalive. Keep what we own; the watchdog and the next keepalive check again.
+      previewLog('status_unavailable', { route: previewRoute(), camera: previewCameraNumber() });
+      return keepCurrent();
+    }
+    if (data.outputActive || data.outputReconnecting) {
+      previewRestartFailures = 0;
+      return keepCurrent();
+    }
+    // The output died while we still owned it. Re-publish to the same input first.
+    if (client && await restorePreviewOutput(client, 'keepalive')) return keepCurrent({ restarted: true });
     const staleInputUid = cloudflarePreviewInputUid;
     cloudflarePreviewOwnsStream = false;
     cloudflarePreviewInputUid = null;
     cloudflarePreviewPlaybackUrl = null;
     cloudflarePreviewRelayPath = null;
+    cloudflarePreviewPublish = null;
+    cloudflarePreviewStartedAt = 0;
+    previewRestartFailures = 0;
     if (staleInputUid) await requestCloudflareCleanup(staleInputUid);
   }
   const relay = validLocalRelay(localConfig);
 
   if (!validIdentity || reuse || !validCloudflareWebRtcUrl(publishUrl, '/webRTC/publish')) {
-    return { stream: null, cleanupInputUid: !reuse && validIdentity ? inputUid : null };
+    // reuse: the Worker points at an input this agent no longer publishes to (it
+    // restarted, or the stream was stopped) and cannot publish to it without the secret
+    // publish URL. Say so; the next keepalive gets a fresh input.
+    return { stream: null, cleanupInputUid: !reuse && validIdentity ? inputUid : null, reuseUnavailable: reuse && validIdentity };
   }
 
+  let startReason = 'new_input';
   try {
     const client = await getObsClient();
     const status = await client.request('GetStreamStatus');
@@ -856,60 +1084,28 @@ async function startCloudflarePreview(config, localConfig) {
       }
       if (stillActive) throw new Error('obs_stale_preview_stop_timeout');
       console.log('[es-mini-agent] [preview] recovered stale Cloudflare WebRTC output');
+      startReason = 'stale_output_reclaimed';
     }
 
     await removeStaleCloudflarePreviewScenes(client);
     cloudflarePreviewCameraIndex = Math.min(cloudflarePreviewCameraIndex, activeSources.length - 1);
     await createCloudflarePreviewOverlay(client);
 
-    const publish = async (settings) => {
-      const configured = await client.request('SetStreamServiceSettings', {
-        streamServiceType: 'whip_custom',
-        streamServiceSettings: settings,
-      });
-      if (!obsRequestSucceeded(configured)) throw new Error('obs_whip_config_rejected');
-      const started = await client.request('StartStream');
-      if (!obsRequestSucceeded(started)) throw new Error('obs_stream_start_rejected');
-    };
-    // S5 L0: with a local relay offered, OBS publishes to the relay and the relay
-    // forwards the same stream to Cloudflare for phones. Any relay failure falls back
-    // to publishing straight to Cloudflare (the path below, unchanged).
-    let localRelay = false;
-    let localError = null;
-    if (relay) {
-      try {
-        await setRelayForward(relay.path, relayForwardDest(publishUrl));
-        await publish({ server: relay.whipUrl, bearer_token: relay.publishToken });
-        if (!(await waitForStreamOutput(client, PREVIEW_RELAY_START_CHECK_MS))) {
-          try { await client.request('StopStream'); } catch (_) {}
-          throw new Error('relay_publish_not_active');
-        }
-        localRelay = true;
-      } catch (e) {
-        localError = /^relay_publish|^obs_/.test(String(e && e.message)) ? 'relay_publish_failed' : 'relay_unreachable';
-        maybeWarnPreview('preview relay unavailable (' + localError + '); publishing to Cloudflare directly');
-        try { await setRelayForward(relay.path, null); } catch (_) {}
-      }
-    } else if (localConfig) {
-      localError = 'relay_config_invalid';
-    }
-    if (!localRelay) {
-      await publish({
-        server: publishUrl,
-        // Cloudflare authenticates with the secret embedded in the WHIP URL.
-        // Clear any bearer left by a previous IVS configuration.
-        bearer_token: '',
-      });
-    }
+    const { localRelay, localError } = await publishPreviewOutput(client, publishUrl, relay, !!localConfig);
     cloudflarePreviewOwnsStream = true;
     cloudflarePreviewInputUid = inputUid;
     cloudflarePreviewPlaybackUrl = playbackUrl;
     cloudflarePreviewRelayPath = localRelay ? relay.path : null;
+    cloudflarePreviewPublish = { inputUid, publishUrl, relay, localOffered: !!localConfig };
+    cloudflarePreviewStartedAt = Date.now();
+    previewRestartFailures = 0;
     console.log('[es-mini-agent] [preview] Cloudflare WebRTC stream started' + (localRelay ? ' (through the room relay)' : ''));
+    previewLog('stream_start', {
+      reason: startReason, route: previewRoute(), camera: previewCameraNumber(), viewers: previewLeases.size,
+      input: inputUid.slice(-6), started_at: new Date(cloudflarePreviewStartedAt).toISOString(), local_error: localError,
+    });
     if (!cloudflarePreviewTimer) {
-      cloudflarePreviewTimer = setInterval(() => {
-        if (Date.now() > previewUntil) void stopCloudflarePreview();
-      }, 5000);
+      cloudflarePreviewTimer = setInterval(() => { void previewTick().catch(() => {}); }, PREVIEW_SWEEP_MS);
     }
     return { stream: { inputUid, playbackUrl }, cleanupInputUid: null, localRelay, localError };
   } catch (e) {
@@ -922,6 +1118,7 @@ async function startCloudflarePreview(config, localConfig) {
     }
     if (relay) { try { await setRelayForward(relay.path, null); } catch (_) {} }
     maybeWarnPreview('Cloudflare preview start failed: ' + error);
+    previewLog('stream_start_failed', { reason: startReason, error: /^[A-Za-z0-9_:.-]+/.test(error) ? error.match(/^[A-Za-z0-9_:.-]+/)[0] : 'error' });
     return { stream: null, cleanupInputUid: inputUid, error };
   }
 }
@@ -1331,7 +1528,7 @@ async function handleOpCore(op, body) {
       return { ok: true, cancelled: true, saved: false };
     }
     if (op === 'status') {
-      return Object.assign({ ok: true, recording: state.recording, feeds_writing: null, preview: false, master_active: false, master_enabled: false }, activeSessionResponse());
+      return Object.assign({ ok: true, recording: state.recording, feeds_writing: null, preview: false, preview_camera: null, master_active: false, master_enabled: false }, activeSessionResponse());
     }
     if (op === 'pause') {
       if (!state.recording) {
@@ -1346,7 +1543,7 @@ async function handleOpCore(op, body) {
       return { ok: true, recording: true, feeds_writing: null };
     }
     if (op === 'preview_start' || op === 'preview_stop' || cameraIndexForPreviewOp(op) !== null) {
-      return { ok: true, preview: false };
+      return { ok: true, preview: false, camera: null };
     }
     if (op === 'diag') {
       return Object.assign({
@@ -1782,7 +1979,7 @@ async function handleOpCore(op, body) {
     const sources = sessionSources();
     const masterActive = await getMasterActiveSafe();
     if (!state.recording) {
-      const out = { ok: true, recording: false, feeds_writing: 0, preview: previewActive(), sources: sources.slice(), master_active: masterActive, master_enabled: MASTER_RECORD };
+      const out = { ok: true, recording: false, feeds_writing: 0, preview: previewActive(), preview_camera: previewCameraNumber(), sources: sources.slice(), master_active: masterActive, master_enabled: MASTER_RECORD };
       if (state.lastTake) out.last_take = state.lastTake;
       if (uploadQueue) out.uploads = uploadQueue.status();
       if (audioMonitor) out.audio = compactAudio(audioMonitor.latest());
@@ -1801,7 +1998,7 @@ async function handleOpCore(op, body) {
       cameras[source].writing = isRtspSession(source) ? !!(rtspState[source] && rtspState[source].writing) : sampled.writing.has(source);
     }
     const feedsWriting = sampled.count + sources.filter((source) => isRtspSession(source) && rtspState[source] && rtspState[source].writing).length;
-    const out = Object.assign({ ok: true, recording: true, feeds_writing: feedsWriting, preview: previewActive(), sources: sources.slice(), master_active: masterActive, master_enabled: MASTER_RECORD }, activeSessionResponse());
+    const out = Object.assign({ ok: true, recording: true, feeds_writing: feedsWriting, preview: previewActive(), preview_camera: previewCameraNumber(), sources: sources.slice(), master_active: masterActive, master_enabled: MASTER_RECORD }, activeSessionResponse());
     out.cameras = cameras;
     out.fallback_sources = fallbackSources(state.capture);
     if (state.rtspSources.length) out.rtsp = rtspState;
@@ -2001,14 +2198,29 @@ async function handleOpCore(op, body) {
   }
   const previewCameraIndex = cameraIndexForPreviewOp(op);
   if (previewCameraIndex !== null) {
-    return await selectCloudflarePreviewCamera(previewCameraIndex);
+    return await withPreviewLock(() => selectCloudflarePreviewCamera(previewCameraIndex));
   }
   if (op === 'preview_start') {
+    const startedAt = Date.now();
+    const viewer = previewViewerId(body);
     // The kiosk sends this every 25 s while it shows the studio: keep its mic check fresh.
+    // Logged when it fires, so a drop can be lined up with it (it opens its own OBS
+    // websocket, with the input-meter events, for about AUDIO_METER_WINDOW_MS).
+    if (audioMonitor && !state.recording && !startInFlight && !audioMonitor.takeActive()) {
+      const lastAudio = audioMonitor.latest();
+      const audioAge = lastAudio && lastAudio.checked_at ? Date.now() - Date.parse(lastAudio.checked_at) : Infinity;
+      if (!(audioAge < AUDIO_PREVIEW_MIN_MS)) previewLog('audio_check_due', { viewer });
+    }
     maybeAudioCheck('preview', AUDIO_PREVIEW_MIN_MS);
-    previewLeases.set(previewViewerId(body), Date.now() + PREVIEW_TTL_MS);
+    const joined = !previewLeases.has(viewer);
+    previewLeases.set(viewer, Date.now() + PREVIEW_TTL_MS);
     refreshPreviewUntil();
-    const realtime = await startCloudflarePreview(body && body.cloudflare, body && body.local);
+    if (joined) previewLog('viewer_join', { viewer, viewers: previewLeases.size, route: previewRoute(), camera: previewCameraNumber() });
+    const realtime = await withPreviewLock(() => startCloudflarePreview(body && body.cloudflare, body && body.local));
+    const tookMs = Date.now() - startedAt;
+    if (tookMs > 2000 || realtime.restarted || !realtime.stream) {
+      previewLog('keepalive', { viewer, ms: tookMs, stream: realtime.stream ? 'yes' : 'no', restarted: realtime.restarted ? 'yes' : null, reuse_unavailable: realtime.reuseUnavailable ? 'yes' : null, error: realtime.error ? 'start_failed' : null });
+    }
     // Only when the Worker offered a relay: flag off leaves the result unchanged.
     const relayFields = body && body.local
       ? Object.assign({ local_relay: !!realtime.localRelay }, realtime.localError ? { local_error: realtime.localError } : {})
@@ -2025,40 +2237,55 @@ async function handleOpCore(op, body) {
         stream: realtime.stream,
         cleanup_input_uid: realtime.cleanupInputUid,
         sources: activeSources.slice(),
+        camera: previewCameraNumber(),
       }, relayFields, audioMonitor ? { audio: compactAudio(currentAudio()) } : {});
     }
     if (!isStorageConfigured()) {
-      return { ok: false, reason: 'r2_unconfigured', cleanup_input_uid: realtime.cleanupInputUid };
+      return { ok: false, reason: 'r2_unconfigured', cleanup_input_uid: realtime.cleanupInputUid, camera: previewCameraNumber() };
     }
     if (!previewTimer) {
       previewTimer = setInterval(pushPreviewFrames, PREVIEW_INTERVAL_MS);
       console.log('[es-mini-agent] [preview] started');
+      previewLog('jpeg_fallback_start', { viewer, reason: realtime.reuseUnavailable ? 'reuse_unavailable' : (realtime.error ? 'stream_start_failed' : 'no_stream_offered') });
     }
     return Object.assign({
       ok: true,
       preview: true,
       cleanup_input_uid: realtime.cleanupInputUid,
-      stream_error: realtime.error || null,
+      stream_error: realtime.error || (realtime.reuseUnavailable ? 'reuse_unavailable' : null),
       sources: activeSources.slice(),
+      camera: previewCameraNumber(),
     }, relayFields, audioMonitor ? { audio: compactAudio(currentAudio()) } : {});
   }
   if (op === 'preview_stop') {
     const viewer = previewViewerId(body);
-    previewLeases.delete(viewer);
+    const held = previewLeases.delete(viewer);
     if (viewer !== PREVIEW_SHARED_VIEWER && refreshPreviewUntil() > Date.now()) {
       // Another viewer is still watching: release only this one.
-      return { ok: true, preview: true, viewers: previewLeases.size };
+      previewLog('viewer_leave', { viewer, held: held ? 'yes' : 'no', viewers: previewLeases.size, kept_stream: 'yes', route: previewRoute(), camera: previewCameraNumber() });
+      return { ok: true, preview: true, viewers: previewLeases.size, camera: previewCameraNumber() };
     }
+    const reason = viewer === PREVIEW_SHARED_VIEWER ? 'legacy_stop' : 'last_viewer_left';
+    previewLog('viewer_leave', { viewer, held: held ? 'yes' : 'no', viewers: 0, kept_stream: 'no' });
     previewLeases.clear();
     previewUntil = 0;
-    const cleanupInputUid = await stopCloudflarePreview();
-    cloudflarePreviewCameraIndex = 0;
-    if (previewTimer) {
-      clearInterval(previewTimer);
-      previewTimer = null;
-      console.log('[es-mini-agent] [preview] stopped');
+    const cleanupInputUid = await withPreviewLock(async () => {
+      // A viewer may have joined while this waited for the lock: then it is not the last.
+      if (previewLeases.size > 0) return undefined;
+      const uid = await stopCloudflarePreview(reason);
+      cloudflarePreviewCameraIndex = 0;
+      if (previewTimer) {
+        clearInterval(previewTimer);
+        previewTimer = null;
+        console.log('[es-mini-agent] [preview] stopped');
+      }
+      return uid;
+    });
+    if (cleanupInputUid === undefined) {
+      refreshPreviewUntil();
+      return { ok: true, preview: true, viewers: previewLeases.size, camera: previewCameraNumber() };
     }
-    return { ok: true, preview: false, cleanup_input_uid: cleanupInputUid };
+    return { ok: true, preview: false, cleanup_input_uid: cleanupInputUid, camera: null };
   }
   if (op === 'update') {
     return await performUpdate();
@@ -2405,6 +2632,8 @@ function heartbeatQuery(now = Date.now()) {
       diskUsage,
       powerHealth,
       audio: currentAudio(),
+      // The angle in the shared preview stream (contract C1), null with no overlay.
+      previewCamera: previewCameraNumber(),
       // Undelivered upload_confirmed posts (A8; in memory, no I/O).
       webhookPending: uploadQueue ? uploadQueue.webhookPending() : null,
     });
@@ -2470,6 +2699,53 @@ async function refreshSources() {
   }
 }
 
+// Posts an op's result back to the relay. Resolves 'command' (or 'error' never: the
+// caller's catch covers a throw).
+async function postCommandResult(cmd, result, opStartedAt) {
+  if (result == null) {
+    console.warn(`[es-mini-agent] relay: unknown op '${cmd.op}' (id=${cmd.id}) — skipping result post`);
+    return 'command';
+  }
+  const postRes = await fetch(`${RECORD_POLL_URL}/api/record`, {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + RECORD_CONTROL_KEY,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ mini_result: true, id: cmd.id, ok: !!result.ok, result }),
+  });
+  if (!postRes.ok) {
+    console.warn(`[es-mini-agent] relay: result POST ${postRes.status} for ${cmd.op} (${cmd.id})`);
+    return 'command';
+  }
+  // How long the op itself took, so a slow tap can be split into poll wait and agent work.
+  console.log(`[es-mini-agent] relay: claimed ${cmd.op} (${cmd.id}) -> posted result (op took ${((Date.now() - opStartedAt) / 1000).toFixed(1)} s)`);
+  return 'command';
+}
+
+// Looks run one at a time, in the order they were claimed, but off the poll loop.
+// `lookPending` counts claimed looks not yet answered; `lookTail` settles when the last one has.
+let lookTail = Promise.resolve();
+let lookPending = 0;
+// Ops that may run while a look is still waiting on the cameras.
+const LOOK_CONCURRENT_OPS = new Set(['status', 'preview_start', 'preview_stop', 'preview_cam1', 'preview_cam2', 'preview_cam3', 'diag', 'audio_check', 'stop', 'cancel', 'pause', 'resume']);
+function dispatchLookOffLoop(cmd, payload) {
+  const claimedAt = Date.now();
+  lookPending += 1;
+  lookTail = lookTail.then(async () => {
+    const startedAt = Date.now();
+    try {
+      const result = await handleOp(cmd.op, payload);
+      await postCommandResult(cmd, result, startedAt);
+      if (previewActive()) previewLog('look', { queued_ms: startedAt - claimedAt, ms: Date.now() - startedAt, ok: result && result.ok ? 'yes' : 'no', preview: 'active' });
+    } catch (e) {
+      console.error('[es-mini-agent] relay: look error:', e && (e.stack || e.message || e));
+    } finally {
+      lookPending -= 1;
+    }
+  });
+}
+
 // Resolves 'command', 'idle' or 'error' so the loop can pick the next interval.
 async function pollOnce() {
   if (polling) return 'idle'; // network calls are async — belt-and-suspenders reentry guard
@@ -2498,28 +2774,20 @@ async function pollOnce() {
     if (!cmd || !cmd.id || !cmd.op) return 'idle'; // nothing to do — stay quiet to keep agent.log readable
 
     lastCommandAt = Date.now();
+    const payload = (cmd.payload && typeof cmd.payload === 'object') ? cmd.payload : {};
+    if (cmd.op === 'look') {
+      // A look waits on the cameras' HTTP answers (up to 3 s each). Run on the poll loop
+      // it holds every command behind it, including the viewers' preview keepalives and
+      // camera picks, for that long per tap (Robbie Nov 4: rapid preset taps blacked out
+      // the preview). Looks still run one at a time, in order, just not on the loop.
+      dispatchLookOffLoop(cmd, payload);
+      return 'command';
+    }
+    // Nothing else may overlap a look: a Start must not begin with cameras still moving.
+    if (lookPending > 0 && !LOOK_CONCURRENT_OPS.has(cmd.op)) await lookTail;
     const opStartedAt = Date.now();
-    const result = await handleOp(cmd.op, (cmd.payload && typeof cmd.payload === 'object') ? cmd.payload : {});
-    if (result == null) {
-      console.warn(`[es-mini-agent] relay: unknown op '${cmd.op}' (id=${cmd.id}) — skipping result post`);
-      return 'command';
-    }
-
-    const postRes = await fetch(`${RECORD_POLL_URL}/api/record`, {
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + RECORD_CONTROL_KEY,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ mini_result: true, id: cmd.id, ok: !!result.ok, result }),
-    });
-    if (!postRes.ok) {
-      console.warn(`[es-mini-agent] relay: result POST ${postRes.status} for ${cmd.op} (${cmd.id})`);
-      return 'command';
-    }
-    // How long the op itself took, so a slow tap can be split into poll wait and agent work.
-    console.log(`[es-mini-agent] relay: claimed ${cmd.op} (${cmd.id}) -> posted result (op took ${((Date.now() - opStartedAt) / 1000).toFixed(1)} s)`);
-    return 'command';
+    const result = await handleOp(cmd.op, payload);
+    return await postCommandResult(cmd, result, opStartedAt);
   } catch (e) {
     // Network hiccup, DNS blip, JSON parse — never crash the process.
     console.error('[es-mini-agent] relay: poll error:', e && (e.stack || e.message || e));

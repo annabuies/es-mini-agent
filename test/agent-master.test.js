@@ -374,6 +374,8 @@ test('heartbeat is sent from cached state on the first poll only once per minute
     power: null,
     // The first mic check runs 2 s after boot, after this first heartbeat.
     audio: null,
+    // Contract C1: the shared preview angle, null with no preview overlay.
+    preview_camera: null,
   });
   assert.equal(typeof heartbeatState.disk_free_bytes, 'number');
   assert.equal(typeof heartbeatState.disk_total_bytes, 'number');
