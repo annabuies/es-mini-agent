@@ -2713,6 +2713,9 @@ async function postCommandResult(cmd, result, opStartedAt) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ mini_result: true, id: cmd.id, ok: !!result.ok, result }),
+    // Post-TF48 audit P2: a result POST the relay never answers would hold the one
+    // command loop (and the heartbeat riding on it) for undici's 5 min. Same cap as the poll.
+    signal: AbortSignal.timeout(POLL_TIMEOUT_MS),
   });
   if (!postRes.ok) {
     console.warn(`[es-mini-agent] relay: result POST ${postRes.status} for ${cmd.op} (${cmd.id})`);

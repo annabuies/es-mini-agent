@@ -517,6 +517,24 @@ test('a poll the relay never answers is abandoned after POLL_TIMEOUT_MS and the 
   assert.match(agent.stderr(), /relay: poll error/);
 });
 
+test('a result POST the relay never answers is abandoned after POLL_TIMEOUT_MS, so the poll and its heartbeat resume', { timeout: 15000 }, async (t) => {
+  const polls = [];
+  let posts = 0;
+  await startAgent(t, {
+    env: { POLL_INTERVAL_MS: '100', POLL_IDLE_INTERVAL_MS: '100', POLL_TIMEOUT_MS: '1000' },
+    relay(req, url) {
+      if (url.searchParams.has('want_sources')) return null;
+      if (req.method === 'POST') { posts += 1; return posts === 1 ? { hang: true } : { body: { ok: true } }; }
+      if (req.method !== 'GET') return null;
+      polls.push(Date.now());
+      return polls.length === 1 ? { body: { ok: true, command: { id: 'cmd-1', op: 'status', payload: {} } } } : { body: { ok: true, command: null } };
+    },
+  });
+  await waitFor(() => polls.length >= 2, 8000);
+  assert.equal(posts >= 1, true, 'the status result was posted');
+  assert.ok(polls[1] - polls[0] < 4500, 'next poll ' + (polls[1] - polls[0]) + ' ms after the hung result POST (not the 5 min undici wait)');
+});
+
 test('smoke: fake relay and OBS start the three camera recordings', { timeout: 8000 }, async (t) => {
   const obsRequests = [];
   const obsServer = createFakeObs(obsRequests);
