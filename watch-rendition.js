@@ -39,6 +39,23 @@ const MAX_MIX_TRACKS = 4;
 // keyframes are the only ones (VideoToolbox otherwise adds its own).
 const HW_CODECS = ['h264', 'hevc'];
 const HW_GOP_FRAMES = 600;
+// Watch-copy mic gate (post-TF48, slice 2). The four open SM7Bs each carry their own
+// preamp noise floor (bench-1: -75...-84 dBFS per mic, audio-health.js). The mix sums
+// all four at unity (normalize=0), so the room-tone hiss is four uncorrelated floors,
+// about +6 dB over any one mic, and it never goes away because every mic stays open
+// even while only one person talks. A gentle downward gate on each mic BEFORE the sum
+// closes the idle mics: room tone falls to the gate's range floor, the talking mic is
+// untouched, and the isolated per-mic files and the master are not rewritten.
+// -50 dBFS sits ~15 dB above the noisiest healthy floor and ~25 dB under speech
+// (-35...-20 dBFS RMS); range 0.06 = at most 24 dB of reduction, so a mic quieter than
+// the threshold is attenuated, never muted. WATCH_AUDIO_GATE=0 restores the plain sum;
+// WATCH_GATE_DB overrides the threshold (dBFS, -70...-30).
+const GATE_DEFAULT_DB = -50;
+const GATE_RANGE = 0.06;
+const GATE_RATIO = 2;
+const GATE_ATTACK_MS = 5;
+const GATE_RELEASE_MS = 300;
+const GATE_KNEE = 2.8;
 
 function round3(n) {
   return Math.round(n * 1000) / 1000;
@@ -71,24 +88,53 @@ function audioShiftFilter(delayS, sampleRate) {
   return 'anull';
 }
 
-/** Filter chain mixing the master's first N audio tracks (input index `input`) into one stereo stream. */
-function mixChain(input, tracks) {
+/**
+ * The per-mic gate filter, or null when off. options.gate: true = on at the default
+ * threshold (WATCH_GATE_DB overrides it), a number = on at that dBFS, false/undefined =
+ * off. WATCH_AUDIO_GATE=0 in the environment turns it off whatever the caller asks.
+ */
+function micGateFilter(options) {
+  const gate = options && options.gate;
+  if (gate === undefined || gate === false || process.env.WATCH_AUDIO_GATE === '0') return null;
+  const envDb = process.env.WATCH_GATE_DB !== undefined && process.env.WATCH_GATE_DB !== '' ? Number(process.env.WATCH_GATE_DB) : NaN;
+  const raw = typeof gate === 'number' ? gate : (Number.isFinite(envDb) ? envDb : GATE_DEFAULT_DB);
+  const db = Math.max(-70, Math.min(-30, raw));
+  const threshold = Math.pow(10, db / 20).toFixed(5);
+  return 'agate=threshold=' + threshold + ':range=' + GATE_RANGE + ':ratio=' + GATE_RATIO + ':attack=' + GATE_ATTACK_MS
+    + ':release=' + GATE_RELEASE_MS + ':knee=' + GATE_KNEE + ':detection=rms:link=average';
+}
+
+/**
+ * Filter chain mixing the master's first N audio tracks (input index `input`) into one
+ * stereo stream. options.gate (see micGateFilter) gates each mic before the sum; the
+ * take's own mix file passes none, so it stays the plain sum.
+ */
+function mixChain(input, tracks, options) {
   const n = Math.max(0, Math.min(MAX_MIX_TRACKS, Number(tracks) || 0));
   if (n === 0) return null;
-  const labels = Array.from({ length: n }, (_, i) => '[' + input + ':a:' + i + ']').join('');
+  const gateFilter = micGateFilter(options);
+  let prefix = '';
+  let labels;
+  if (gateFilter) {
+    prefix = Array.from({ length: n }, (_, i) => '[' + input + ':a:' + i + ']' + gateFilter + '[g' + i + ']').join(';') + ';';
+    labels = Array.from({ length: n }, (_, i) => '[g' + i + ']').join('');
+  } else {
+    labels = Array.from({ length: n }, (_, i) => '[' + input + ':a:' + i + ']').join('');
+  }
   // Resample first so every input is 48 kHz stereo; normalize=0 keeps each mic at
   // its own level (amix would otherwise divide by 4, -12 dB); the limiter only
   // catches a sum over full scale, with its lookahead compensated (latency=1).
   const head = n === 1
     ? labels + 'aresample=' + SAMPLE_RATE + ',aformat=channel_layouts=stereo'
     : labels + 'amix=inputs=' + n + ':duration=longest:normalize=0,aresample=' + SAMPLE_RATE + ',aformat=channel_layouts=stereo';
-  return head + ',alimiter=limit=0.95:level=0:latency=1';
+  return prefix + head + ',alimiter=limit=0.95:level=0:latency=1';
 }
 
 /**
  * ffmpeg args for one camera's watch copy: 1080p H.264 ~4 Mbps, a keyframe every
- * 2 s, faststart; AAC stereo = the mic mix delayed by delayS. masterTracks 0 (no
- * master on disk) makes a video-only copy.
+ * 2 s, faststart; AAC stereo = the mic mix delayed by delayS, each mic gated before the
+ * sum (opts.gate false = plain sum; see GATE_DEFAULT_DB). masterTracks 0 (no master on
+ * disk) makes a video-only copy.
  */
 function watchArgs(input) {
   const opts = input || {};
@@ -102,7 +148,7 @@ function watchArgs(input) {
   args.push('-i', opts.cameraPath);
   if (tracks > 0) {
     args.push('-i', opts.masterPath);
-    filters.push(mixChain(1, tracks) + ',' + audioShiftFilter(opts.delayS) + ',apad[aout]');
+    filters.push(mixChain(1, tracks, { gate: opts.gate === undefined ? true : opts.gate }) + ',' + audioShiftFilter(opts.delayS) + ',apad[aout]');
     maps.push('-map', '[aout]');
   }
   args.push('-filter_complex', filters.join(';'), ...maps,
@@ -230,6 +276,7 @@ module.exports = {
   computeDelayS,
   hardwareFit,
   mixArgs,
+  micGateFilter,
   mixChain,
   offsetFromTiming,
   planWatch,

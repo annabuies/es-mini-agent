@@ -11,7 +11,8 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
 const test = require('node:test');
-const { audioShiftFilter, computeDelayS, hardwareFit, mixArgs, offsetFromTiming, planWatch, watchArgs } = require('../watch-rendition');
+const { audioShiftFilter, computeDelayS, hardwareFit, micGateFilter, mixArgs, offsetFromTiming, planWatch, watchArgs } = require('../watch-rendition');
+const { BURSTS, ROOM_TONE, levelDb, makeMaster } = require('./helpers/synth-mics');
 const { measureFlash } = require('../scripts/sync-measure');
 const { createUploadQueue } = require('../upload-queue');
 
@@ -86,7 +87,7 @@ test('watch args: 1080p H.264 ~4 Mbps, 2 s keyframes, faststart, four mics mixed
   const args = watchArgs({ cameraPath: '/r/cam1/a.mp4', masterPath: '/r/master/a.mp4', masterTracks: 4, delayS: 1.08, outPath: '/r/cam1/a.mp4.watch.mp4' });
   const at = (flag) => args[args.indexOf(flag) + 1];
   assert.deepEqual(args.filter((a, i) => args[i - 1] === '-i'), ['/r/cam1/a.mp4', '/r/master/a.mp4']);
-  assert.match(at('-filter_complex'), /^\[0:v:0\]scale=-2:1080:flags=bicubic,format=yuv420p\[vout\];\[1:a:0\]\[1:a:1\]\[1:a:2\]\[1:a:3\]amix=inputs=4:duration=longest:normalize=0,.*,adelay=delays=51840S:all=1,apad\[aout\]$/);
+  assert.match(at('-filter_complex'), /^\[0:v:0\]scale=-2:1080:flags=bicubic,format=yuv420p\[vout\];(\[1:a:\d\]agate=[^;]*\[g\d\];){4}\[g0\]\[g1\]\[g2\]\[g3\]amix=inputs=4:duration=longest:normalize=0,.*,adelay=delays=51840S:all=1,apad\[aout\]$/, 'each mic is gated before the sum');
   assert.equal(at('-c:v'), 'libx264');
   assert.equal(at('-b:v'), '4000k');
   assert.equal(at('-force_key_frames'), 'expr:gte(t,n_forced*2)');
@@ -204,7 +205,7 @@ test('hardware watch args: GPU decode on the camera only, scale_vt, VideoToolbox
   const at = (flag) => hw[hw.indexOf(flag) + 1];
   assert.ok(hw.indexOf('-hwaccel') < hw.indexOf('/r/cam1/a.mp4') && hw.lastIndexOf('-hwaccel') === hw.indexOf('-hwaccel'), 'hwaccel applies to the camera input only');
   assert.equal(at('-hwaccel_output_format'), 'videotoolbox_vld');
-  assert.match(at('-filter_complex'), /^\[0:v:0\]scale_vt=w=-2:h=1080\[vout\];\[1:a:0\]/);
+  assert.match(at('-filter_complex'), /^\[0:v:0\]scale_vt=w=-2:h=1080\[vout\];\[1:a:0\]agate=/);
   assert.equal(at('-c:v'), 'h264_videotoolbox');
   assert.equal(at('-g'), '600');
   assert.equal(at('-b:v'), '4000k');
@@ -259,3 +260,71 @@ for (const [label, offsetS, cameraStartS] of [['+1.08 s', 1.08, 0], ['-0.50 s', 
     assert.ok(head.indexOf('moov') > 0 && (head.indexOf('mdat') < 0 || head.indexOf('moov') < head.indexOf('mdat')), 'moov first');
   });
 }
+
+// Post-TF48 slice 2: the Watch mix hiss. Four open SM7Bs sum four noise floors (+6 dB); each mic is
+// now gated before the sum on the Watch copy only. Measured on synthetic 4-channel audio (real ffmpeg).
+test('watch gate: on by default for the Watch copy only; the take mix stays the plain sum; WATCH_AUDIO_GATE=0 and gate:false restore it', () => {
+  const input = { cameraPath: '/c.mp4', masterPath: '/m.mp4', masterTracks: 4, delayS: 0, outPath: '/o.mp4' };
+  const fc = (args) => args[args.indexOf('-filter_complex') + 1];
+  assert.match(fc(watchArgs(input)), /agate=threshold=0\.00316:range=0\.06:ratio=2:attack=5:release=300/);
+  assert.doesNotMatch(fc(mixArgs({ masterPath: '/m.mp4', masterTracks: 4, outPath: '/o.m4a' })), /agate/, 'the take mix file is untouched');
+  assert.doesNotMatch(fc(watchArgs({ ...input, gate: false })), /agate/);
+  assert.equal(micGateFilter({ gate: -45 }).includes('threshold=0.00562'), true, 'a number is a dBFS threshold');
+  assert.equal(micGateFilter({ gate: -200 }).includes('threshold=0.00032'), true, 'clamped to -70 dBFS');
+  const env = process.env.WATCH_AUDIO_GATE;
+  process.env.WATCH_AUDIO_GATE = '0';
+  try { assert.doesNotMatch(fc(watchArgs(input)), /agate/, 'rollback switch'); } finally { if (env === undefined) delete process.env.WATCH_AUDIO_GATE; else process.env.WATCH_AUDIO_GATE = env; }
+  const dbEnv = process.env.WATCH_GATE_DB;
+  process.env.WATCH_GATE_DB = '-40';
+  try { assert.match(fc(watchArgs(input)), /threshold=0\.01000/); } finally { if (dbEnv === undefined) delete process.env.WATCH_GATE_DB; else process.env.WATCH_GATE_DB = dbEnv; }
+  // One mic: no amix, still gated.
+  assert.match(fc(watchArgs({ ...input, masterTracks: 1 })), /\[1:a:0\]agate=[^;]*\[g0\];\[g0\]aresample/);
+});
+
+function encodeWatch(dir, master, extra) {
+  const cam = path.join(dir, 'cam.mp4');
+  if (!fs.existsSync(cam)) execFileSync('ffmpeg', ['-nostdin', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=s=320x180:r=30:d=16', '-c:v', 'libx264', '-preset', 'ultrafast', cam]);
+  const out = path.join(dir, 'watch-' + (extra && extra.gate === false ? 'plain' : 'gated') + '.mp4');
+  execFileSync('ffmpeg', watchArgs({ cameraPath: cam, masterPath: master, masterTracks: 4, delayS: 0, outPath: out, ...(extra || {}) }));
+  return out;
+}
+
+const burstRms = (file, i) => levelDb(file, '0:a:0', BURSTS[i][0] + 0.2, BURSTS[i][1] - 0.2).rms;
+
+test('watch gate on synthetic 4-mic audio: room-tone hiss falls well below the plain sum, every mic\'s speech survives, masters and the take mix are untouched', NEEDS_FFMPEG, (t) => {
+  const dir = tmp(t);
+  const master = makeMaster(path.join(dir, 'master.mp4'), { floorsDb: [-66, -70, -74, -78], video: true });
+  const masterBefore = md5(master);
+  const plain = encodeWatch(dir, master, { gate: false });
+  const gated = encodeWatch(dir, master);
+  const roomPlain = levelDb(plain, '0:a:0', ...ROOM_TONE).rms;
+  const roomGated = levelDb(gated, '0:a:0', ...ROOM_TONE).rms;
+  // Four floors of -66/-70/-74/-78 sum to about -64 dBFS (the isolated mics are -66...-78).
+  assert.ok(roomPlain > -66 && roomPlain < -62, 'plain sum ' + roomPlain);
+  assert.ok(roomGated <= roomPlain - 15, 'gated room tone ' + roomGated + ' vs plain ' + roomPlain);
+  for (let i = 0; i < 4; i += 1) {
+    const speechPlain = burstRms(plain, i);
+    const speechGated = burstRms(gated, i);
+    assert.ok(speechPlain > -30 && speechPlain < -20, 'mic ' + (i + 1) + ' speech present: ' + speechPlain);
+    assert.ok(Math.abs(speechGated - speechPlain) <= 0.5, 'mic ' + (i + 1) + ' speech ' + speechGated + ' vs ' + speechPlain);
+  }
+  assert.equal(md5(master), masterBefore, 'the master (isolated mic tracks) is byte-identical');
+  // The take's own mix keeps the plain-sum hiss (decision: gating it is a separate yes).
+  const mix = path.join(dir, 'mix.m4a');
+  execFileSync('ffmpeg', mixArgs({ masterPath: master, masterTracks: 4, outPath: mix }));
+  const mixRoom = levelDb(mix, '0:a:0', ...ROOM_TONE).rms;
+  assert.ok(Math.abs(mixRoom - roomPlain) <= 1.5, 'take mix unchanged: ' + mixRoom + ' vs ' + roomPlain);
+});
+
+test('watch gate: quiet talkers (-37 dBFS RMS) and speech bleeding between open mics keep their level; the gate does not eat soft speech', NEEDS_FFMPEG, (t) => {
+  const dir = tmp(t);
+  for (const [label, opts] of [['quiet', { speechGain: 0.5 }], ['bleed', { bleedDb: -25 }]]) {
+    const sub = path.join(dir, label);
+    fs.mkdirSync(sub);
+    const master = makeMaster(path.join(sub, 'master.mp4'), { floorsDb: [-66, -70, -74, -78], video: true, ...opts });
+    const plain = encodeWatch(sub, master, { gate: false });
+    const gated = encodeWatch(sub, master);
+    for (let i = 0; i < 4; i += 1) assert.ok(Math.abs(burstRms(gated, i) - burstRms(plain, i)) <= 0.5, label + ' mic ' + (i + 1));
+    assert.ok(levelDb(gated, '0:a:0', ...ROOM_TONE).rms <= levelDb(plain, '0:a:0', ...ROOM_TONE).rms - 15, label + ' room tone');
+  }
+});
