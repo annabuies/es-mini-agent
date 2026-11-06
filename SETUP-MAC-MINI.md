@@ -1,5 +1,6 @@
 # Mac mini camera bench setup — runbook for Claude Code
 
+> **Scope.** This is the bench and camera SOP: Node, OBS, plugins, obs-websocket, scenes, the first test take. Onboarding a whole new property (building id, network, cloud row, hardware, the one-command install, acceptance, hand-off) is the **new-property SOP**, which wraps this one: [docs/NEW-PROPERTY.md](docs/NEW-PROPERTY.md). Installing or updating the agent itself: [docs/INSTALL.md](docs/INSTALL.md).
 
 **You are Claude Code running on Robbie's Mac mini.** Your job: get this mini recording a real camera through OBS and confirm the EVRYBDY FLEET agent can drive it. Work top to bottom. Automate every terminal step yourself. For the few OBS GUI steps you cannot click, give Robbie the exact instructions and then **verify the result** before moving on. Do not claim a step is done until you have checked it.
 
