@@ -4,6 +4,22 @@ This is the context and plan for the session that builds the one-command Mac min
 
 Anna's ask (2026-11-06, in her words): "as the build now become really good and stable we need to make sure all future mac mini just need to run a command it will install everything as needed", "update the SOP as well and have a SOP instruction how we configure/onboard a new property to set this in motion", and "let Robbie know if there's anything the Mac mini needs to work on". Robbie (Slack, 2026-11-05 ET): the app worked perfectly, he dropped one company and is partnering with the company he met that day, studios will be installed soon, and he asked for "the Mac mini update that I have to do" so he can run it tomorrow (Nov 6 ET).
 
+## Build status (2026-11-06, build session; local only)
+
+- **A1–A8 done** on this branch (`20230f2..HEAD`), plus one self-review fix (`0867c7f`).
+- Full suite: 283 tests / 282 pass / 0 fail / 1 skip before the fix. Installer files: 50/50 after it. Final count in the session return.
+- `install.sh` v2 SHA-256 `8caa2507aae966a40bd48bb38da104ca67421248daf2ffe85c8c815b1dd2242f`. Round-1 audit prompt: `docs/mini-one-command-install-audit-round1-2026-11-06.md`.
+- **Changes from this plan:**
+  - `ES_MINI_COMMIT` is a required input (the tar name and folder need `<c7>`; identity = commit + hashes).
+  - `ES_MINI_CONFIG` is read literally, not sourced (a `$` or backtick in a secret would run).
+  - A healthy relay poll is silent in `agent.log`, so the readback checks the `relay: polling` start line plus no `poll GET 401/403`. Other relay errors are a warning.
+  - A failed readback rolls back automatically.
+  - `update-state.json` is written in the new folder, so `diag` and `agent_commit` show the real commit.
+  - `AUTO_TUNNEL` (cloudflared quick tunnel) is dropped.
+  - The S6 Phase I extract path bug (the tar extracts to `es-mini-agent-<V>-<c7>/`, not `<V>-<c7>/`) is handled in v2.
+  - The plan's `api/record.js:657-661` heartbeat cite is `:965-990` at `477be4e`.
+- **Not done here (Anna):** B1–B7.
+
 ## Goal
 
 **Make every future Mac mini (and Robbie's existing one) installable or updatable with one command that carries over every setting, verifies what it installs, reads back the result and can roll back; write the SOP that takes a new property from "signed" to "first take"; draft Robbie's messages; then hand Anna an audit prompt.**
