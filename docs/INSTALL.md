@@ -125,6 +125,19 @@ Same version already running from the same folder, no `--set`, no `--obs-launche
 
 ---
 
+## Compatibility: Mini 2026.11.05-1 on the live backend (checked 2026-11-06)
+
+Live, read-only: Worker version `266905e7-ccda-4330-9337-63106428d263` (2026-11-05 12:11Z, `cf es wrangler deployments list`). The deployment has no commit message; the post-TF48 ledger maps it to es-os-app `477be4e`, which is what was read below. Honeybook Trigger `20261105.1` = `df7d1aa`.
+
+| Check | Result | Evidence |
+|---|---|---|
+| Every op the live Worker can enqueue is handled by the Mini | **Yes.** The Worker inserts into `record_commands` in two places only: `api/record.js:1967` (after the allowlist at `:1551`: `start stop cancel status pause resume preview_start preview_stop preview_cam1-3 diag look`, with `start_check` answered at `:1596-1625` and never inserted) and `lib/auto-stop.js:124` (`op: 'stop'`, `:117`). All of these are in the Mini's `VALID_OPS` (`server.js:2305` at `20230f2`). | `git show 477be4e:api/record.js`, `git grep record_commands 477be4e` |
+| Other live enqueuers | Honeybook `src/lib/room-power.ts:105` enqueues `op: "power"` for agents ≥ `MIN_POWER_AGENT_VERSION = "2026.09.28-2"` (`:24`); `2026.11.05-1` passes, and `power` is in `VALID_OPS`. | `git show df7d1aa:src/lib/room-power.ts` |
+| `mic_check` | **Never enqueued** by the live Worker: it is not in the `:1551` allowlist and not in any other insert. On 2026.11.05-1 it stays inert until app #72 and migration 0124 are live. Nothing else in the Mini depends on them. | same |
+| Heartbeat `last_state` stays under 2048 bytes | **Yes, by construction.** The Worker drops a `state` over 2048 bytes (`api/record.js:974`, stores `{}`). The Mini's `heartbeatStateJson` (`heartbeat-state.js:122-135`, cap `:8`) drops routes, then per-channel detail, then per-mic detail to fit. The 11-05 ledger measured 2024 bytes worst case. | code |
+| Heartbeat version/commit | `server.js:2646-2647` sends `v=<AGENT_VERSION>` and `c=<update-state.json commit>`; the Worker PATCHes `agent_version`/`agent_commit` (`api/record.js:979-987`). The plan cited `:657-661`; at `477be4e` it is `:965-990`. | code |
+| `update` op | Still pulls GitHub `main` (`self-update.js`). It refuses while recording or uploading (`server.js:1413-1418`). **Never queue it.** It is not in the Worker allowlist, so only a manual SQL insert could queue it. | code |
+
 ## Known limits
 
 1. **One shared `RECORD_CONTROL_KEY`** for all Minis (`api/record.js` checks one secret). Rotating it means re-running the installer on every Mini with the new key in `ES_MINI_CONFIG` (mode 600; never on the command line). Per-building keys are a separate Worker project.
