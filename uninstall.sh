@@ -76,9 +76,9 @@ cat <<EOF
 ${BOLD}es-mini-agent has been uninstalled.${RST}
 
   - The launchd LaunchAgent is gone; it will NOT auto-start at next login.
-  - Your project folder and logs were kept (nothing under
-    ~/Documents/es-mini-agent was deleted).
+  - Runtime folders, logs and backups were kept (nothing under
+    ~/es-mini-agent-runtimes, ~/es-backups or ~/Documents/es-mini-agent was deleted).
 
-To reinstall later, re-run ./install.sh with BUILDING_ID and RECORD_CONTROL_KEY.
+To reinstall later, use the pinned installer: docs/INSTALL.md ("Fresh Mini").
 
 EOF

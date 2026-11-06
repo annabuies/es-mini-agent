@@ -1,6 +1,6 @@
 # es-mini-agent: rules for any AI assistant working here
 
-This agent runs unattended on the EVRYBDY Studios Mac Mini (bench-1). **`main` is live.** The Mini self-updates from `main` (only the `*.js` files listed in `modules.txt`), and people run `install.sh` straight from `main` with `curl`.
+This agent runs unattended on the EVRYBDY Studios Mac Mini (bench-1). People install and update a Mini with the **pinned installer from a release** (`install.sh` v2, [docs/INSTALL.md](docs/INSTALL.md)): it verifies the release hashes and installs one commit. **`main` is only what the `update` op would pull** (the `*.js` files in `modules.txt`), and `update` is never queued. Treat `main` as live anyway: an `update` would install it.
 
 ## How changes land
 1. Never push to `main`, merge a PR, or force-push. `main` is protected.
