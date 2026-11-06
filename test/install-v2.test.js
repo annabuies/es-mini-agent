@@ -19,7 +19,8 @@ const path = require('node:path');
 const test = require('node:test');
 
 const projectDir = path.resolve(__dirname, '..');
-const V2 = path.join(projectDir, 'install.sh');
+// ES_MINI_TEST_INSTALLER runs the suite against another copy (fail-before checks on a parent commit).
+const V2 = process.env.ES_MINI_TEST_INSTALLER || path.join(projectDir, 'install.sh');
 const COMMIT = '20230f20fdd3345451e947e907b26455daed787b';
 const C7 = COMMIT.slice(0, 7);
 const VERSION = '2026.11.05-1';
@@ -114,7 +115,7 @@ case "$1" in
     [ -f "$S/fail-load" ] && exit 5
     wd="$(/usr/libexec/PlistBuddy -c 'Print :WorkingDirectory' "$2")"
     out="$(/usr/libexec/PlistBuddy -c 'Print :StandardOutPath' "$2")"
-    printf '%s' "$wd" > "$S/cwd"
+    printf '%s' "$wd" > "$S/cwd"; cp "$2" "$S/loaded.plist"
     n=$(( $(cat "$S/pid" 2>/dev/null || echo 500) + 1 )); echo "$n" > "$S/pid"
     if [ -w "$(dirname "$out")" ]; then
       printf '[es-mini-agent] listening on :x\\n[es-mini-agent] relay: polling https://api.example/api/record every 250ms\\n' >> "$out"
@@ -173,7 +174,10 @@ async function sandbox({ fresh = false, unreadableOld = false } = {}) {
     if (req.method === 'GET' && req.url === '/health') {
       return send({ ok: true, building_id: 'bench-1', uptime_s: 5, state: { recording: state.recording, paused: state.paused } });
     }
-    if (req.headers.authorization !== 'Bearer ' + SECRETS.RECORD_CONTROL_KEY) { res.statusCode = 401; return send({ ok: false, reason: 'unauthorized' }); }
+    // Like the real agent: the key it checks is the one in the plist launchd loaded.
+    let key = SECRETS.RECORD_CONTROL_KEY;
+    try { key = JSON.parse(execFileSync('plutil', ['-convert', 'json', '-o', '-', path.join(stateDir, 'loaded.plist')]).toString()).EnvironmentVariables.RECORD_CONTROL_KEY; } catch {}
+    if (req.headers.authorization !== 'Bearer ' + key) { res.statusCode = 401; return send({ ok: false, reason: 'unauthorized' }); }
     if (req.url === '/record/status') return send({ ok: true, recording: state.recording, uploads: state.uploads });
     if (req.url === '/record/diag') {
       let agent = null, commit = null;
@@ -210,6 +214,7 @@ async function sandbox({ fresh = false, unreadableOld = false } = {}) {
     fs.writeFileSync(path.join(oldDir, 'agent.log'), 'old log\n');
     original = plistXml({ env: fixtureEnv(port), wd: oldDir, node: process.execPath });
     fs.writeFileSync(plist, original, { mode: 0o600 });
+    fs.writeFileSync(path.join(stateDir, 'loaded.plist'), original);
     fs.writeFileSync(path.join(la, 'com.es.obs-launcher.plist'), '<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>com.es.obs-launcher</string></dict></plist>\n', { mode: 0o644 });
     // The old agent is running.
     fs.writeFileSync(path.join(stateDir, 'cwd'), oldDir);
@@ -684,6 +689,42 @@ test('v2 --obs-launcher installs the launcher from the new runtime into Applicat
     assert.ok(la.includes(`<string>${dir}/obs-launcher.sh</string>`));
     assert.doesNotMatch(la, /Documents|__LAUNCHER_DIR__/);
     assert.match(r.calls, /defaults write com\.apple\.loginwindow TALLogoutSavesState -bool false/);
+  } finally { await sb.close(); }
+});
+
+test('v2 key rotation via ES_MINI_CONFIG: guards use the running key, readback uses the new one; neither is printed', SKIP, async () => {
+  const sb = await sandbox();
+  try {
+    const NEWKEY = 'rotated-key-#2 & <z> $X';
+    const cfg = path.join(sb.root, 'rotate.env');
+    fs.writeFileSync(cfg, `RECORD_CONTROL_KEY='${NEWKEY}'\n`, { mode: 0o600 });
+    const r = await sb.run(V2, ['--yes'], sb.v2env({ ES_MINI_CONFIG: cfg }));
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /env keys changed \(names only\): RECORD_CONTROL_KEY/);
+    assert.match(r.out, /readback: diag agent 2026\.11\.05-1/);
+    assert.equal(envOf(sb.plist).RECORD_CONTROL_KEY, NEWKEY);
+    assert.ok(!r.out.includes(NEWKEY) && !r.out.includes('rotated-key'), 'new key never printed');
+    noSecrets(r.out);
+  } finally { await sb.close(); }
+});
+
+test('v2 same-version --set on a hand-installed runtime (no update-state.json) succeeds and records the commit', SKIP, async () => {
+  const sb = await sandbox();
+  try {
+    // What the manual S6 runbook leaves: the package extracted at the v2 path, plist pointing at it.
+    fs.mkdirSync(path.dirname(sb.newDir), { recursive: true });
+    const x = path.join(sb.root, 'hand'); fs.mkdirSync(x);
+    execFileSync('tar', ['-xf', pkg().tar, '-C', x]);
+    fs.renameSync(path.join(x, `es-mini-agent-${VERSION}-${C7}`), sb.newDir);
+    const hand = plistXml({ env: fixtureEnv(sb.port), wd: sb.newDir, node: process.execPath });
+    fs.writeFileSync(sb.plist, hand, { mode: 0o600 });
+    fs.writeFileSync(path.join(sb.stateDir, 'loaded.plist'), hand);
+    fs.writeFileSync(path.join(sb.stateDir, 'cwd'), sb.newDir);
+    const r = await sb.run(V2, ['--yes', '--set', 'RTSP_CAPTURE=1'], sb.v2env());
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /running folder .* still matches the package/);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(sb.newDir, 'update-state.json'), 'utf8')).commit, COMMIT);
+    assert.equal(envOf(sb.plist).RTSP_CAPTURE, '1');
   } finally { await sb.close(); }
 });
 

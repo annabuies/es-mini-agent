@@ -725,7 +725,10 @@ if [ "$LIVE" = "$NEW" ]; then
   # Same version, settings change: the folder is live; check it in place, do not replace it.
   (cd "$NEW" && shasum -a 256 -c "$WORK/$SUMS_NAME" >/dev/null) || die "the running folder $NEW no longer matches the package"
   ok "running folder $NEW still matches the package"
+  WRITE_STATE=0
+  [ "$FROM_COMMIT" = "$C" ] || WRITE_STATE=1   # e.g. installed by hand (S6 runbook): no update-state.json
 else
+  WRITE_STATE=1
   if [ -e "$NEW" ]; then
     mv "$NEW" "$NEW.set-aside-$TS"
     warn "an earlier $NEW was set aside as $NEW.set-aside-$TS (not deleted)"
@@ -736,6 +739,8 @@ else
   elif [ -n "$LIVE" ] && ! ls "$LIVE" >/dev/null 2>&1; then
     warn ".cam-golden.json not carried over (old folder not readable); take a new camera baseline in the app"
   fi
+fi
+if [ "$WRITE_STATE" = 1 ]; then
   NEW_COMMIT="$C" PREV_COMMIT="$FROM_COMMIT" NEW_VERSION="$V" OUT="$NEW/update-state.json" "$NODE_BIN" -e '
     const e=process.env;const prev=(e.PREV_COMMIT&&e.PREV_COMMIT!=="null"&&!e.PREV_COMMIT.startsWith("__"))?e.PREV_COMMIT:null;
     require("fs").writeFileSync(e.OUT,JSON.stringify({commit:e.NEW_COMMIT,previousCommit:prev,updatedAt:new Date().toISOString(),version:e.NEW_VERSION,installedBy:"install.sh"},null,2)+"\n");'
@@ -830,6 +835,10 @@ EOF
   exit 1
 }
 [ "$SWAP_OK" = 1 ] || fail_and_rollback "launchctl load failed"
+# The new agent listens on the new plist's PORT and checks its RECORD_CONTROL_KEY (a key
+# rotation or a --set PORT changes them); the busy guards above used the running agent's.
+PORT="$("$NODE_BIN" -e "$JS_ENVGET" "$WORK/new.json" PORT)"; [ -n "$PORT" ] || PORT=8787
+RCK="$("$NODE_BIN" -e "$JS_ENVGET" "$WORK/new.json" RECORD_CONTROL_KEY)"
 OTHER_DIR=""; [ "$LIVE" = "$NEW" ] || OTHER_DIR="$LIVE"
 readback "$V" "$NEW" "$C" "$OUT_OFF" "$ERR_OFF" 1 "$OTHER_DIR" || fail_and_rollback "$RB_RESULT"
 
