@@ -29,6 +29,13 @@ function freePort() {
     s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolve(p)); });
   });
 }
+// The ICE port is UDP: pick one that is free for UDP (a TCP-free port can be a busy UDP one).
+function freeUdpPort() {
+  return new Promise((resolve) => {
+    const s = require('node:dgram').createSocket('udp4');
+    s.bind(0, () => { const p = s.address().port; s.close(() => resolve(p)); });
+  });
+}
 const sha = (f) => crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex');
 
 // Fake mediamtx: reads its yml, serves /v3/info + /v3/config/paths/get/<room> on the API
@@ -106,7 +113,7 @@ async function sandbox(t) {
   const bin = path.join(root, 'bin');
   fs.mkdirSync(home, { recursive: true }); fs.mkdirSync(state);
   shims(bin, state);
-  const ports = { api: await freePort(), web: await freePort(), ice: await freePort() };
+  const ports = { api: await freePort(), web: await freePort(), ice: await freeUdpPort() };
   const good = makeTar(root, 'good', 'ok');
   const cert = makeCert(root, HOST, 30, 'room');
   const sb = {
