@@ -26,8 +26,10 @@
 # A failed readback stops the new relay and puts the previous one back.
 # Nothing here reads or prints a secret. bash 3.2 safe.
 set -euo pipefail
+# shasum is Perl: an unsupported inherited locale (e.g. LANG=C.UTF-8 over SSH) makes it panic.
+export LC_ALL=C LANG=C
 
-INSTALLER_VERSION="2026.11.08-1"
+INSTALLER_VERSION="2026.11.08-2"
 RELAY_VERSION="v1.21.3"
 TAR_NAME="mediamtx_${RELAY_VERSION}_darwin_arm64.tar.gz"
 TAR_URL="https://github.com/bluenviron/mediamtx/releases/download/${RELAY_VERSION}/${TAR_NAME}"
