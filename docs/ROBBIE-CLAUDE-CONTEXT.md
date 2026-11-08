@@ -26,7 +26,7 @@ Installing the relay changes nothing for sessions until Anna flips the switch. I
 Only after Anna says the certificate is on the Mini. Run it in **Terminal on the Mini's own screen** (not over SSH), logged in as `megadesk-command`, with nothing booked for the next 30 minutes:
 
 ```
-cd ~/code/es-mini-agent && git fetch origin && git checkout --detach 48c7a68a3b7d68d98e36a781eeac475f98a5094c && /bin/bash scripts/install-preview-relay.sh
+cd ~/code/es-mini-agent && git fetch origin && git checkout --detach 02f97a954e00c302ceb793910a3ae598bada5a05 && /bin/bash scripts/install-preview-relay.sh
 ```
 
 What it does: checks the Mac, the ports and the certificate, downloads MediaMTX v1.21.3 and verifies its fingerprint, installs it under `~/Library/Application Support/es-preview-relay`, starts it as the LaunchAgent `com.es.preview-relay`, and checks it answers. It ends with a block that starts `===== ES PREVIEW RELAY INSTALL REPORT =====`. **Copy that whole block to Anna in Slack.**
@@ -88,4 +88,4 @@ Anna can turn it off instantly at any time, and the iPad goes back to the cloud 
 | Relay (after step 2) | `~/Library/Application Support/es-preview-relay` |
 | Relay log | `~/Library/Logs/es-preview-relay.log` |
 | Backups | `~/es-backups/` |
-| Code checkout | `~/code/es-mini-agent` (after the line above, it sits on commit `48c7a68`, which is expected) |
+| Code checkout | `~/code/es-mini-agent` (after the line above, it sits on commit `02f97a9`, which is expected) |

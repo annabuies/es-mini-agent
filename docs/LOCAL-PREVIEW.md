@@ -35,7 +35,7 @@ Expect `172.16.1.35`. If `success:false` with an auth error, the cached zone tok
 DNS-01 through Cloudflare. The token stays on Anna's Mac; the Mini only gets the two files.
 
 ```
-CF_DNS_API_TOKEN="$(cat ~/.cache/cf/es_cloudflare_zone_token)" lego run --accept-tos --dns cloudflare --domains preview-bench1.evrybdystudios.com --path ~/es-preview-certs
+CF_DNS_API_TOKEN="$(cat ~/.cache/cf/es_cloudflare_zone_token)" lego run --accept-tos --dns cloudflare --dns.resolvers 1.1.1.1:53 --domains preview-bench1.evrybdystudios.com --path ~/es-preview-certs
 ```
 
 (lego 5 puts the flags after `run`. If it asks for an email, add `--email <ops address>`.)
@@ -65,13 +65,13 @@ scp -i ~/.ssh/id_ed25519_es_mini "$(find ~/es-preview-certs -name 'preview-bench
 Optional check before Robbie runs it (changes nothing):
 
 ```
-ssh -i ~/.ssh/id_ed25519_es_mini megadesk-command@100.75.212.27 'cd ~/code/es-mini-agent && git fetch -q origin && git checkout -q --detach 48c7a68a3b7d68d98e36a781eeac475f98a5094c && /bin/bash scripts/install-preview-relay.sh --dry-run'
+ssh -i ~/.ssh/id_ed25519_es_mini megadesk-command@100.75.212.27 'cd ~/code/es-mini-agent && git fetch -q origin && git checkout -q --detach 02f97a954e00c302ceb793910a3ae598bada5a05 && /bin/bash scripts/install-preview-relay.sh --dry-run'
 ```
 
 ## L2. Relay install (Robbie, in Terminal on the Mini, nothing booked for 30 minutes)
 
 ```
-cd ~/code/es-mini-agent && git fetch origin && git checkout --detach 48c7a68a3b7d68d98e36a781eeac475f98a5094c && /bin/bash scripts/install-preview-relay.sh
+cd ~/code/es-mini-agent && git fetch origin && git checkout --detach 02f97a954e00c302ceb793910a3ae598bada5a05 && /bin/bash scripts/install-preview-relay.sh
 ```
 
 It stops with `STOPPED: nothing was changed` on any failed check, and rolls back on a failed readback. Success ends with `===== ES PREVIEW RELAY INSTALL REPORT =====` and `result: SUCCESS`. Robbie pastes the whole block back.
