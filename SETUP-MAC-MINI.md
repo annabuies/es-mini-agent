@@ -1,5 +1,7 @@
 # Mac mini camera bench setup — runbook for Claude Code
 
+> **Scope.** This is the bench and camera SOP: Node, OBS, plugins, obs-websocket, scenes, the first test take. Onboarding a whole new property (building id, network, cloud row, hardware, the one-command install, acceptance, hand-off) is the **new-property SOP**, which wraps this one: [docs/NEW-PROPERTY.md](docs/NEW-PROPERTY.md). Installing or updating the agent itself: [docs/INSTALL.md](docs/INSTALL.md).
+
 **You are Claude Code running on Robbie's Mac mini.** Your job: get this mini recording a real camera through OBS and confirm the EVRYBDY FLEET agent can drive it. Work top to bottom. Automate every terminal step yourself. For the few OBS GUI steps you cannot click, give Robbie the exact instructions and then **verify the result** before moving on. Do not claim a step is done until you have checked it.
 
 > **Honesty rule (non-negotiable):** never report "ready" unless a real recording actually wrote a growing file to disk AND the agent reported at least one feed writing. If something failed, say exactly what failed and stop. Do not paper over it.
@@ -126,28 +128,20 @@ The real proof is step 7 (a file appears when recording). This is just an early 
 
 ---
 
-## Step 6 — Install / refresh the agent with OBS mode ON (you automate)
+## Step 6 — Install / refresh the agent with OBS mode ON (Robbie in Terminal)
 
-Run the one-command installer with all the env vars. This downloads the current agent (including `obs-control.js` + `storage-upload.js`), writes a launchd service, and starts it:
+Use the pinned installer: **[docs/INSTALL.md](docs/INSTALL.md)**. A fresh Mini uses its "Fresh Mini" section, with the property's values in an `ES_MINI_CONFIG` file (mode 600; at least `BUILDING_ID`, `RECORD_CONTROL_KEY`, `OBS_SOURCES`, `OBS_WS_PASSWORD`, `OBS_RECORD_DIR`). An existing Mini uses the 3-step update. Either way Anna sends the exact line with the release version and hashes.
 
-```bash
-BUILDING_ID="bench-1" \
-RECORD_CONTROL_KEY="<<RECORD_CONTROL_KEY>>" \
-OBS_SOURCES="cam1" \
-OBS_WS_URL="ws://127.0.0.1:4455" \
-OBS_WS_PASSWORD="<<OBS_WS_PASSWORD>>" \
-OBS_RECORD_DIR="$HOME/es-mini-recordings" \
-bash <(curl -fsSL https://raw.githubusercontent.com/annabuies/es-mini-agent/main/install.sh)
-```
+**Do not** use the old `bash <(curl …/main/install.sh)` one-liner: it installed whatever was on `main` and rebuilt the plist from 22 fixed keys.
 
-The installer ends by hitting `http://localhost:8787/health` and printing SUCCESS or FAILURE. If it prints FAILURE, read the error log it points you to (`~/Documents/es-mini-agent/agent.error.log`) and fix the cause (usually a missing env var or OBS not running), then re-run the same command. Do not proceed on a FAILURE.
+The installer ends with `SUCCESS` and a report block, or `STOPPED` (nothing changed) or `FAILURE, ROLLED BACK`. On anything but SUCCESS, read the line it prints, fix the cause (usually OBS not running or a missing value in the config file), and run the same line again. Do not proceed without SUCCESS.
 
 ### Optional: launch OBS safely after login
 
 To have launchd open OBS on a cold login without the “did not properly shut down” Safe Mode dialog, add `--obs-launcher` to the installer command (after the process substitution):
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/annabuies/es-mini-agent/main/install.sh) --obs-launcher
+# add --obs-launcher to the installer line Anna sends (docs/INSTALL.md)
 ```
 
 This installs `com.es.obs-launcher` with `RunAtLoad=true` (the script runs from `~/Library/Application Support/es-mini-agent/`, because macOS blocks launchd-started bash from reading `~/Documents`).
@@ -165,7 +159,7 @@ Every decision is logged to `~/Library/Application Support/es-mini-agent/obs-lau
 Confirm OBS mode actually engaged (not demo mode) — the log should show it connecting to OBS, and health should be ok:
 ```bash
 curl -s http://localhost:8787/health
-tail -n 30 ~/Documents/es-mini-agent/agent.log
+tail -n 30 "$(/usr/libexec/PlistBuddy -c 'Print :WorkingDirectory' ~/Library/LaunchAgents/com.es.mini-agent.plist)/agent.log"
 ```
 
 ---
@@ -240,6 +234,6 @@ Then tell Robbie to **leave OBS open and the mini awake** — Anna will fire a r
 ---
 
 ### If you get stuck
-- Agent won't boot → `tail -n 50 ~/Documents/es-mini-agent/agent.error.log`. A `Cannot find module './obs-control'` error means the download didn't pull that file — re-run step 6.
+- Agent won't boot → `tail -n 50 "$(/usr/libexec/PlistBuddy -c 'Print :WorkingDirectory' ~/Library/LaunchAgents/com.es.mini-agent.plist)/agent.error.log"`. The v2 installer already rolls back by itself when the new runtime does not read back; send Anna the window.
 - `feeds_writing: null` → OBS mode is off (env var or OBS-not-running or wrong ws password). See step 7.
-- Rollback the agent to the last known-good demo version: re-run the installer but first `cd ~/Documents/es-mini-agent && git fetch && git checkout pre-obs-agent-2026-07-16` (only if the repo was cloned; the curl installer always pulls latest `main`).
+- Roll the agent back to the version before the last install: paste the `rollback:` line from that install's report (`/bin/bash ~/es-backups/mini-<time>/install.sh --rollback ~/es-backups/mini-<time>`). Never run git on the Mini.

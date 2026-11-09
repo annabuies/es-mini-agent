@@ -14,7 +14,7 @@ test('installer and launcher shell scripts pass bash syntax checks', () => {
   }
 });
 
-test('installer removes the stale agent plist and supports the opt-in OBS launcher', () => {
+test('installer never ships an agent plist template and supports the opt-in OBS launcher', () => {
   const install = fs.readFileSync(path.join(projectDir, 'install.sh'), 'utf8');
   const uninstall = fs.readFileSync(path.join(projectDir, 'uninstall.sh'), 'utf8');
   const manifest = fs.readFileSync(path.join(projectDir, 'modules.txt'), 'utf8');
@@ -22,8 +22,8 @@ test('installer removes the stale agent plist and supports the opt-in OBS launch
   const obsLauncher = fs.readFileSync(path.join(projectDir, 'obs-launcher.sh'), 'utf8');
 
   assert.doesNotMatch(manifest, /^com\.es\.mini-agent\.plist$/m);
-  assert.match(install, /rm -f "\$PROJECT_DIR\/com\.es\.mini-agent\.plist"/);
-  assert.doesNotMatch(install, /download "com\.es\.mini-agent\.plist"/);
+  // v2 never downloads single files (no download() helper); the agent plist is built from the live one.
+  assert.doesNotMatch(install, /download "com\.es\.mini-agent\.plist"|^download\(\)/m);
 
   assert.match(install, /--obs-launcher/);
   assert.match(install, /launchctl load "\$OBS_LAUNCHER_PLIST"/);
@@ -39,7 +39,8 @@ test('installer removes the stale agent plist and supports the opt-in OBS launch
 test('--obs-launcher turns macOS session restore off so only the launcher starts OBS; uninstall restores it', () => {
   const install = fs.readFileSync(path.join(projectDir, 'install.sh'), 'utf8');
   const uninstall = fs.readFileSync(path.join(projectDir, 'uninstall.sh'), 'utf8');
-  const block = install.slice(install.indexOf('# ---------- optional OBS login launcher ----------'), install.indexOf('# ---------- verify ----------'));
+  const block = install.slice(install.indexOf('# ---------- optional OBS login launcher ----------'), install.indexOf('# ---------- end OBS login launcher ----------'));
+  assert.ok(block.length > 100);
   assert.match(block, /defaults write com\.apple\.loginwindow TALLogoutSavesState -bool false/);
   assert.match(block, /defaults write com\.apple\.loginwindow LoginwindowLaunchesRelaunchApps -bool false/);
   assert.match(block, /defaults -currentHost delete com\.apple\.loginwindow TALAppsToRelaunchAtLogin/);
@@ -285,10 +286,10 @@ test('OBS writes no new log, or stops at another prompt: alert, and an old log i
   assert.match(other.out, /ALERT: OBS has not finished starting after 90 s and shows no Safe Mode dialog/);
 });
 
-test('agent release version is 2026.11.02-1 (server.js and package.json; Build 46)', () => {
+test('agent release version is 2026.11.05-1 (server.js and package.json; post-TF48)', () => {
   const server = fs.readFileSync(path.join(projectDir, 'server.js'), 'utf8');
-  assert.match(server, /const AGENT_VERSION = '2026\.11\.02-1';/);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf8')).version, '2026.11.02-1');
+  assert.match(server, /const AGENT_VERSION = '2026\.11\.05-1';/);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf8')).version, '2026.11.05-1');
 });
 
 test('modules.txt ships every local module server.js needs, followed through every require', () => {
@@ -311,13 +312,16 @@ test('modules.txt ships the Build 42 modules server.js requires', () => {
   for (const name of ['audio-check.js', 'audio-health.js', 'watch-rendition.js']) assert.match(manifest, new RegExp('^' + name.replace('.', '\\.') + '$', 'm'));
 });
 
-test('installer persists the power strip env into the plist and modules.txt ships power.js', () => {
+test('installer v2 has no fixed env-key list (power strip keys are carried like every other key) and modules.txt ships power.js', () => {
   const install = fs.readFileSync(path.join(projectDir, 'install.sh'), 'utf8');
   const manifest = fs.readFileSync(path.join(projectDir, 'modules.txt'), 'utf8');
+  // v1 rebuilt the plist from a heredoc of 22 keys; v2 keeps the live EnvironmentVariables dict.
   for (const key of ['POWER_STRIP_URL', 'POWER_STRIP_USER', 'POWER_STRIP_PASS', 'POWER_OUTLETS_SWITCHABLE']) {
-    assert.match(install, new RegExp(`<key>${key}</key>\\s*<string>\\$\\{${key}_X\\}</string>`));
+    assert.doesNotMatch(install, new RegExp(`<key>${key}</key>`));
   }
+  assert.match(install, /plutil -convert json -o "\$WORK\/old\.json" "\$PL"/);
   assert.match(manifest, /^power\.js$/m);
+  // The carry-over itself (every key and value, unknown keys included) is proven in install-v2.test.js (a).
 });
 
 test('modules.txt lists only .js runtime modules (deployed self-update rejects anything else)', () => {
@@ -327,31 +331,6 @@ test('modules.txt lists only .js runtime modules (deployed self-update rejects a
   assert.deepEqual(manifest.filter((m) => !/^[A-Za-z0-9._-]+\.js$/.test(m)), []);
 });
 
-test('installer reuses values from the live plist for anything left unset (bash 3.2 safe)', { skip: process.platform !== 'darwin' && 'needs /usr/libexec/PlistBuddy' }, () => {
-  const { execFileSync, spawnSync } = require('node:child_process');
-  const os = require('node:os');
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-reuse-'));
-  try {
-    fs.mkdirSync(path.join(home, 'Library', 'LaunchAgents'), { recursive: true });
-    fs.writeFileSync(path.join(home, 'Library', 'LaunchAgents', 'com.es.mini-agent.plist'), `<?xml version="1.0" encoding="UTF-8"?>
-<plist version="1.0"><dict><key>EnvironmentVariables</key><dict>
-<key>BUILDING_ID</key><string>bench-1</string>
-<key>RECORD_CONTROL_KEY</key><string>k3y &amp; "q"</string>
-<key>OBS_SOURCES</key><string>cam1,cam2,cam3</string>
-<key>POWER_STRIP_URL</key><string>http://old</string>
-</dict></dict></plist>`);
-    const install = fs.readFileSync(path.join(projectDir, 'install.sh'), 'utf8');
-    const start = install.indexOf('# ---------- reuse an existing install ----------');
-    const end = install.indexOf('# ---------- read inputs ----------');
-    assert.ok(start > 0 && end > start);
-    const script = `set -euo pipefail\n${install.slice(start, end)}\nprintf '%s|%s|%s|%s' "$BUILDING_ID" "$RECORD_CONTROL_KEY" "$OBS_SOURCES" "$POWER_STRIP_URL"`;
-    const out = execFileSync('/bin/bash', ['-c', script], { env: { PATH: process.env.PATH, HOME: home, POWER_STRIP_URL: 'http://172.16.1.40' } }).toString();
-    assert.equal(out, 'bench-1|k3y & "q"|cam1,cam2,cam3|http://172.16.1.40');
-  } finally {
-    fs.rmSync(home, { recursive: true, force: true });
-  }
-});
-
 test('OBS launcher runs from Application Support, never ~/Documents (launchd bash gets EPERM there)', () => {
   const os = require('node:os');
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-obs-'));
@@ -359,25 +338,29 @@ test('OBS launcher runs from Application Support, never ~/Documents (launchd bas
   try {
     fs.mkdirSync(path.join(home, 'Library', 'LaunchAgents'), { recursive: true });
     fs.writeFileSync(path.join(bin, 'launchctl'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    // Never touch the real user's loginwindow defaults from a test.
+    fs.writeFileSync(path.join(bin, 'defaults'), '#!/bin/sh\necho "defaults $*" >> "$HOME/defaults.log"\nexit 0\n', { mode: 0o755 });
     const install = fs.readFileSync(path.join(projectDir, 'install.sh'), 'utf8');
-    const helpers = install.slice(install.indexOf('xml_escape() {'), install.indexOf('LAUNCH_AGENTS_DIR='));
     const start = install.indexOf('# ---------- optional OBS login launcher ----------');
-    const end = install.indexOf('# ---------- verify ----------');
+    const end = install.indexOf('# ---------- end OBS login launcher ----------');
     assert.ok(start > 0 && end > start);
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-work-'));
     const script = `set -euo pipefail
 ok() { :; }; warn() { :; }; err() { echo "$*" >&2; }
-${helpers}
-INSTALL_OBS_LAUNCHER=1
-PROJECT_DIR=${JSON.stringify(projectDir)}
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
-${install.slice(start, end)}`;
+APP_SUPPORT="$HOME/Library/Application Support/es-mini-agent"
+WORK=${JSON.stringify(work)}
+${install.slice(start, end)}
+install_obs_launcher ${JSON.stringify(projectDir)}`;
     execFileSync('/bin/bash', ['-c', script], { env: { PATH: `${bin}:${process.env.PATH}`, HOME: home } });
+    fs.rmSync(work, { recursive: true, force: true });
     const plist = fs.readFileSync(path.join(home, 'Library', 'LaunchAgents', 'com.es.obs-launcher.plist'), 'utf8');
     const dir = path.join(home, 'Library', 'Application Support', 'es-mini-agent');
     assert.ok(plist.includes(`<string>${dir}/obs-launcher.sh</string>`));
     assert.ok(plist.includes(`<string>${dir}/obs-launcher.error.log</string>`));
     assert.doesNotMatch(plist, /Documents|__LAUNCHER_DIR__/);
     assert.ok(fs.statSync(path.join(dir, 'obs-launcher.sh')).mode & 0o100);
+    assert.match(fs.readFileSync(path.join(home, 'defaults.log'), 'utf8'), /TALLogoutSavesState -bool false/);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
     fs.rmSync(bin, { recursive: true, force: true });
