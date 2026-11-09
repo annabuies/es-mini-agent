@@ -288,10 +288,12 @@ async function runPower(config, payload, context, options) {
     return out;
   }
 
+  // Never off during a take (recording or paused). Uploads do not need the lights: before
+  // Build 46 an off also waited for the upload queue to drain, which held the fixtures on
+  // for up to 40 min after a long take (Robbie 10-31; Anna 11-02).
   if (action === 'off') {
     const ctx = context || {};
     if (ctx.recording) return { ok: false, action, reason: 'busy_recording' };
-    if (ctx.uploading) return { ok: false, action, reason: 'busy_uploading' };
   }
 
   if (!current.baseUrl) return { ok: false, action, reason: 'power_unconfigured' };

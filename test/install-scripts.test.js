@@ -285,9 +285,30 @@ test('OBS writes no new log, or stops at another prompt: alert, and an old log i
   assert.match(other.out, /ALERT: OBS has not finished starting after 90 s and shows no Safe Mode dialog/);
 });
 
-test('agent release version is 2026.10.03-1', () => {
+test('agent release version is 2026.11.02-1 (server.js and package.json; Build 46)', () => {
   const server = fs.readFileSync(path.join(projectDir, 'server.js'), 'utf8');
-  assert.match(server, /const AGENT_VERSION = '2026\.10\.03-1';/);
+  assert.match(server, /const AGENT_VERSION = '2026\.11\.02-1';/);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf8')).version, '2026.11.02-1');
+});
+
+test('modules.txt ships every local module server.js needs, followed through every require', () => {
+  const manifest = new Set(fs.readFileSync(path.join(projectDir, 'modules.txt'), 'utf8')
+    .split('\n').map((l) => l.replace(/#.*/, '').trim()).filter(Boolean));
+  const seen = new Set();
+  const visit = (name) => {
+    if (seen.has(name)) return;
+    seen.add(name);
+    const src = fs.readFileSync(path.join(projectDir, name), 'utf8');
+    for (const m of src.matchAll(/require\(\s*['"]\.\/([A-Za-z0-9._-]+?)(?:\.js)?['"]\s*\)/g)) visit(m[1] + '.js');
+  };
+  visit('server.js');
+  assert.ok(seen.has('webhook-outbox.js') && seen.has('heartbeat-state.js'), 'Build 45 modules are reached');
+  assert.deepEqual([...seen].filter((name) => !manifest.has(name)).sort(), []);
+});
+
+test('modules.txt ships the Build 42 modules server.js requires', () => {
+  const manifest = fs.readFileSync(path.join(projectDir, 'modules.txt'), 'utf8');
+  for (const name of ['audio-check.js', 'audio-health.js', 'watch-rendition.js']) assert.match(manifest, new RegExp('^' + name.replace('.', '\\.') + '$', 'm'));
 });
 
 test('installer persists the power strip env into the plist and modules.txt ships power.js', () => {

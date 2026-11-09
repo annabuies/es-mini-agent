@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
+const fsp = require('fs/promises');
 const http = require('http');
 const os = require('os');
 const path = require('path');
@@ -65,6 +66,45 @@ test('a 0-byte master file is dropped without a webhook', { timeout: 8000 }, asy
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.deepEqual(stateFiles(), []);
   assert.equal(hook.posts.length, 0);
+});
+
+test('an empty master waits for its queued state write before removing that state', { timeout: 8000 }, async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'es-mini-empty-write-race-'));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const stateDir = path.join(tempDir, 'state');
+  const filePath = path.join(tempDir, 'master-take.mp4');
+  fs.writeFileSync(filePath, '');
+
+  const rename = fsp.rename;
+  const unlink = fsp.unlink;
+  let releaseWrite;
+  let writeStarted;
+  let gateOpen = false;
+  let removedBeforeWrite = false;
+  const writeGate = new Promise((resolve) => { releaseWrite = resolve; });
+  const atRename = new Promise((resolve) => { writeStarted = resolve; });
+  fsp.rename = async (from, to) => {
+    if (String(to).endsWith('.state.json')) {
+      writeStarted();
+      await writeGate;
+    }
+    return rename(from, to);
+  };
+  fsp.unlink = async (file) => {
+    if (String(file).endsWith('.state.json') && !gateOpen) removedBeforeWrite = true;
+    return unlink(file);
+  };
+  t.after(() => { gateOpen = true; releaseWrite(); fsp.rename = rename; fsp.unlink = unlink; });
+
+  const queue = createUploadQueue({ stateDir, buildingId: 'bench-1', stabilityPollMs: 5, uploader: async () => { throw new Error('must not upload'); } });
+  queue.enqueue({ filePath, source: 'master' });
+  await atRename;
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(removedBeforeWrite, false, 'the worker must not delete state before its queued write finishes');
+  gateOpen = true;
+  releaseWrite();
+  await waitFor(() => queue.status().active === null && queue.status().queued === 0
+    && fs.existsSync(stateDir) && fs.readdirSync(stateDir).length === 0, 6000);
 });
 
 test('sweep drops upload states left behind by the old "requires sizeBytes" failure, keeps other errors', async (t) => {

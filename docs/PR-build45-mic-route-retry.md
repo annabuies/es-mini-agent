@@ -1,0 +1,31 @@
+## Build 45 part 1 (Mini, agent 2026.10.27-2): mic route check, look settle time, durable upload-notice retry, faster Watch copies
+
+Plan: `ab-wiki/Clients/ES/docs/build45-phone-looks-readiness-mic-build-plan-2026-10-26.md` (A5, A6, A8). Based on `947a060` (watch-copy retry), which is based on #24 `9ba2f22`. The live Mini reports agent version `2026.10.20-1`, but its `agent_commit` comes from a persistent update-state file and does not prove the installed source SHA. Merge #24 first.
+
+- **A6 mic route** (`audio-check.js`):
+  - Every live check since 10-20 said `mic_not_recorded` on all four mics, while the master held four healthy tracks. The check assumed Mic N is on track N.
+  - It now follows each mic's enabled tracks (`GetInputAudioTracks` "1".."6") into `RecTracks` (`parameterValue`, then `defaultParameterValue`).
+  - An unknown side is `null`, never `mic_not_recorded`. A mic on no recorded track still flags.
+  - Each mic reports `route: { tracks, rec_tracks }`.
+  - The heartbeat builder moved to `heartbeat-state.js`. Its worst case is 1687 bytes, under the Worker's 2048-byte cap.
+- **A5 look settle** (`ptz.js`):
+  - A successful look returns `settle_ms` (`LOOK_SETTLE_MS`, default 4000, clamped 0–15000), `settled_at` and `elapsed_ms`.
+  - It does **not** wait, because the agent runs one command at a time and the Worker gives a look 6.5 s.
+- **A8 upload-notice outbox** (`webhook-outbox.js`, `storage-upload.js`, `upload-queue.js`):
+  - A failed `upload_confirmed`, failed-camera or watch-failed notice goes to `<UPLOAD_STATE_DIR>/webhook-outbox.json`. It is retried at 1, 5, 15 and 60 min, then hourly, for 48 h. It survives restarts.
+  - The exact body is re-sent, so the shim's idempotency key matches.
+  - The heartbeat carries `webhook_pending: { count, oldest_age_s }`.
+  - The webhook URL (`?key=`) is never written to disk or logged. The old code logged response bodies that could echo it; that is fixed.
+  - Given-up notices now schedule their own 7-day expiry, so `webhook_pending` clears without another upload. A synchronous no-op flush also releases its in-flight guard, allowing later retries and pruning.
+- **Upload state ordering** (`upload-queue.js`): the worker waits for the queued state write before processing a file. A 0-byte master could previously finish and delete its state while that write was still in flight, leaving a stale state file after the take.
+- **Exact-take Stop recovery** (`server.js`): idle status retains the stopped take's `session_ref` with its save and file-health result. The app relay only accepts this as proof of Saved when the phone requests that same take, and it strips local file paths. This does not change the installed mic-only patch.
+- **Watch latency (10-27)** (`watch-rendition.js`, `upload-queue.js`): field takes on 10-26 had Watch copies 8–35 min after Stop. Cause: each camera's 1080p copy is a software libx264 encode at `nice 15`, one camera at a time, and a new take kills the running encode, which restarts from zero.
+  - Hardware path: VideoToolbox decode, `scale_vt` and `h264_videotoolbox`, same 4 Mbps, forced 2 s keyframes (`-g 600` so they are the only ones), faststart, same mic mix and delay. Used only for a camera file with exactly one video stream, H.264/HEVC and unrotated (a separate probe that counts every video stream; `scale_vt` would drop a rotation the software path applies). A failed hardware encode is redone in software at once; two in a row turn hardware off until restart, and the `status` reply's `uploads.watch_hw` then reads `false`. `WATCH_HW=off` restores the Build 42 args exactly.
+  - Bench, 60 s 4K, Apple M2, both at `nice 15`: idle 25.9 s software vs 14.0 s hardware (CPU 113 s vs ~3 s); with all cores busy 32.0 s vs 12.8 s. A/V sync within one frame at all four synthetic offsets on the hardware path. SSIM vs a lanczos 1080p reference on noisy synthetic video: 0.969 hardware vs 0.976 software.
+  - The duplicate `proxies/` upload now waits behind pending `stream/` Watch copies; a restart resumes it from `*.legacy.json` in the state dir, which also carries its failed-attempt count so a restart keeps the three-try limit. The upload is at-least-once; it sends no webhook (`url` is undefined), so a repeat only rewrites the same `proxies/` object.
+  - Logs: `watch encode start … wait_ms`, `watch copy confirmed … encoder=hw|sw encode_ms upload_ms ready_ms`, preemption `lost_encode_ms`.
+- **Version** `2026.10.27-2` (was `2026.10.26-2`; `2026.10.27-1` was the round-2 audit build). `modules.txt` gains `heartbeat-state.js` and `webhook-outbox.js`, and a new test follows every `require` from `server.js`.
+
+Install **after** the honeybook shim (idempotency key) is live. Never via the `update` op until this and #24 are on `main`.
+
+**Verification (27 Oct, final local candidate):** the full serial suite passed 201 of 202 tests, with 1 skipped because the historical Take 1 media is not on this machine and 0 failures (302.6 s under `caffeinate`). The focused Watch suite passed 20/20. The cached-camera heartbeat timing fixture passed 3 isolated repeats and passed in the full suite. `node --check` passed for the changed runtime modules. Hardware speed, picture quality and sync on the actual Mini remain a field gate before the app release. The branch remains local; no Mini install was performed.

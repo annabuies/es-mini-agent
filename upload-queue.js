@@ -6,6 +6,8 @@ const path = require('path');
 const { spawn } = require('child_process');
 
 const { runMultipartUpload, signS3Request } = require('./storage-upload');
+const { mixArgs, planWatch, probeMedia, watchArgs } = require('./watch-rendition');
+const { createWebhookOutbox } = require('./webhook-outbox');
 
 const STABILITY_POLL_MS = 2000;
 const STABILITY_WARN_MS = 60000;
@@ -19,6 +21,11 @@ const EMPTY_CAMERA_FILE_BYTES = 64 * 1024;
 // streams failed to start or dropped mid-take (es-mini-agent #10).
 const PROXY_POLL_MS = 2000;
 const PROXY_HOLD_MS = 30000;
+// A watch copy that fails is tried again (field fix 2026-10-23: one failure used to
+// end it for good, silently). After the last try the cloud is told, so the app says
+// "could not be made" instead of promising it.
+const WATCH_COPY_ATTEMPTS = 3;
+const WATCH_RETRY_MS = 60000;
 const NICE_BIN = '/usr/bin/nice';
 
 function isCameraRecording(job) {
@@ -78,7 +85,15 @@ async function readResponseTextSafe(res) {
 
 // Capture/health fields the stop path attaches to a take's files. They ride on
 // the upload_confirmed webhook so the cloud can mark the booking thread.
-const META_KEYS = ['capture_mode', 'fallback', 'fallback_reason', 'health', 'health_reason', 'duration_s', 'master_duration_s', 'short_by_s', 'reconnects', 'lost_s', 'resume_wait_s', 'take_health', 'fallback_sources', 'failed_sources'];
+// Since 2026.10.20-1 (Build 42): rendition (original|watch|mic|mix|proxy),
+// recorded_at (the take's OBS start), duration_s on every file, offset_s and
+// audio (mix|none) on watch copies, original_key, and the take's audio verdict.
+const META_KEYS = ['capture_mode', 'fallback', 'fallback_reason', 'health', 'health_reason', 'duration_s', 'master_duration_s', 'short_by_s', 'reconnects', 'lost_s', 'resume_wait_s', 'take_health', 'fallback_sources', 'failed_sources',
+  'rendition', 'recorded_at', 'offset_s', 'audio', 'original_key', 'audio_level', 'audio_codes'];
+// Small structured blocks (the stop result's audio_health / timing), passed as JSON.
+const OBJECT_META_KEYS = ['audio_health', 'timing'];
+const MAX_OBJECT_META_BYTES = 8 * 1024;
+const RENDITIONS = ['original', 'watch', 'mic', 'mix', 'proxy'];
 
 function cleanMeta(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -89,8 +104,26 @@ function cleanMeta(value) {
     if (typeof v === 'string' || typeof v === 'boolean' || Number.isFinite(v)) out[key] = v;
     else if (Array.isArray(v)) out[key] = v.filter((x) => typeof x === 'string');
   }
+  if (out.rendition !== undefined && !RENDITIONS.includes(out.rendition)) delete out.rendition;
+  for (const key of OBJECT_META_KEYS) {
+    const v = value[key];
+    if (!v || typeof v !== 'object' || Array.isArray(v)) continue;
+    try {
+      const json = JSON.stringify(v);
+      if (Buffer.byteLength(json) <= MAX_OBJECT_META_BYTES) out[key] = JSON.parse(json);
+    } catch (_) { /* not JSON-safe: dropped */ }
+  }
   return Object.keys(out).length ? out : null;
 }
+
+/** The webhook's kind: "audio" for mic/mix files, "video" for camera, master and watch files. */
+function webhookKind(kind) {
+  return kind === AUDIO_KIND ? 'audio' : 'video';
+}
+
+// Object keys the agent may write besides recordings/<building>/...: the watch copy
+// and the take's mix (Build 42 contract).
+const KEY_RE = /^(?:recordings|stream|audio|proxies)\/[A-Za-z0-9._ -]+(?:\/[A-Za-z0-9._ -]+)+$/;
 
 function resolveFfprobeBin() {
   const configured = String(process.env.FFPROBE_BIN || '').trim();
@@ -127,6 +160,17 @@ function createUploadQueue(opts) {
   const buildingId = String(options.buildingId || '').trim() || 'unknown';
   const uploader = typeof options.uploader === 'function' ? options.uploader : runMultipartUpload;
   const audioSplit = !!options.audioSplit;
+  // The take's four mics mixed into one stereo .m4a (audio/<building>/<base>-mix.m4a).
+  // Defaults on with the split; AUDIO_MIX=0 rolls back only the mix.
+  const audioMix = options.audioMix === undefined ? audioSplit : !!options.audioMix;
+  // The watch copy is also uploaded under the old proxies/ key (no webhook), so
+  // the Slack footage link, ClickUp sync and retention that read proxies/ keep
+  // working until they move to stream/. PROXY_COPY=0 drops the second upload.
+  const proxyCopy = options.proxyCopy !== false;
+  // Hardware Watch encode (Build 45), on unless WATCH_HW=off. A failed hardware
+  // encode is redone in software at once; two failures in a row turn it off.
+  let watchHardware = options.watchHardware !== undefined ? options.watchHardware !== false : process.env.WATCH_HW !== 'off';
+  let hwWatchFailures = 0;
   // Delete a camera/master original from the Mini once S3 holds a verified copy
   // (the uploader checks size with HeadObject) and the proxy / audio split that
   // read it are done. ~43 GB per recorded hour vs ~100 GB free (Robbie, Sep 29).
@@ -136,8 +180,15 @@ function createUploadQueue(opts) {
     : STABILITY_POLL_MS;
 
   const proxyPollMs = Number.isFinite(options.proxyPollMs) && options.proxyPollMs >= 0 ? options.proxyPollMs : PROXY_POLL_MS;
+  const watchRetryMs = Number.isFinite(options.watchRetryMs) && options.watchRetryMs >= 0 ? options.watchRetryMs : WATCH_RETRY_MS;
+  // Every upload_confirmed (uploads, failed cameras, failed watch copies) goes
+  // through one durable outbox in the state dir: a failed POST is retried
+  // (webhook-outbox.js). Retries use the current webhook URL.
+  const outbox = options.webhookOutbox || createWebhookOutbox(Object.assign({}, options.outboxOptions || {}, { stateDir, webhookUrl: () => (typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl) }));
 
   const queue = [];
+  // Watch copies have priority over the duplicate legacy proxies/ upload. Both
+  // are low-priority work and stop starting new jobs during a take.
   const pendingProxyJobs = [];
   let proxyWorkerRunning = false;
   let activeProxy = null; // { proc, closed } while a proxy encode runs
@@ -146,11 +197,29 @@ function createUploadQueue(opts) {
   const completedFilePaths = new Set();
   let activeJob = null;
   let activeSnapshot = null;
+  // A local original is deleted (deleteAfterUpload) once its upload is verified AND
+  // nothing still needs it: a camera file waits for its own watch copy, the master
+  // for every camera's watch copy of that take (they read its mic tracks).
+  const holds = new Map(); // filePath -> Set of tokens
+  const removable = new Map(); // filePath -> key, upload verified, waiting for holds
   let lastConfirmed = null;
   let workerRunning = false;
 
   function stateFilePathForKey(key) {
     return path.join(stateDir, toSafeFileName(key) + '.state.json');
+  }
+
+  // A legacy proxies/ upload waits behind other cameras' Watch copies, so a restart
+  // in that wait must not orphan its .watch.mp4 or lose the copy: sweep() reloads it.
+  function legacyFilePathForKey(key) {
+    return path.join(stateDir, toSafeFileName(key) + '.legacy.json');
+  }
+  // The marker carries the failed-attempt count, so a restart keeps the retry limit.
+  function writeLegacyMarker(job) {
+    return writeJsonFileAtomic(legacyFilePathForKey(job.key), {
+      version: 1, filePath: job.filePath, key: job.key, source: job.source,
+      sessionRef: job.sessionRef || null, attempts: job.watchAttempts || 0,
+    });
   }
 
   function buildBaseState(job, status) {
@@ -163,6 +232,8 @@ function createUploadQueue(opts) {
       sessionRef: job.sessionRef,
       removeAfterConfirm: job.removeAfterConfirm,
       meta: job.meta,
+      watch: job.watch || null,
+      keyOverride: job.keyOverride || null,
       sizeBytes: null,
       status,
       enqueuedAt: job.enqueuedAt,
@@ -261,11 +332,14 @@ function createUploadQueue(opts) {
   }
 
   function runFfmpeg(args) {
+    return runFfmpegWith(resolveFfmpegBin().bin, args);
+  }
+
+  function runFfmpegWith(bin, args) {
     return new Promise((resolve, reject) => {
       let proc;
       try {
-        const ffmpegBin = resolveFfmpegBin().bin;
-        proc = spawn(ffmpegBin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+        proc = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
       } catch (e) {
         reject(e);
         return;
@@ -368,11 +442,23 @@ function createUploadQueue(opts) {
     });
   }
 
+  /** Low-priority one-shot ffmpeg (the mix encode). */
+  function runNiceFfmpeg(args) {
+    const bin = resolveFfmpegBin().bin;
+    return fs.existsSync(NICE_BIN) ? runFfmpegWith(NICE_BIN, ['-n', '15', bin].concat(args)) : runFfmpegWith(bin, args);
+  }
+
   async function splitMasterAudio(job) {
     if (!audioSplit) {
       console.log('[upload-queue] audio split disabled key=' + job.key);
       return;
     }
+    const meta = job.meta || {};
+    const health = meta.audio_health && Array.isArray(meta.audio_health.tracks) ? meta.audio_health : null;
+    // Every mic and mix file carries the take's start and length (rendition fields).
+    const takeFields = {};
+    if (meta.recorded_at) takeFields.recorded_at = meta.recorded_at;
+    if (Number.isFinite(meta.duration_s)) takeFields.duration_s = meta.duration_s;
     try {
       const output = await runFfprobe(['-v', 'error', '-select_streams', 'a', '-show_streams', '-of', 'json', job.filePath]);
       const parsed = JSON.parse(output);
@@ -385,14 +471,36 @@ function createUploadQueue(opts) {
         const filePath = path.join(path.dirname(job.filePath), base + '-' + mic + '.m4a');
         // Stream-copy invariant: ffmpeg -c copy; mic tracks are never re-encoded.
         await runFfmpeg(['-y', '-i', job.filePath, '-map', '0:a:' + index, '-c', 'copy', filePath]);
-        const out = enqueue({ filePath, source: mic, kind: AUDIO_KIND, sessionRef: job.sessionRef, removeAfterConfirm: true });
+        const micMeta = Object.assign({ rendition: 'mic' }, takeFields);
+        const track = health && health.tracks.find((t) => t && t.index === index);
+        if (track) Object.assign(micMeta, { audio_health: track, audio_level: track.level, audio_codes: track.codes });
+        const out = enqueue({ filePath, source: mic, kind: AUDIO_KIND, sessionRef: job.sessionRef, removeAfterConfirm: true, meta: micMeta });
         if (!out.queued) {
           await removeFileIfExists(filePath);
           console.warn('[upload-queue] audio enqueue skipped source=' + mic + ' key=' + job.key + ' reason=' + out.reason);
         }
       }
+      if (audioMix && splitCount > 0) await makeMix(job, base, splitCount, takeFields, health);
     } catch (e) {
       console.warn('[upload-queue] audio split failed key=' + job.key + ' error=' + truncateError(e && (e.message || e.stack || e)));
+    }
+  }
+
+  /** The take's four mics as one stereo file on the master's timeline: audio/<building>/<base>-mix.m4a. */
+  async function makeMix(job, base, tracks, takeFields, health) {
+    const filePath = path.join(path.dirname(job.filePath), base + '-mix.m4a');
+    try {
+      await runNiceFfmpeg(mixArgs({ masterPath: job.filePath, masterTracks: tracks, outPath: filePath }));
+      const mixMeta = Object.assign({ rendition: 'mix' }, takeFields);
+      if (health) Object.assign(mixMeta, { audio_level: health.level, audio_codes: health.codes });
+      const out = enqueue({ filePath, source: 'mix', kind: AUDIO_KIND, sessionRef: job.sessionRef, removeAfterConfirm: true, key: 'audio/' + buildingId + '/' + base + '-mix.m4a', meta: mixMeta });
+      if (!out.queued) {
+        await removeFileIfExists(filePath);
+        console.warn('[upload-queue] mix enqueue skipped key=' + job.key + ' reason=' + out.reason);
+      }
+    } catch (e) {
+      await removeFileIfExists(filePath).catch(() => {});
+      console.warn('[upload-queue] mix failed key=' + job.key + ' error=' + truncateError(e && (e.message || e.stack || e)));
     }
   }
 
@@ -404,25 +512,18 @@ function createUploadQueue(opts) {
   async function postFailedCamera(key, source, sessionRef, meta) {
     const url = typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl;
     if (!url) return;
-    try {
-      const res = await fetch(String(url), {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(Object.assign({}, meta || {}, {
-          event: 'upload_confirmed',
-          key,
-          sizeBytes: 0,
-          confirmedAt: new Date().toISOString(),
-          kind: 'recording',
-          building_id: buildingId,
-          source,
-          session_ref: sessionRef,
-        })),
-      });
-      if (!res.ok) console.warn('[upload-queue] failed-camera webhook failed status=' + res.status + ' key=' + key);
-    } catch (e) {
-      console.warn('[upload-queue] failed-camera webhook error key=' + key + ':', e && (e.message || e));
-    }
+    const result = await outbox.post(Object.assign({}, meta || {}, {
+      event: 'upload_confirmed',
+      key,
+      sizeBytes: 0,
+      confirmedAt: new Date().toISOString(),
+      kind: 'video',
+      rendition: 'original',
+      building_id: buildingId,
+      source,
+      session_ref: sessionRef,
+    }), { url }).catch(() => ({ delivered: false, queued: false }));
+    if (!result.delivered) console.warn('[upload-queue] failed-camera webhook not delivered' + (result.queued ? ', kept for retry' : '') + ' key=' + key);
   }
 
   async function reportEmptyFile(job, sizeBytes, why) {
@@ -430,6 +531,7 @@ function createUploadQueue(opts) {
     if (isCameraRecording(job)) await postFailedCamera(job.key, job.source, job.sessionRef, job.meta);
     await removeFileIfExists(job.stateFilePath);
     completedFilePaths.add(job.filePath);
+    releaseWatchHold(job);
   }
 
   /**
@@ -455,6 +557,7 @@ function createUploadQueue(opts) {
         error: stable.reason,
       });
       console.warn('[upload-queue] file missing before upload key=' + job.key + ' file=' + job.filePath);
+      releaseWatchHold(job);
       return;
     }
 
@@ -496,7 +599,8 @@ function createUploadQueue(opts) {
         isRecording,
         shouldAbort: () => false,
         webhookUrl: typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl,
-        webhookExtra: Object.assign({}, job.meta || {}, { kind: job.kind, building_id: buildingId, source: job.source, session_ref: job.sessionRef }),
+        webhookOutbox: outbox,
+        webhookExtra: Object.assign({}, job.meta || {}, { kind: webhookKind(job.kind), building_id: buildingId, source: job.source, session_ref: job.sessionRef }),
         abortOnFailure: false,
         deleteObjectAfterVerify: false,
         onProgress: (partial) => {
@@ -542,24 +646,55 @@ function createUploadQueue(opts) {
         error: detail || 'upload_failed',
       });
       console.warn('[upload-queue] upload failed key=' + job.key + ' error=' + (detail || 'upload_failed'));
+      // A failed upload is not retried (see sweep), so it will never get a watch copy.
+      releaseWatchHold(job);
     } finally {
       activeSnapshot = null;
     }
   }
 
-  async function removeUploadedOriginal(job) {
-    if (!deleteAfterUpload || job.kind === AUDIO_KIND || job.removeAfterConfirm) return;
+  function hold(filePath, token) {
+    if (!filePath) return;
+    if (!holds.has(filePath)) holds.set(filePath, new Set());
+    holds.get(filePath).add(token);
+  }
+
+  function release(filePath, token) {
+    const set = holds.get(filePath);
+    if (!set) return;
+    set.delete(token);
+    if (set.size === 0) holds.delete(filePath);
+    maybeRemoveOriginal(filePath).catch(() => {});
+  }
+
+  /** A camera job whose watch copy will never be made no longer needs the take's master. */
+  function releaseWatchHold(job) {
+    if (job && job.watch && job.watch.masterPath) release(job.watch.masterPath, 'watch:' + job.filePath);
+  }
+
+  async function maybeRemoveOriginal(filePath) {
+    if (!removable.has(filePath) || holds.has(filePath)) return;
+    const key = removable.get(filePath);
+    removable.delete(filePath);
     try {
-      await removeFileIfExists(job.filePath);
-      console.log('[upload-queue] removed local original after verified upload key=' + job.key);
+      await removeFileIfExists(filePath);
+      console.log('[upload-queue] removed local original after verified upload key=' + key);
     } catch (e) {
-      console.warn('[upload-queue] could not remove local original key=' + job.key + ':', e && (e.message || e));
+      console.warn('[upload-queue] could not remove local original key=' + key + ':', e && (e.message || e));
     }
   }
 
+  async function removeUploadedOriginal(job) {
+    if (!deleteAfterUpload || job.kind === AUDIO_KIND || job.removeAfterConfirm) return;
+    removable.set(job.filePath, job.key);
+    if (holds.has(job.filePath)) console.log('[upload-queue] keeping local original until the take\'s watch copies are made key=' + job.key);
+    await maybeRemoveOriginal(job.filePath);
+  }
+
   function maybeMakeProxy(job) {
+    if (!job.watchQueuedAt) job.watchQueuedAt = Date.now();
     pendingProxyJobs.push(job);
-    if (proxiesBlocked()) console.warn('[upload-queue] proxy deferred (recording active) key=' + job.key);
+    if (proxiesBlocked()) console.warn('[upload-queue] watch copy deferred (recording active) key=' + job.key);
     ensureProxyWorker().catch((e) => {
       console.warn('[upload-queue] proxy worker error:', e && (e.stack || e.message || e));
     });
@@ -575,71 +710,211 @@ function createUploadQueue(opts) {
           await new Promise((resolve) => { const t = setTimeout(resolve, proxyPollMs); if (t.unref) t.unref(); });
           continue;
         }
-        // A proxy stopped for a take stays at the head of the line and is redone.
-        if (await makeProxy(pendingProxyJobs[0])) pendingProxyJobs.shift();
+        // A copy waiting to be tried again lets the others go first. In
+        // particular, never make another camera wait for the prior camera's
+        // second, legacy upload after its stream/ Watch is already ready.
+        const now = Date.now();
+        const ready = (j) => !(j.watchRetryAt > now);
+        const job = pendingProxyJobs.find((j) => !j.legacyCopy && ready(j)) || pendingProxyJobs.find(ready);
+        if (!job) {
+          const soonest = Math.min(...pendingProxyJobs.map((j) => j.watchRetryAt));
+          await new Promise((resolve) => { const t = setTimeout(resolve, Math.max(0, Math.min(soonest - now, proxyPollMs))); if (t.unref) t.unref(); });
+          continue;
+        }
+        // A copy stopped for a take stays in the line and is redone.
+        const result = job.legacyCopy ? await uploadLegacyProxy(job) : await makeProxy(job);
+        if (!result) continue;
+        pendingProxyJobs.splice(pendingProxyJobs.indexOf(job), 1);
+        if (result === 'retry') {
+          job.watchRetryAt = Date.now() + watchRetryMs * job.watchAttempts;
+          pendingProxyJobs.push(job);
+        }
       }
     } finally {
       proxyWorkerRunning = false;
     }
   }
 
-  /** Resolves true when the job is finished (made, failed or skipped), false if a take stopped it. */
+  async function uploadRendition(job, filePath, key, url, extra) {
+    const st = await fsp.stat(filePath);
+    const stateFilePath = stateFilePathForKey(key);
+    await uploader({
+      r2Config,
+      key,
+      filePath,
+      sizeBytes: st.size,
+      stateFilePath,
+      isRecording,
+      shouldAbort: () => false,
+      webhookUrl: url,
+      webhookOutbox: outbox,
+      webhookExtra: extra,
+      abortOnFailure: false,
+      deleteObjectAfterVerify: false,
+    });
+    await removeFileIfExists(stateFilePath);
+  }
+
+  /** Keep the old proxies/ object available, after pending stream/ Watch copies. */
+  async function uploadLegacyProxy(job) {
+    let retry = false;
+    try {
+      await uploadRendition(job, job.filePath, job.key, undefined, {
+        kind: 'proxy', rendition: 'proxy', building_id: buildingId,
+        source: job.source, session_ref: job.sessionRef,
+      });
+      console.log('[upload-queue] proxy confirmed ' + job.key);
+    } catch (e) {
+      job.watchAttempts = (job.watchAttempts || 0) + 1;
+      retry = job.watchAttempts < WATCH_COPY_ATTEMPTS;
+      console.warn('[upload-queue] legacy proxy upload failed key=' + job.key + ' attempt=' + job.watchAttempts + '/' + WATCH_COPY_ATTEMPTS
+        + (retry ? ' (will try again)' : ' (giving up)') + ' error=' + truncateError(e && (e.message || e.stack || e)));
+      if (retry) {
+        await writeLegacyMarker(job).catch((err) => {
+          console.warn('[upload-queue] could not record legacy proxy attempt key=' + job.key + ':', err && (err.message || err));
+        });
+      }
+    } finally {
+      if (!retry) {
+        await removeFileIfExists(job.filePath).catch(() => {});
+        await removeFileIfExists(stateFilePathForKey(job.key)).catch(() => {});
+        await removeFileIfExists(legacyFilePathForKey(job.key)).catch(() => {});
+      }
+    }
+    return retry ? 'retry' : true;
+  }
+
+  /**
+   * The camera's watch copy (Build 42; this step made the silent "proxy" before):
+   * 1080p H.264 ~4 Mbps, a keyframe every 2 s, faststart, with the take's mic mix
+   * delayed by the camera's offset_s (watch-rendition.js). Uploaded as
+   * stream/<building>/<camN>/<base>.mp4 WITH the upload_confirmed webhook
+   * (rendition "watch"), and, unless PROXY_COPY=0, again as the old proxies/ key
+   * without one. The 4K original is only read.
+   * Resolves true when the job is finished (made, failed for good or skipped), 'retry'
+   * when it failed with tries left (the original and master are kept for it), false if a
+   * take stopped it.
+   */
   async function makeProxy(job) {
-    const proxyBase = path.basename(job.filePath, path.extname(job.filePath));
-    const proxyKey = 'proxies/' + buildingId + '/' + job.source + '/' + proxyBase + '.mp4';
-    const tmpProxyPath = job.filePath + '.proxy.mp4';
+    const base = path.basename(job.filePath, path.extname(job.filePath));
+    const streamKey = 'stream/' + buildingId + '/' + job.source + '/' + base + '.mp4';
+    const proxyKey = 'proxies/' + buildingId + '/' + job.source + '/' + base + '.mp4';
+    const tmpPath = job.filePath + '.watch.mp4';
+    const watch = job.watch || {};
     let preempted = false;
+    let retry = false;
+    let legacyQueued = false;
+    // Field timing (Build 45): where Watch readiness time goes, per camera.
+    let encodeStartedAt = null;
+    let encoder = null;
 
     try {
       let st;
       try {
         st = await fsp.stat(job.filePath);
       } catch (e) {
-        console.warn('[upload-queue] proxy skipped, master file gone key=' + job.key);
+        console.warn('[upload-queue] watch copy skipped, original file gone key=' + job.key);
         return true;
       }
       if (!st.isFile()) return true;
 
-      await runProxyFfmpeg([
-        '-y',
-        '-i', job.filePath,
-        '-vf', 'scale=1920:1080',
-        '-c:v', 'libx264',
-        '-preset', 'veryfast',
-        '-crf', '21',
-        '-c:a', 'aac',
-        '-movflags', '+faststart',
-        tmpProxyPath,
-      ]);
+      const plan = await planWatch({ cameraPath: job.filePath, masterPath: watch.masterPath || null, offsetS: Number.isFinite(watch.offsetS) ? watch.offsetS : null, allowHardware: watchHardware }, { ffprobeBin: resolveFfprobeBin });
+      if (plan.audio !== 'mix') console.warn('[upload-queue] WARN watch copy without audio key=' + job.key + ' reason=' + (!watch.masterPath ? 'no_master' : (plan.offsetS === null ? 'no_timing' : 'master_unreadable')));
+      encodeStartedAt = Date.now();
+      console.log('[upload-queue] watch encode start key=' + job.key + ' wait_ms=' + (job.watchQueuedAt ? encodeStartedAt - job.watchQueuedAt : -1)
+        + ' pending=' + pendingProxyJobs.length + ' attempt=' + ((job.watchAttempts || 0) + 1) + ' preempts=' + (job.watchPreempts || 0));
+      const encodeArgs = (hardware) => watchArgs({ cameraPath: job.filePath, masterPath: watch.masterPath, masterTracks: plan.masterTracks, delayS: plan.delayS, outPath: tmpPath, hardware });
+      encoder = plan.hardware ? 'hw' : 'sw';
+      try {
+        await runProxyFfmpeg(encodeArgs(plan.hardware));
+        if (plan.hardware) hwWatchFailures = 0;
+      } catch (e) {
+        if (!plan.hardware || (e && e.preempted)) throw e;
+        hwWatchFailures += 1;
+        if (hwWatchFailures >= 2) watchHardware = false;
+        console.warn('[upload-queue] hardware watch encode failed, redoing in software key=' + job.key + ' failures=' + hwWatchFailures
+          + (watchHardware ? '' : ' (hardware off until restart)') + ' error=' + truncateError(e && (e.message || e)));
+        encoder = 'sw';
+        await runProxyFfmpeg(encodeArgs(false));
+      }
+      const encodeMs = Date.now() - encodeStartedAt;
+      const uploadStartedAt = Date.now();
 
-      const proxyStat = await fsp.stat(tmpProxyPath);
-      const proxyStateFilePath = stateFilePathForKey(proxyKey);
-      await uploader({
-        r2Config,
-        key: proxyKey,
-        filePath: tmpProxyPath,
-        sizeBytes: proxyStat.size,
-        stateFilePath: proxyStateFilePath,
-        isRecording,
-        shouldAbort: () => false,
-        webhookUrl: undefined,
-        webhookExtra: { kind: 'proxy', building_id: buildingId, source: job.source, session_ref: job.sessionRef },
-        abortOnFailure: false,
-        deleteObjectAfterVerify: false,
+      const out = await probeMedia(tmpPath, { ffprobeBin: resolveFfprobeBin });
+      const extra = Object.assign({}, job.meta || {}, {
+        rendition: 'watch',
+        audio: plan.audio,
+        original_key: job.key,
+        kind: 'video', building_id: buildingId, source: job.source, session_ref: job.sessionRef,
       });
-      await removeFileIfExists(proxyStateFilePath);
-      console.log('[upload-queue] proxy confirmed ' + proxyKey);
+      delete extra.duration_s;
+      if (out.ok && Number.isFinite(out.durationS)) extra.duration_s = Math.round(out.durationS * 1000) / 1000;
+      if (watch.recordedAt) extra.recorded_at = watch.recordedAt;
+      if (plan.offsetS !== null) extra.offset_s = plan.offsetS;
+      await uploadRendition(job, tmpPath, streamKey, typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl, extra);
+      console.log('[upload-queue] watch copy confirmed ' + streamKey + ' audio=' + plan.audio + (plan.delayS !== null ? ' delay=' + plan.delayS.toFixed(3) + 's' : '')
+        + ' encoder=' + encoder + ' encode_ms=' + encodeMs + ' upload_ms=' + (Date.now() - uploadStartedAt)
+        + ' ready_ms=' + (job.watchQueuedAt ? Date.now() - job.watchQueuedAt : -1));
+      if (proxyCopy) {
+        const legacy = { legacyCopy: true, filePath: tmpPath, key: proxyKey, source: job.source, sessionRef: job.sessionRef };
+        try {
+          await writeLegacyMarker(legacy);
+        } catch (e) {
+          console.warn('[upload-queue] could not record legacy proxy wait key=' + proxyKey + ':', e && (e.message || e));
+        }
+        pendingProxyJobs.push(legacy);
+        legacyQueued = true;
+      }
     } catch (e) {
       preempted = !!(e && e.preempted);
-      if (preempted) console.warn('[upload-queue] proxy stopped for a take, will redo after it key=' + job.key);
-      else console.warn('[upload-queue] proxy failed key=' + job.key + ' error=' + truncateError(e && (e.message || e.stack || e)));
+      if (preempted) {
+        job.watchPreempts = (job.watchPreempts || 0) + 1;
+        console.warn('[upload-queue] watch copy stopped for a take, will redo after it key=' + job.key
+          + ' lost_encode_ms=' + (encodeStartedAt ? Date.now() - encodeStartedAt : 0) + ' preempts=' + job.watchPreempts);
+      }
+      else {
+        job.watchAttempts = (job.watchAttempts || 0) + 1;
+        retry = job.watchAttempts < WATCH_COPY_ATTEMPTS;
+        console.warn('[upload-queue] watch copy failed key=' + job.key + ' attempt=' + job.watchAttempts + '/' + WATCH_COPY_ATTEMPTS
+          + (retry ? ' (will try again)' : ' (giving up)') + ' error=' + truncateError(e && (e.message || e.stack || e)));
+        if (!retry) await postWatchFailed(job, streamKey, e && e.watchError ? e.watchError : 'encode_or_upload_failed');
+      }
     } finally {
-      await removeFileIfExists(tmpProxyPath).catch(() => {});
-      // The original is already verified in S3; a failed proxy is not a reason to keep it.
-      // A proxy stopped for a take still needs the original.
-      if (!preempted) await removeUploadedOriginal(job);
+      if (!legacyQueued) await removeFileIfExists(tmpPath).catch(() => {});
+      // The original is already verified in S3; a copy that failed for good is not a
+      // reason to keep it. A copy stopped for a take, or due another try, still needs the
+      // original (and the master).
+      if (!preempted && !retry) {
+        releaseWatchHold(job);
+        await removeUploadedOriginal(job);
+      }
     }
-    return !preempted;
+    if (preempted) return false;
+    return retry ? 'retry' : true;
+  }
+
+  // The watch copy could not be made: an upload_confirmed for its stream/ key with no
+  // bytes and rendition "watch". The cloud ledgers it without announcing it (a watch copy
+  // is never posted, es-honeybook Build 42) and the app shows the angle as failed. Needs
+  // es-honeybook Build 42 live: an older task would post it as "Camera N recording failed".
+  async function postWatchFailed(job, streamKey, reason) {
+    const url = typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl;
+    if (!url) return;
+    const watch = job.watch || {};
+    const result = await outbox.post(Object.assign({
+      event: 'upload_confirmed',
+      key: streamKey,
+      sizeBytes: 0,
+      confirmedAt: new Date().toISOString(),
+      kind: 'video',
+      rendition: 'watch',
+      original_key: job.key,
+      watch_error: String(reason).slice(0, 64),
+      building_id: buildingId,
+      source: job.source,
+      session_ref: job.sessionRef,
+    }, watch.recordedAt ? { recorded_at: watch.recordedAt } : {}), { url }).catch(() => ({ delivered: false, queued: false }));
+    if (!result.delivered) console.warn('[upload-queue] watch-failed webhook not delivered' + (result.queued ? ', kept for retry' : '') + ' key=' + streamKey);
   }
 
   async function ensureWorker() {
@@ -652,6 +927,10 @@ function createUploadQueue(opts) {
         queuedFilePaths.delete(job.filePath);
         activeJob = job;
         try {
+          // The queued state is written asynchronously by enqueue(). A very
+          // short or empty file can finish before that write, otherwise its
+          // final state removal is undone by the late queued write.
+          await job.stateReady;
           await runJob(job);
         } catch (e) {
           console.warn('[upload-queue] worker job error:', e && (e.stack || e.message || e));
@@ -685,8 +964,18 @@ function createUploadQueue(opts) {
       }
 
       const keyFolder = kind === AUDIO_KIND ? 'audio' : source;
-      const key = 'recordings/' + buildingId + '/' + keyFolder + '/' + path.basename(filePath);
+      // A caller-given key (the take's mix: audio/<building>/<base>-mix.m4a) must stay
+      // under this agent's own prefixes.
+      const keyOverride = input && typeof input.key === 'string' && KEY_RE.test(input.key) && !input.key.includes('..') ? input.key : null;
+      const key = keyOverride || ('recordings/' + buildingId + '/' + keyFolder + '/' + path.basename(filePath));
       const stateFilePath = stateFilePathForKey(key);
+      // What the camera's watch copy needs from its take (see makeProxy).
+      const watchIn = input && input.watch && typeof input.watch === 'object' ? input.watch : null;
+      const watch = watchIn ? {
+        masterPath: typeof watchIn.masterPath === 'string' && watchIn.masterPath ? path.resolve(watchIn.masterPath) : null,
+        offsetS: Number.isFinite(watchIn.offsetS) ? watchIn.offsetS : null,
+        recordedAt: typeof watchIn.recordedAt === 'string' ? watchIn.recordedAt : null,
+      } : null;
       const job = {
         filePath,
         source,
@@ -694,14 +983,17 @@ function createUploadQueue(opts) {
         sessionRef,
         removeAfterConfirm: !!(input && input.removeAfterConfirm),
         meta: cleanMeta(input && input.meta),
+        watch,
+        keyOverride,
         key,
         stateFilePath,
         enqueuedAt: new Date().toISOString(),
       };
+      if (watch && watch.masterPath && isCameraRecording(job)) hold(watch.masterPath, 'watch:' + filePath);
 
       queuedFilePaths.add(filePath);
       queue.push(job);
-      writeState(stateFilePath, buildBaseState(job, 'queued'));
+      job.stateReady = writeState(stateFilePath, buildBaseState(job, 'queued'));
       ensureWorker().catch((e) => {
         console.warn('[upload-queue] worker start failed:', e && (e.stack || e.message || e));
       });
@@ -723,6 +1015,28 @@ function createUploadQueue(opts) {
       }
 
       for (const name of files) {
+        if (name.endsWith('.legacy.json')) {
+          const legacyPath = path.join(stateDir, name);
+          try {
+            const saved = await readJsonFile(legacyPath);
+            const filePath = saved && saved.filePath ? path.resolve(String(saved.filePath)) : '';
+            const key = saved && saved.key ? String(saved.key) : '';
+            let exists = false;
+            if (filePath && key) {
+              try { exists = (await fsp.stat(filePath)).isFile(); } catch (_) { exists = false; }
+            }
+            if (exists && !pendingProxyJobs.some((j) => j.legacyCopy && j.key === key)) {
+              const attempts = Math.max(0, Math.floor(Number(saved.attempts) || 0));
+              pendingProxyJobs.push({ legacyCopy: true, filePath, key, source: String(saved.source || ''), sessionRef: saved.sessionRef || undefined, watchAttempts: attempts });
+              console.log('[upload-queue] legacy proxy upload resumed after restart key=' + key + ' attempts=' + attempts);
+            } else if (!exists) {
+              await removeFileIfExists(legacyPath);
+            }
+          } catch (e) {
+            console.warn('[upload-queue] failed reading legacy proxy wait ' + legacyPath + ':', e && (e.message || e));
+          }
+          continue;
+        }
         if (!name.endsWith('.state.json')) continue;
         const stateFilePath = path.join(stateDir, name);
         let stateData;
@@ -772,7 +1086,7 @@ function createUploadQueue(opts) {
 
           if (sourceExists) {
             const source = stateData.source ? String(stateData.source) : '';
-            const out = enqueue({ filePath: sourceFilePath, source, kind: stateData.kind, sessionRef: stateData.sessionRef, removeAfterConfirm: stateData.removeAfterConfirm, meta: stateData.meta });
+            const out = enqueue({ filePath: sourceFilePath, source, kind: stateData.kind, sessionRef: stateData.sessionRef, removeAfterConfirm: stateData.removeAfterConfirm, meta: stateData.meta, watch: stateData.watch, key: stateData.keyOverride || undefined });
             if (!out.queued) {
               console.warn('[upload-queue] sweep enqueue skipped key=' + String(stateData.key || '?') + ' reason=' + String(out.reason || 'unknown'));
             }
@@ -805,7 +1119,10 @@ function createUploadQueue(opts) {
     try {
       return {
         queued: queue.length,
+        // Watch copies still to make (the step that made proxies; name kept for the kiosk/diag readers).
         proxies_pending: pendingProxyJobs.length,
+        // false once WATCH_HW=off or two hardware failures in a row turned the VideoToolbox path off.
+        watch_hw: watchHardware,
         active: activeSnapshot ? Object.assign({}, activeSnapshot) : null,
         last_confirmed: lastConfirmed ? Object.assign({}, lastConfirmed) : null,
       };
@@ -815,7 +1132,31 @@ function createUploadQueue(opts) {
     }
   }
 
-  return { enqueue, sweep, status, reportMissingCamera, holdProxies };
+  /**
+   * Adds meta to a job that has not uploaded yet (the take's audio_health when the
+   * file check finished after stop returned). Returns true if a job took it.
+   */
+  function annotate(filePath, metaPatch) {
+    const target = path.resolve(String(filePath || ''));
+    const job = queue.find((j) => j.filePath === target) || (activeJob && activeJob.filePath === target && !activeSnapshot ? activeJob : null);
+    if (!job) return false;
+    job.meta = cleanMeta(Object.assign({}, job.meta || {}, metaPatch || {}));
+    updateStateFields(job.stateFilePath, { meta: job.meta }).catch(() => {});
+    return true;
+  }
+
+  return {
+    enqueue,
+    sweep,
+    status,
+    reportMissingCamera,
+    holdProxies,
+    annotate,
+    // Heartbeat webhook_pending: null when every upload_confirmed was delivered.
+    webhookPending: () => outbox.pending(),
+    flushWebhooks: () => outbox.flush(),
+    stop: () => outbox.stop(),
+  };
 }
 
-module.exports = { createUploadQueue, resolveFfmpegBin, resolveFfprobeBin };
+module.exports = { createUploadQueue, resolveFfmpegBin, resolveFfprobeBin, cleanMeta };
