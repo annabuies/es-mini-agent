@@ -157,7 +157,7 @@ test('a viewer leaving keeps the stream for the others; the last viewer leaving 
   assert.equal(count(agent.obsRequests, 'StartStream'), 1, 'the second viewer shares the running stream');
 
   const phoneLeaves = await agent.op('preview_stop', { viewer: VIEWER_PHONE });
-  assert.deepEqual(phoneLeaves, { ok: true, preview: true, viewers: 1 });
+  assert.deepEqual(phoneLeaves, { ok: true, preview: true, viewers: 1, camera: 1 });
   assert.equal(count(agent.obsRequests, 'StopStream'), 0, 'the kiosk keeps its picture');
 
   const kioskLeaves = await agent.op('preview_stop', { viewer: VIEWER_KIOSK });
@@ -184,7 +184,7 @@ test('a stop for a viewer that never started does not keep a stream nobody watch
   const agent = await startAgent(t);
   await agent.op('preview_start', { viewer: VIEWER_KIOSK, cloudflare: CF });
   const stray = await agent.op('preview_stop', { viewer: VIEWER_PHONE });
-  assert.deepEqual(stray, { ok: true, preview: true, viewers: 1 }, 'the kiosk lease is untouched');
+  assert.deepEqual(stray, { ok: true, preview: true, viewers: 1, camera: 1 }, 'the kiosk lease is untouched');
   const last = await agent.op('preview_stop', { viewer: VIEWER_KIOSK });
   assert.equal(last.preview, false);
   assert.equal(count(agent.obsRequests, 'StopStream'), 1);

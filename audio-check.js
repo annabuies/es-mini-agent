@@ -38,6 +38,19 @@ const LOW_PEAK_DB = -90;
 const IDENTICAL_TOLERANCE_DB = 0.05;
 const IDENTICAL_MIN_FRAMES = 10;
 const IDENTICAL_MIN_RANGE_DB = 0.5;
+// Signal truth (post-TF48 slice 6, contract C2). "Active" = a speech-level signal above the
+// channel's own measured floor, never merely "the input exists" (the EVO 8 interface
+// being plugged in says nothing about a mic on its XLR input). A channel is active when
+// its peak over the window reaches SIGNAL_MIN_PEAK_DB and clears the channel's floor (the
+// 20th-percentile frame level, i.e. the quiet moments between words) by SIGNAL_MARGIN_DB;
+// a meter that never changes (frozen) is not a signal. The idle check runs this on its
+// 1.5 s window (nobody speaking: normally 0 active, source "idle"); the mic_check op runs
+// it for MIC_CHECK_MS while somebody speaks into each mic (source "mic_check").
+const SIGNAL_MIN_PEAK_DB = -40;
+const SIGNAL_MARGIN_DB = 20;
+const SIGNAL_FLOOR_PERCENTILE = 0.2;
+const MIC_CHECK_MS = 3000;
+const MIC_CHECK_STICKY_MS = 5 * 60 * 1000;
 const EVO_DEVICE_RE = /AppleUSBAudioEngine:Audient:EVO/i;
 const FAIL_CODES = ['evo_missing', 'mic_muted', 'mic_not_recorded', 'mics_frozen', 'mics_identical'];
 const CODE_ORDER = ['evo_missing', 'mic_muted', 'mic_not_recorded', 'mic_silent', 'mics_frozen', 'mics_identical', 'meters_unavailable'];
@@ -129,6 +142,54 @@ function analyzeMeters(frames, micNames) {
   return out;
 }
 
+function dbOf(x) {
+  return x > 0 ? 20 * Math.log10(x) : -Infinity;
+}
+
+function round1(n) {
+  return Number.isFinite(n) ? Math.round(n * 10) / 10 : null;
+}
+
+/**
+ * Pure. The contract `signal` block from raw meter frames:
+ * { checked_at, window_ms, expected_count, active_count, source, channels: [{ ch, label,
+ *   peak_dbfs, rms_dbfs, floor_dbfs, active }] }. Levels are null for a mic with no frames.
+ * options: { source, checkedAt, windowMs }.
+ */
+function signalFromFrames(frames, micNames, options) {
+  const opts = options || {};
+  const names = micNames || DEFAULT_MICS;
+  const list = Array.isArray(frames) ? frames : [];
+  const channels = names.map((name, i) => {
+    const series = seriesFor(list, name);
+    const entry = { ch: i + 1, label: name, peak_dbfs: null, rms_dbfs: null, floor_dbfs: null, active: false };
+    if (!series.length) return entry;
+    const mags = series.map((chs) => Math.max(0, ...chs.map((c) => Number(c[0]) || 0)));
+    const peaks = series.map((chs) => Math.max(0, ...chs.map((c) => Math.max(Number(c[1]) || 0, Number(c[0]) || 0))));
+    const peakDb = dbOf(Math.max(...peaks));
+    const rmsDb = dbOf(Math.sqrt(mags.reduce((sum, m) => sum + m * m, 0) / mags.length));
+    const sortedDb = mags.map(dbOf).sort((a, b) => a - b);
+    const floorDb = sortedDb[Math.min(sortedDb.length - 1, Math.floor(sortedDb.length * SIGNAL_FLOOR_PERCENTILE))];
+    const first = JSON.stringify(series[0]);
+    const frozen = series.length >= 2 && series.every((x) => JSON.stringify(x) === first);
+    entry.peak_dbfs = round1(peakDb);
+    entry.rms_dbfs = round1(rmsDb);
+    entry.floor_dbfs = round1(floorDb);
+    entry.active = !frozen && Number.isFinite(peakDb) && peakDb >= SIGNAL_MIN_PEAK_DB && (!Number.isFinite(floorDb) || peakDb - floorDb >= SIGNAL_MARGIN_DB);
+    return entry;
+  });
+  const times = list.map((f) => f.at).filter(Number.isFinite);
+  const span = times.length >= 2 ? Math.max(...times) - Math.min(...times) : 0;
+  return {
+    checked_at: opts.checkedAt || new Date().toISOString(),
+    window_ms: Number.isFinite(opts.windowMs) ? opts.windowMs : span,
+    expected_count: names.length,
+    active_count: channels.filter((c) => c.active).length,
+    source: opts.source || 'idle',
+    channels,
+  };
+}
+
 const MAX_TRACKS = 6;
 
 /**
@@ -202,6 +263,8 @@ function evaluateAudio(meters, info, checkedAt, micNames) {
     level,
     checked_at: checkedAt || new Date().toISOString(),
     evo_present: typeof facts.evoPresent === 'boolean' ? facts.evoPresent : null,
+    // The audio INTERFACE (EVO 8) is there; says nothing about a mic being plugged in (see `signal`).
+    interface_present: typeof facts.evoPresent === 'boolean' ? facts.evoPresent : null,
     codes: ordered,
     mics,
   };
@@ -211,7 +274,7 @@ function evaluateAudio(meters, info, checkedAt, micNames) {
 
 /** The block when the check could not run at all (OBS down, check disabled). */
 function unknownAudio(error, checkedAt) {
-  return { level: 'unknown', checked_at: checkedAt || new Date().toISOString(), evo_present: null, codes: [], mics: {}, error: String(error || 'unknown') };
+  return { level: 'unknown', checked_at: checkedAt || new Date().toISOString(), evo_present: null, interface_present: null, codes: [], mics: {}, error: String(error || 'unknown') };
 }
 
 async function safeRequest(client, type, payload) {
@@ -300,9 +363,18 @@ function createAudioMonitor(options) {
   }));
 
   let last = null;
+  let lastMicCheck = null; // { signal, atMs }: the newest explicit mic_check, kept on the cached verdict for a while
+  let micChecking = false;
   let inFlight = null;
   let take = null;
   let lastLogged = '';
+
+  /** The signal to carry on a verdict: a recent explicit mic_check (people spoke), else this window's own. */
+  function withSignal(block, frames, source) {
+    const own = signalFromFrames(frames, micNames, { source, checkedAt: block.checked_at, windowMs: source === 'idle' ? windowMs : takeWindowMs });
+    const sticky = lastMicCheck && Date.now() - lastMicCheck.atMs < MIC_CHECK_STICKY_MS ? lastMicCheck.signal : null;
+    return Object.assign(block, { signal: sticky || own });
+  }
 
   function remember(block, context) {
     last = block;
@@ -328,7 +400,7 @@ function createAudioMonitor(options) {
     }
     try {
       const [settings] = await Promise.all([readAudioSettings(client, micNames, opts), sleep(windowMs)]);
-      return evaluateAudio(analyzeMeters(frames, micNames), settings, new Date().toISOString(), micNames);
+      return withSignal(evaluateAudio(analyzeMeters(frames, micNames), settings, new Date().toISOString(), micNames), frames, 'idle');
     } catch (e) {
       return unknownAudio('audio_check_failed: ' + (e && (e.message || e)));
     } finally {
@@ -341,7 +413,50 @@ function createAudioMonitor(options) {
     const frames = t.frames.filter((f) => f.at >= since);
     if (!t.client) return unknownAudio('obs_unreachable');
     const settings = await readAudioSettings(t.client, micNames, opts);
-    return evaluateAudio(analyzeMeters(frames, micNames), settings, new Date().toISOString(), micNames);
+    return withSignal(evaluateAudio(analyzeMeters(frames, micNames), settings, new Date().toISOString(), micNames), frames, 'take');
+  }
+
+  /**
+   * The mic_check op (contract C2): about 3 s of meters from the four mic inputs while
+   * somebody speaks into each, on its own short-lived read-only client (meters + GetInputList
+   * + the EVO device list; it never writes to OBS, never touches recording or the take's
+   * client). Refuses while a take is open here; the caller (server.js) refuses while recording
+   * or paused. Resolves { ok, interface_present, signal } or { ok: false, reason }.
+   */
+  async function micCheck(options) {
+    const o = options || {};
+    if (take) return { ok: false, reason: 'recording_active' };
+    if (micChecking) return { ok: false, reason: 'mic_check_busy' };
+    micChecking = true;
+    const frames = [];
+    let client;
+    try {
+      try {
+        client = makeClient((type, payload) => { if (type === 'InputVolumeMeters') frames.push(meterFrame(payload, Date.now())); }, EVENT_SUB_INPUT_VOLUME_METERS);
+        await client.ensureConnected();
+      } catch (e) {
+        try { if (client) client.close(); } catch (_) {}
+        client = null;
+        return { ok: false, reason: 'obs_unreachable', interface_present: null };
+      }
+      const ms = Number.isFinite(o.windowMs) ? o.windowMs : (Number.isFinite(opts.micCheckMs) ? opts.micCheckMs : MIC_CHECK_MS);
+      const [settings] = await Promise.all([readAudioSettings(client, micNames, opts), sleep(ms)]);
+      // A take opened here meanwhile owns the meters now: this result is no longer clean.
+      if (take) return { ok: false, reason: 'recording_active' };
+      const signal = signalFromFrames(frames, micNames, { source: 'mic_check', checkedAt: new Date().toISOString(), windowMs: ms });
+      const out = { ok: frames.length > 0, interface_present: typeof settings.evoPresent === 'boolean' ? settings.evoPresent : null, signal };
+      if (!out.ok) out.reason = 'meters_unavailable';
+      else {
+        lastMicCheck = { signal, atMs: Date.now() };
+        if (last) last = Object.assign({}, last, { signal });
+      }
+      return out;
+    } catch (e) {
+      return { ok: false, reason: 'mic_check_failed', detail: String(e && (e.message || e)).slice(0, 120) };
+    } finally {
+      micChecking = false;
+      try { if (client) client.close(); } catch (_) {}
+    }
   }
 
   /** A fresh check (idle: own client; during a take: the take's client). */
@@ -417,6 +532,7 @@ function createAudioMonitor(options) {
 
   return {
     check,
+    micCheck,
     beginTake,
     endTake,
     latest: () => last,
@@ -434,5 +550,9 @@ module.exports = {
   evaluateAudio,
   meterFrame,
   readAudioSettings,
+  signalFromFrames,
   unknownAudio,
+  MIC_CHECK_MS,
+  SIGNAL_MARGIN_DB,
+  SIGNAL_MIN_PEAK_DB,
 };

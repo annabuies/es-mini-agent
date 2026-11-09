@@ -312,6 +312,7 @@ async function startAgent(t, options = {}) {
     relayRequests.push(url);
     // options.relay(req, url) may answer instead: { status?, body }.
     const custom = typeof options.relay === 'function' ? options.relay(req, url) : null;
+    if (custom && custom.hang) return; // never answers (a stalled connection)
     res.statusCode = (custom && custom.status) || 200;
     res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify(custom ? custom.body : (options.relayResponse || { command: null })));
@@ -361,7 +362,7 @@ test('heartbeat is sent from cached state on the first poll only once per minute
   const [first, second] = polls;
 
   assert.equal(first.searchParams.get('hb'), '1');
-  assert.equal(first.searchParams.get('v'), '2026.11.02-1');
+  assert.equal(first.searchParams.get('v'), '2026.11.05-1');
   assert.equal(first.searchParams.get('c'), 'unknown');
   const heartbeatState = JSON.parse(Buffer.from(first.searchParams.get('state'), 'base64url').toString('utf8'));
   assert.deepEqual(heartbeatState, {
@@ -373,6 +374,8 @@ test('heartbeat is sent from cached state on the first poll only once per minute
     power: null,
     // The first mic check runs 2 s after boot, after this first heartbeat.
     audio: null,
+    // Contract C1: the shared preview angle, null with no preview overlay.
+    preview_camera: null,
   });
   assert.equal(typeof heartbeatState.disk_free_bytes, 'number');
   assert.equal(typeof heartbeatState.disk_total_bytes, 'number');
@@ -433,7 +436,8 @@ test('heartbeat reports cached camera reachability without probing from the poll
 
   assert.deepEqual(heartbeatState.cameras_down, ['cam2']);
   assert.match(heartbeatState.cameras_checked_at, /^2026-/);
-  assert.ok(Buffer.byteLength(JSON.stringify(heartbeatState)) < 1024);
+  // A typical state (all four mics with routes, plus the C2 signal) is about 1.2 KB; the Worker's cap is 2048.
+  assert.ok(Buffer.byteLength(JSON.stringify(heartbeatState)) < 1536);
   assert.equal(cameraRequests.length, 1);
 });
 
@@ -478,6 +482,57 @@ test('a failing relay is retried after 1 s then 2 s, never at the fast interval,
   assert.ok(gaps[1] >= 1900 && gaps[1] < 2600, 'after the second failure: ' + gaps[1] + ' ms');
   for (const gap of gaps.slice(2, 6)) assert.ok(gap < 500, 'recovered poll gap ' + gap + ' ms');
   assert.equal((agent.stderr().match(/relay: poll GET 503/g) || []).length, 2);
+});
+
+// Post-TF48 slice 4: "Studio offline" at the kiosk = the Worker saw no heartbeat for 150 s. The
+// heartbeat rides on the poll, once a minute; a failed or hung poll must not use up that slot.
+test('a heartbeat that did not get through rides on the retry, then goes back to once a minute', { timeout: 15000 }, async (t) => {
+  const polls = [];
+  await startAgent(t, {
+    env: { POLL_INTERVAL_MS: '100', POLL_IDLE_INTERVAL_MS: '100' },
+    relay(req, url) {
+      if (req.method !== 'GET' || url.searchParams.has('want_sources')) return null;
+      polls.push(url.searchParams.get('hb'));
+      return polls.length <= 2 ? { status: 503, body: { ok: false } } : { body: { ok: true, command: null } };
+    },
+  });
+  await waitFor(() => polls.length >= 6, 10000);
+  assert.deepEqual(polls.slice(0, 6), ['1', '1', '1', null, null, null], 'two failed polls, then the delivered one, then no repeat');
+});
+
+test('a poll the relay never answers is abandoned after POLL_TIMEOUT_MS and the heartbeat is sent again', { timeout: 15000 }, async (t) => {
+  const polls = [];
+  const agent = await startAgent(t, {
+    env: { POLL_INTERVAL_MS: '100', POLL_IDLE_INTERVAL_MS: '100', POLL_TIMEOUT_MS: '1000' },
+    relay(req, url) {
+      if (req.method !== 'GET' || url.searchParams.has('want_sources')) return null;
+      polls.push({ at: Date.now(), hb: url.searchParams.get('hb') });
+      return polls.length === 1 ? { hang: true } : { body: { ok: true, command: null } };
+    },
+  });
+  await waitFor(() => polls.length >= 3, 8000);
+  assert.equal(polls[1].hb, '1', 'the abandoned poll\'s heartbeat is sent again');
+  assert.ok(polls[1].at - polls[0].at < 4000, 'gap after the hang ' + (polls[1].at - polls[0].at) + ' ms (not the 5 min undici wait)');
+  assert.equal(polls[2].hb, null);
+  assert.match(agent.stderr(), /relay: poll error/);
+});
+
+test('a result POST the relay never answers is abandoned after POLL_TIMEOUT_MS, so the poll and its heartbeat resume', { timeout: 15000 }, async (t) => {
+  const polls = [];
+  let posts = 0;
+  await startAgent(t, {
+    env: { POLL_INTERVAL_MS: '100', POLL_IDLE_INTERVAL_MS: '100', POLL_TIMEOUT_MS: '1000' },
+    relay(req, url) {
+      if (url.searchParams.has('want_sources')) return null;
+      if (req.method === 'POST') { posts += 1; return posts === 1 ? { hang: true } : { body: { ok: true } }; }
+      if (req.method !== 'GET') return null;
+      polls.push(Date.now());
+      return polls.length === 1 ? { body: { ok: true, command: { id: 'cmd-1', op: 'status', payload: {} } } } : { body: { ok: true, command: null } };
+    },
+  });
+  await waitFor(() => polls.length >= 2, 8000);
+  assert.equal(posts >= 1, true, 'the status result was posted');
+  assert.ok(polls[1] - polls[0] < 4500, 'next poll ' + (polls[1] - polls[0]) + ' ms after the hung result POST (not the 5 min undici wait)');
 });
 
 test('smoke: fake relay and OBS start the three camera recordings', { timeout: 8000 }, async (t) => {
@@ -638,6 +693,14 @@ test('pause and resume also control the active master', { timeout: 8000 }, async
     'CallVendorRequest', 'CallVendorRequest', 'CallVendorRequest', 'PauseRecord',
     'CallVendorRequest', 'CallVendorRequest', 'CallVendorRequest', 'ResumeRecord',
   ]);
+});
+
+test('a resume with no take starts nothing and does not fake a recording (post-TF48 audit)', { timeout: 8000 }, async (t) => {
+  const agent = await startAgent(t);
+  const before = agent.obsRequests.length;
+  assert.deepEqual(await postAgent(agent.agentPort, 'resume'), { ok: true, recording: false, feeds_writing: null });
+  assert.equal((await postAgent(agent.agentPort, 'status')).recording, false);
+  assert.equal(agent.obsRequests.slice(before).some((r) => r.type === 'CallVendorRequest' || r.type === 'ResumeRecord'), false);
 });
 
 test('master uploads retain their recording key and skip proxy generation', { timeout: 8000 }, async (t) => {
@@ -1309,7 +1372,7 @@ test('an RTSP take: stop reports timing and offsets; the watch copy is made with
   const graph = encode[encode.indexOf('-filter_complex') + 1];
   const samples = Math.round(cam1.offset_s * 48000);
   assert.ok(graph.includes(`adelay=delays=${samples}S:all=1`), 'the mix is delayed by +offset_s: ' + graph);
-  assert.ok(graph.includes('[1:a:0][1:a:1][1:a:2][1:a:3]amix=inputs=4'));
+  assert.ok(graph.includes('[g0][g1][g2][g3]amix=inputs=4') && /\[1:a:3\]agate=/.test(graph), 'the four mic tracks are gated, then mixed: ' + graph);
   assert.ok(agent.uploads.some((r) => r.method === 'POST' && r.query.has('uploads') && r.path === `/fake-bucket/stream/bench-1/cam1/${TAKE}.mp4`.replace(/ /g, '%20')));
   // B2: the originals are never rewritten.
   assert.equal(md5File(path.join(agent.recordDir, 'cam2', TAKE + '.mp4')), before.cam2);
