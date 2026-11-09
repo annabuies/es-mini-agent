@@ -245,33 +245,30 @@ Testers saw Record and Stop take 3-5 s to react on the kiosk. Part of that wait 
 
 ## Install as a launchd LaunchAgent (auto-start + auto-restart)
 
-1. Run the installer with the required environment values. It resolves Node, generates the live plist with the full environment block, and loads it:
+Install or update a Mini with the **pinned installer from a release**: [docs/INSTALL.md](docs/INSTALL.md). It verifies the release hashes, keeps every setting in the live plist, refuses while recording or uploading, backs up to `~/es-backups/`, installs into `~/es-mini-agent-runtimes/<version>-<commit>/` (never `~/Documents`), reads back the result and can roll back (`install.sh --rollback`). A new property: [docs/NEW-PROPERTY.md](docs/NEW-PROPERTY.md).
+
+Never use the old `bash <(curl …/main/install.sh)` one-liner, `update` or self-update to switch runtimes. The release package is built from a commit with `scripts/build-mini-package.sh <repo> <out> <commit> <version>`.
+
+1. Tail logs (the folder is the plist's `WorkingDirectory`):
 
    ```bash
-   BUILDING_ID=bench-1 RECORD_CONTROL_KEY='your-long-secret' ./install.sh
+   D="$(/usr/libexec/PlistBuddy -c 'Print :WorkingDirectory' ~/Library/LaunchAgents/com.es.mini-agent.plist)"; tail -f "$D/agent.log" "$D/agent.error.log"
    ```
 
-   Re-run the installer to change launchd environment values. There is deliberately no `com.es.mini-agent.plist` template in the project folder; that stale copy was easy to mistake for the live plist.
-
-2. Tail logs:
-
-   ```bash
-   tail -f ~/Documents/es-mini-agent/agent.log \
-           ~/Documents/es-mini-agent/agent.error.log
-   ```
-
-3. Reload the generated plist manually if needed:
+2. Reload the plist manually if needed:
 
    ```bash
    launchctl unload ~/Library/LaunchAgents/com.es.mini-agent.plist
    launchctl load   ~/Library/LaunchAgents/com.es.mini-agent.plist
    ```
 
-4. Stop for good, or run `./uninstall.sh` to remove both agent LaunchAgents:
+3. Stop for good, or run `./uninstall.sh` to remove both agent LaunchAgents (runtime folders and backups are kept):
 
    ```bash
    launchctl unload ~/Library/LaunchAgents/com.es.mini-agent.plist
    ```
+
+There is deliberately no `com.es.mini-agent.plist` template in the project folder; that stale copy was easy to mistake for the live plist.
 
 `KeepAlive: true` means launchd restarts the process if it crashes — the "self-recovery agent" behavior the FLEET docs describe. `RunAtLoad: true` starts it immediately on load / on user login.
 
