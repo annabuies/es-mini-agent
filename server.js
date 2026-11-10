@@ -35,7 +35,7 @@ const { compactAudio, createHeartbeatSlot, heartbeatStateJson } = require('./hea
 // Bumped by hand per release. This is the fastest way to tell what a remote
 // machine is actually running -- it comes back in `diag` even when OBS is
 // unreachable and even on a machine that has never self-updated.
-const AGENT_VERSION = '2026.11.05-1';
+const AGENT_VERSION = '2026.11.09-1';
 // Where self-update pulls new code from. Overridable for testing; the default is
 // the public repo, fetched with no credentials on purpose (see modules.txt).
 const REPO_RAW_BASE = process.env.REPO_RAW_BASE || 'https://raw.githubusercontent.com/annabuies/es-mini-agent/main';
@@ -94,6 +94,13 @@ const PREVIEW_JPEG_QUALITY = 60;
 const PREVIEW_RELAY_API = (process.env.PREVIEW_RELAY_API || 'http://127.0.0.1:9997').replace(/\/$/, '');
 const PREVIEW_RELAY_TIMEOUT_MS = 2000;
 const PREVIEW_RELAY_START_CHECK_MS = Number(process.env.PREVIEW_RELAY_START_CHECK_MS || 3000);
+// bench-1 field tests 2026-11-09 (x2): OBS's output goes active ~1-2 s before its WHIP
+// session reaches the relay, the kiosk asked in that gap, got "no stream is available"
+// and fell back to cloud for 10 minutes. So the room path is only reported once the
+// relay itself says the room's stream is available. The Worker waits 6.5 s for this op,
+// so this budget counts from the publish request (OBS going active is inside it).
+const PREVIEW_RELAY_READY_MS = Number(process.env.PREVIEW_RELAY_READY_MS || 3500);
+const PREVIEW_RELAY_PROBE_TIMEOUT_MS = 1000;
 const OBS_WS_URL = process.env.OBS_WS_URL || 'ws://127.0.0.1:4455';
 const OBS_WS_PASSWORD = process.env.OBS_WS_PASSWORD || '';
 const OBS_SOURCES_RAW = process.env.OBS_SOURCES || '';
@@ -805,6 +812,37 @@ async function setRelayForward(path, dest) {
   }
 }
 
+// True when the relay has the room's stream (a publisher is in and its tracks are up).
+// MediaMTX v1.21.3 (the pinned relay): `available`; `ready` is its deprecated alias for
+// the same thing (api/openapi.yaml). Re-check this if the pinned version changes.
+// Any error = not yet.
+async function relayStreamAvailable(path, timeoutMs = PREVIEW_RELAY_PROBE_TIMEOUT_MS) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), Math.max(50, Math.min(timeoutMs, PREVIEW_RELAY_PROBE_TIMEOUT_MS)));
+  try {
+    const response = await fetch(`${PREVIEW_RELAY_API}/v3/paths/get/${encodeURIComponent(path)}`, { signal: ctrl.signal });
+    if (!response.ok) return false;
+    const data = await response.json();
+    return !!(data && (data.available === true || data.ready === true));
+  } catch (_) {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Never runs past its budget: each probe is capped to the time left.
+async function waitForRelayStream(path, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const left = deadline - Date.now();
+    if (left <= 0) return false;
+    if (await relayStreamAvailable(path, left)) return true;
+    if (deadline - Date.now() <= 150) return false;
+    await sleep(150);
+  }
+}
+
 async function waitForStreamOutput(client, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -886,15 +924,23 @@ async function publishPreviewOutput(client, publishUrl, relay, localOffered) {
   // to publishing straight to Cloudflare (the path below, unchanged).
   let localRelay = false;
   let localError = null;
+  let relayReady = false;
   if (relay) {
     try {
       await setRelayForward(relay.path, relayForwardDest(publishUrl));
+      const publishedAt = Date.now();
       await publish({ server: relay.whipUrl, bearer_token: relay.publishToken });
       if (!(await waitForStreamOutput(client, PREVIEW_RELAY_START_CHECK_MS))) {
         try { await client.request('StopStream'); } catch (_) {}
         throw new Error('relay_publish_not_active');
       }
       localRelay = true;
+      // OBS keeps publishing to the relay either way (phones get the forward). The room
+      // path is offered to the kiosk only once the relay has the stream; until then the
+      // kiosk stays on cloud and a later keepalive offers the room path.
+      const readyBudget = Math.max(500, PREVIEW_RELAY_READY_MS - (Date.now() - publishedAt));
+      relayReady = await waitForRelayStream(relay.path, readyBudget);
+      if (!relayReady) localError = 'relay_not_ready';
     } catch (e) {
       localError = /^relay_publish|^obs_/.test(String(e && e.message)) ? 'relay_publish_failed' : 'relay_unreachable';
       maybeWarnPreview('preview relay unavailable (' + localError + '); publishing to Cloudflare directly');
@@ -911,7 +957,7 @@ async function publishPreviewOutput(client, publishUrl, relay, localOffered) {
       bearer_token: '',
     });
   }
-  return { localRelay, localError };
+  return { localRelay, localError, relayReady };
 }
 
 // The overlay scene must still be in OBS (an OBS restart loses it); rebuild it if not.
@@ -1009,12 +1055,14 @@ async function startCloudflarePreview(config, localConfig) {
     && validCloudflareWebRtcUrl(playbackUrl, '/webRTC/play');
 
   if (cloudflarePreviewOwnsStream) {
+    // Keepalives offer the room path only while the relay actually has the stream.
+    const relayLive = cloudflarePreviewRelayPath ? await relayStreamAvailable(cloudflarePreviewRelayPath) : false;
     const keepCurrent = (extra) => Object.assign({
       stream: { inputUid: cloudflarePreviewInputUid, playbackUrl: cloudflarePreviewPlaybackUrl },
       // A keepalive can race with creation of a replacement input. Keep the
       // stream we own and ask the relay to delete the unused candidate.
       cleanupInputUid: validIdentity && inputUid !== cloudflarePreviewInputUid ? inputUid : null,
-      localRelay: !!cloudflarePreviewRelayPath,
+      localRelay: relayLive,
     }, extra || {});
     let client = null;
     let data = null;
@@ -1091,7 +1139,7 @@ async function startCloudflarePreview(config, localConfig) {
     cloudflarePreviewCameraIndex = Math.min(cloudflarePreviewCameraIndex, activeSources.length - 1);
     await createCloudflarePreviewOverlay(client);
 
-    const { localRelay, localError } = await publishPreviewOutput(client, publishUrl, relay, !!localConfig);
+    const { localRelay, localError, relayReady } = await publishPreviewOutput(client, publishUrl, relay, !!localConfig);
     cloudflarePreviewOwnsStream = true;
     cloudflarePreviewInputUid = inputUid;
     cloudflarePreviewPlaybackUrl = playbackUrl;
@@ -1107,7 +1155,7 @@ async function startCloudflarePreview(config, localConfig) {
     if (!cloudflarePreviewTimer) {
       cloudflarePreviewTimer = setInterval(() => { void previewTick().catch(() => {}); }, PREVIEW_SWEEP_MS);
     }
-    return { stream: { inputUid, playbackUrl }, cleanupInputUid: null, localRelay, localError };
+    return { stream: { inputUid, playbackUrl }, cleanupInputUid: null, localRelay: relayReady, localError };
   } catch (e) {
     const error = truncateDetail(e && (e.message || e));
     if (cloudflarePreviewOverlay) {

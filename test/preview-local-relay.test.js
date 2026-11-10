@@ -105,17 +105,27 @@ const CF = {
 };
 const LOCAL = { whipUrl: 'https://preview-bench1.evrybdystudios.com:8889/bench-1/whip', publishToken: 'pv1.publish.bench-1.9999999999.' + 'f'.repeat(64) };
 
-async function startAgent(t, { obs: obsOptions = {}, relayStatus = 200, relayDown = false } = {}) {
+// relayAvailable: 'yes' (the stream is up as soon as asked), 'never', or a number of ms
+// after the first forward PATCH (how long OBS's WHIP session takes to reach the relay).
+async function startAgent(t, { obs: obsOptions = {}, relayStatus = 200, relayDown = false, relayAvailable = 'yes' } = {}) {
   const obsRequests = [];
   const obs = createFakeObs(obsRequests, obsOptions);
   const obsPort = await listen(obs);
   t.after(() => close(obs));
   const relayCalls = [];
+  const relayState = { available: relayAvailable, forwardAt: 0 };
   const relayApi = http.createServer(async (req, res) => {
     const chunks = [];
     for await (const c of req) chunks.push(c);
     relayCalls.push({ method: req.method, url: req.url, body: Buffer.concat(chunks).toString('utf8') });
     res.statusCode = relayStatus;
+    if (req.method === 'PATCH' && !relayState.forwardAt) relayState.forwardAt = Date.now();
+    if (req.method === 'GET' && req.url === '/v3/paths/get/bench-1') {
+      const a = relayState.available;
+      const available = a === 'yes' || (typeof a === 'number' && relayState.forwardAt > 0 && Date.now() - relayState.forwardAt >= a);
+      res.end(JSON.stringify({ name: 'bench-1', available, ready: available }));
+      return;
+    }
     res.end('{}');
   });
   const relayPort = await listen(relayApi);
@@ -135,7 +145,7 @@ async function startAgent(t, { obs: obsOptions = {}, relayStatus = 200, relayDow
       BUILDING_ID: 'bench-1', RECORD_CONTROL_KEY: 'fake-test-key', PORT: String(agentPort),
       RECORD_POLL_URL: `http://127.0.0.1:${pollPort}`, POLL_IDLE_INTERVAL_MS: '60000',
       OBS_WS_URL: `ws://127.0.0.1:${obsPort}`, OBS_SOURCES: 'cam1,cam2,cam3', MASTER_RECORD: '0',
-      PREVIEW_RELAY_API: `http://127.0.0.1:${relayPort}`, PREVIEW_RELAY_START_CHECK_MS: '600',
+      PREVIEW_RELAY_API: `http://127.0.0.1:${relayPort}`, PREVIEW_RELAY_START_CHECK_MS: '600', PREVIEW_RELAY_READY_MS: '1500',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -153,8 +163,9 @@ async function startAgent(t, { obs: obsOptions = {}, relayStatus = 200, relayDow
     });
     return response.json();
   };
-  return { op, obsRequests, relayCalls, output: () => output };
+  return { op, obsRequests, relayCalls, relayState, output: () => output };
 }
+const patches = (calls) => calls.filter((c) => c.method === 'PATCH');
 const serverSettings = (requests) => requests.filter((r) => r.type === 'SetStreamServiceSettings').map((r) => r.data.streamServiceSettings);
 const types = (requests) => requests.map((r) => r.type);
 const RECORDER_CALLS = ['StartRecord', 'StopRecord', 'PauseRecord', 'ResumeRecord', 'CallVendorRequest'];
@@ -224,7 +235,7 @@ test('flag on, the relay never accepts the publish: OBS is stopped, the forward 
     { server: CF.publishUrl, bearer_token: '' },
   ]);
   assert.ok(types(agent.obsRequests).includes('StopStream'));
-  assert.deepEqual(agent.relayCalls.map((c) => JSON.parse(c.body).forward.length), [1, 0]);
+  assert.deepEqual(patches(agent.relayCalls).map((c) => JSON.parse(c.body).forward.length), [1, 0]);
 });
 
 test('an invalid relay offer is ignored: Cloudflare directly, relay never called', { timeout: 30000 }, async (t) => {
@@ -234,4 +245,39 @@ test('an invalid relay offer is ignored: Cloudflare directly, relay never called
   assert.equal(out.local_error, 'relay_config_invalid');
   assert.equal(agent.relayCalls.length, 0);
   assert.deepEqual(serverSettings(agent.obsRequests), [{ server: CF.publishUrl, bearer_token: '' }]);
+});
+
+test('flag on, OBS reaches the relay ~1 s after its output goes active: the room path is reported only once the relay has the stream (bench-1 11-09)', { timeout: 30000 }, async (t) => {
+  const agent = await startAgent(t, { relayAvailable: 700 });
+  const started = Date.now();
+  const out = await agent.op('preview_start', { viewer: '0123456789abcdef', cloudflare: CF, local: LOCAL });
+  assert.equal(out.ok, true);
+  assert.equal(out.local_relay, true);
+  assert.equal('local_error' in out, false);
+  assert.ok(Date.now() - started >= 650, 'the answer waited for the relay');
+  assert.ok(agent.relayCalls.some((c) => c.method === 'GET' && c.url === '/v3/paths/get/bench-1'));
+  // the forward was set before OBS published, and the probe never touched config
+  assert.equal(agent.relayCalls[0].method, 'PATCH');
+  assert.equal(patches(agent.relayCalls).length, 1);
+});
+
+test('flag on, the relay never gets the stream in time: kiosk stays on cloud, OBS keeps publishing to the relay, a later keepalive offers the room path', { timeout: 30000 }, async (t) => {
+  const agent = await startAgent(t, { relayAvailable: 'never' });
+  const out = await agent.op('preview_start', { viewer: '0123456789abcdef', cloudflare: CF, local: LOCAL });
+  assert.equal(out.ok, true);
+  assert.equal(out.local_relay, false);
+  assert.equal(out.local_error, 'relay_not_ready');
+  assert.equal(out.stream.playbackUrl, CF.playbackUrl);
+  // no fallback publish: the relay still forwards to Cloudflare for phones and the kiosk
+  assert.deepEqual(serverSettings(agent.obsRequests), [{ server: LOCAL.whipUrl, bearer_token: LOCAL.publishToken }]);
+  assert.equal(types(agent.obsRequests).includes('StopStream'), false);
+  assert.match(agent.output(), /ev=stream_start .*route=local.*local_error=relay_not_ready/);
+  // still not there on the next keepalive
+  const kept = await agent.op('preview_start', { viewer: '0123456789abcdef', cloudflare: { ...CF, reuse: true }, local: LOCAL });
+  assert.equal(kept.local_relay, false);
+  // the stream reaches the relay: the next keepalive offers the room path, no restart
+  agent.relayState.available = 'yes';
+  const later = await agent.op('preview_start', { viewer: '0123456789abcdef', cloudflare: { ...CF, reuse: true }, local: LOCAL });
+  assert.equal(later.local_relay, true);
+  assert.equal(types(agent.obsRequests).filter((x) => x === 'StartStream').length, 1);
 });
