@@ -813,10 +813,12 @@ async function setRelayForward(path, dest) {
 }
 
 // True when the relay has the room's stream (a publisher is in and its tracks are up).
-// MediaMTX v1.21: `available` (`ready` is the deprecated name). Any error = not yet.
-async function relayStreamAvailable(path) {
+// MediaMTX v1.21.3 (the pinned relay): `available`; `ready` is its deprecated alias for
+// the same thing (api/openapi.yaml). Re-check this if the pinned version changes.
+// Any error = not yet.
+async function relayStreamAvailable(path, timeoutMs = PREVIEW_RELAY_PROBE_TIMEOUT_MS) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), PREVIEW_RELAY_PROBE_TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), Math.max(50, Math.min(timeoutMs, PREVIEW_RELAY_PROBE_TIMEOUT_MS)));
   try {
     const response = await fetch(`${PREVIEW_RELAY_API}/v3/paths/get/${encodeURIComponent(path)}`, { signal: ctrl.signal });
     if (!response.ok) return false;
@@ -829,11 +831,14 @@ async function relayStreamAvailable(path) {
   }
 }
 
+// Never runs past its budget: each probe is capped to the time left.
 async function waitForRelayStream(path, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    if (await relayStreamAvailable(path)) return true;
-    if (Date.now() >= deadline) return false;
+    const left = deadline - Date.now();
+    if (left <= 0) return false;
+    if (await relayStreamAvailable(path, left)) return true;
+    if (deadline - Date.now() <= 150) return false;
     await sleep(150);
   }
 }
@@ -919,6 +924,7 @@ async function publishPreviewOutput(client, publishUrl, relay, localOffered) {
   // to publishing straight to Cloudflare (the path below, unchanged).
   let localRelay = false;
   let localError = null;
+  let relayReady = false;
   if (relay) {
     try {
       await setRelayForward(relay.path, relayForwardDest(publishUrl));
@@ -933,7 +939,8 @@ async function publishPreviewOutput(client, publishUrl, relay, localOffered) {
       // path is offered to the kiosk only once the relay has the stream; until then the
       // kiosk stays on cloud and a later keepalive offers the room path.
       const readyBudget = Math.max(500, PREVIEW_RELAY_READY_MS - (Date.now() - publishedAt));
-      if (!(await waitForRelayStream(relay.path, readyBudget))) localError = 'relay_not_ready';
+      relayReady = await waitForRelayStream(relay.path, readyBudget);
+      if (!relayReady) localError = 'relay_not_ready';
     } catch (e) {
       localError = /^relay_publish|^obs_/.test(String(e && e.message)) ? 'relay_publish_failed' : 'relay_unreachable';
       maybeWarnPreview('preview relay unavailable (' + localError + '); publishing to Cloudflare directly');
@@ -950,7 +957,7 @@ async function publishPreviewOutput(client, publishUrl, relay, localOffered) {
       bearer_token: '',
     });
   }
-  return { localRelay, localError, relayReady: localRelay && !localError };
+  return { localRelay, localError, relayReady };
 }
 
 // The overlay scene must still be in OBS (an OBS restart loses it); rebuild it if not.
